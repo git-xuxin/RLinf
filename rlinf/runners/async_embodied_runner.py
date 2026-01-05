@@ -21,7 +21,10 @@ from omegaconf.dictconfig import DictConfig
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
-from rlinf.utils.metric_utils import compute_evaluate_metrics
+from rlinf.utils.metric_utils import (
+    compute_env_metrics_per_env_worker,
+    compute_evaluate_metrics,
+)
 from rlinf.utils.runner_utils import check_progress
 
 if TYPE_CHECKING:
@@ -60,12 +63,14 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             result = self.env_metric_channel.get_nowait()
         except asyncio.QueueEmpty:
             return None
+
+        all_workers_env_metrics = compute_env_metrics_per_env_worker([result])
         env_metrics = compute_evaluate_metrics(
             [
                 result,
             ]
         )
-        return env_metrics
+        return all_workers_env_metrics, env_metrics
 
     def run(self):
         start_step = self.global_step
@@ -105,10 +110,17 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
             self.metric_logger.log(training_metrics, train_step)
 
-            env_metrics = self.get_env_metrics()
-            if env_metrics is not None:
+            env_metrics_result = self.get_env_metrics()
+            if env_metrics_result is not None:
+                all_workers_env_metrics, env_metrics = env_metrics_result
                 rollout_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+                env_worker_metrics = {
+                    f"env/worker_{rank_id}/{k}": v
+                    for rank_id, worker_env_metrics in all_workers_env_metrics.items()
+                    for k, v in worker_env_metrics.items()
+                }
                 self.metric_logger.log(rollout_metrics, train_step)
+                self.metric_logger.log(env_worker_metrics, train_step)
 
             _, save_model, _ = check_progress(
                 self.global_step,

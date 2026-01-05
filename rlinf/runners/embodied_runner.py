@@ -23,7 +23,10 @@ from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.metric_logger import MetricLogger
-from rlinf.utils.metric_utils import compute_evaluate_metrics
+from rlinf.utils.metric_utils import (
+    compute_env_metrics_per_env_worker,
+    compute_evaluate_metrics,
+)
 from rlinf.utils.runner_utils import check_progress
 
 if TYPE_CHECKING:
@@ -197,18 +200,27 @@ class EmbodiedRunner:
             env_results_list = [
                 results for results in env_handle.wait() if results is not None
             ]
+            all_workers_env_metrics = compute_env_metrics_per_env_worker(
+                env_results_list
+            )
             env_metrics = compute_evaluate_metrics(env_results_list)
 
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
             rollout_metrics = {
                 f"rollout/{k}": v for k, v in actor_rollout_metrics[0].items()
             }
-            env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+            env_metrics = {f"env/general/{k}": v for k, v in env_metrics.items()}
+            env_worker_metrics = {
+                f"env/worker_{rank_id}/{k}": v
+                for rank_id, worker_env_metrics in all_workers_env_metrics.items()
+                for k, v in worker_env_metrics.items()
+            }
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
             training_metrics = {
                 f"train/{k}": v for k, v in actor_training_metrics[0].items()
             }
             self.metric_logger.log(env_metrics, _step)
+            self.metric_logger.log(env_worker_metrics, _step)
             self.metric_logger.log(rollout_metrics, _step)
             self.metric_logger.log(time_metrics, _step)
             self.metric_logger.log(training_metrics, _step)
@@ -216,6 +228,7 @@ class EmbodiedRunner:
             logging_metrics = time_metrics
             logging_metrics.update(eval_metrics)
             logging_metrics.update(env_metrics)
+            logging_metrics.update(env_worker_metrics)
             logging_metrics.update(rollout_metrics)
             logging_metrics.update(training_metrics)
 
