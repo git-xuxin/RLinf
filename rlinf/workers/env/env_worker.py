@@ -17,7 +17,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from rlinf.data.io_struct import EnvOutput
 from rlinf.envs import get_env_cls
@@ -70,8 +70,33 @@ class EnvWorker(Worker):
                 self.cfg.env.eval.total_num_envs // self._world_size // self.stage_num
             )
 
+    def update_env_cfg(self):
+        # train env
+        train_override_cfgs = self.cfg.env.train.get("override_cfgs", None)
+        if train_override_cfgs is not None:
+            general_train_override_cfg = OmegaConf.to_container(
+                self.cfg.env.train.get("override_cfg", {}), resolve=True
+            )
+            override_cfg = OmegaConf.to_container(
+                train_override_cfgs[self._rank], resolve=True
+            ).copy()
+            override_cfg.update(general_train_override_cfg)
+            setattr(self.cfg.env.train, "override_cfg", override_cfg)
+
+        eval_override_cfgs = self.cfg.env.eval.get("override_cfgs", None)
+        if eval_override_cfgs is not None:
+            general_eval_override_cfg = OmegaConf.to_container(
+                self.cfg.env.eval.get("override_cfg", {}), resolve=True
+            )
+            eval_override_cfg = OmegaConf.to_container(
+                eval_override_cfgs[self._rank], resolve=True
+            ).copy()
+            eval_override_cfg.update(general_eval_override_cfg)
+            setattr(self.cfg.env.eval, "override_cfg", override_cfg)
+
     def init_worker(self):
         enable_offload = self.cfg.env.enable_offload
+        self.update_env_cfg()
 
         train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
         eval_env_cls = get_env_cls(self.cfg.env.eval.env_type, self.cfg.env.eval)
