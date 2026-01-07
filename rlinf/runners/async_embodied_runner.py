@@ -104,6 +104,9 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             with self.timer("actor_training"):
                 actor_result = self.actor.run_training().wait()
             if not actor_result[0]:
+                time_metrics = self.timer.consume_durations()
+                time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+                self.metric_logger.log(time_metrics, train_step)
                 time.sleep(1.0)
                 continue
             train_step += 1
