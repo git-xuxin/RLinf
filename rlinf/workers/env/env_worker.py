@@ -70,6 +70,9 @@ class EnvWorker(Worker):
                 self.cfg.env.eval.total_num_envs // self._world_size // self.stage_num
             )
 
+        self.train_queue = Channel.create(name="train_queue", local=True)
+        self.eval_queue = Channel.create(name="eval_queue", local=True)
+
     def update_env_cfg(self):
         # train env
         train_override_cfgs = self.cfg.env.train.get("override_cfgs", None)
@@ -257,9 +260,24 @@ class EnvWorker(Worker):
         chunk_action = []
         for gather_id in range(self.gather_num):
             src_rank_in_rollout = gather_id + self._rank * self.gather_num
-            chunk_action.append(
-                self.recv(self.cfg.rollout.group_name, src_rank=src_rank_in_rollout)
+            work = self.recv(
+                self.cfg.rollout.group_name, src_rank=src_rank_in_rollout, async_op=True
             )
+
+            def _callback():
+                rollout_mode, recv_action = work.wait()
+                if rollout_mode == "train":
+                    self.train_queue.put(recv_action)
+                elif rollout_mode == "eval":
+                    self.eval_queue.put(recv_action)
+
+            work.then(_callback)
+
+            if mode == "train":
+                action = self.train_queue.get()
+            elif mode == "eval":
+                action = self.eval_queue.get()
+            chunk_action.append(action)
         chunk_action = np.concatenate(chunk_action, axis=0)
         return chunk_action
 
@@ -316,7 +334,7 @@ class EnvWorker(Worker):
             env_batch_i = self.split_env_batch(env_batch, gather_id, mode)
             dst_rank_in_rollout = gather_id + self._rank * self.gather_num
             self.send(
-                env_batch_i,
+                (mode, env_batch_i),
                 self.cfg.rollout.group_name,
                 dst_rank_in_rollout,
                 async_op=True,
