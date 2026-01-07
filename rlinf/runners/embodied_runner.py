@@ -159,10 +159,11 @@ class EmbodiedRunner:
                         output_channel=self.rollout_channel,
                         actor_channel=self.actor_channel,
                     )
+                    rollout_handle.wait()
+                with self.timer("send_rollout_batch"):
                     self.actor.recv_rollout_batch(
                         input_channel=self.actor_channel
                     ).wait()
-                    rollout_handle.wait()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
@@ -215,7 +216,6 @@ class EmbodiedRunner:
                 for rank_id, worker_env_metrics in all_workers_env_metrics.items()
                 for k, v in worker_env_metrics.items()
             }
-            time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
             training_metrics = {
                 f"train/{k}": v for k, v in actor_training_metrics[0].items()
             }

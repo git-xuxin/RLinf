@@ -95,20 +95,28 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 self.cfg.runner.val_check_interval > 0
                 and train_step % self.cfg.runner.val_check_interval == 0
             ):
-                self.update_rollout_weights()
-                eval_metrics = self.evaluate()
-                eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                self.metric_logger.log(data=eval_metrics, step=train_step)
+                with self.timer("eval"):
+                    self.update_rollout_weights()
+                    eval_metrics = self.evaluate()
+                    eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+                    self.metric_logger.log(data=eval_metrics, step=train_step)
 
-            actor_result = self.actor.run_training().wait()
+            with self.timer("actor_training"):
+                actor_result = self.actor.run_training().wait()
             if not actor_result[0]:
                 time.sleep(1.0)
                 continue
             train_step += 1
-            self.update_rollout_weights()
+
+            with self.timer("sync_weights"):
+                self.update_rollout_weights()
 
             training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
             self.metric_logger.log(training_metrics, train_step)
+
+            time_metrics = self.timer.consume_durations()
+            time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+            self.metric_logger.log(time_metrics, train_step)
 
             env_metrics_result = self.get_env_metrics()
             if env_metrics_result is not None:

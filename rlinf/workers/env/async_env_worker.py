@@ -24,7 +24,9 @@ from rlinf.workers.env.env_worker import EnvWorker
 
 
 class AsyncEnvWorker(EnvWorker):
-    async def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
+    async def recv_chunk_actions(
+        self, input_channel: Channel, mode="train"
+    ) -> np.ndarray:
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         chunk_action = []
         for gather_id in range(self.gather_num):
