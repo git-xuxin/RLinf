@@ -48,8 +48,13 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         train_actor_steps = max(min_buffer_size, train_actor_steps)
 
-        if not (await self.replay_buffer.is_ready_async(min_buffer_size)):
-            self.log_on_first_rank(
+        is_ready_local = await self.replay_buffer.is_ready_async(min_buffer_size)
+        is_ready = torch.tensor(int(is_ready_local), device=self.device)
+        torch.distributed.all_reduce(is_ready, op=torch.distributed.ReduceOp.MIN)
+        is_ready = is_ready.item() > 0
+
+        if not is_ready:
+            self.log_info(
                 f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
             )
             return False
