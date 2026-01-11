@@ -57,6 +57,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         # Data channels
         self.env_metric_channel = Channel.create("EnvMetric")
         self.replay_channel = Channel.create("ReplayBuffer")
+        self.demo_channel = Channel.create("DemoBuffer")
 
     def get_env_metrics(self):
         try:
@@ -86,14 +87,17 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             input_channel=self.env_channel,
             output_channel=self.rollout_channel,
             replay_channel=self.replay_channel,
+            demo_channel=self.demo_channel,
         )
         self.actor.start_replay_buffer(self.replay_channel)
+        self.actor.start_demo_buffer(self.demo_channel)
 
         train_step = start_step
         while train_step < self.max_steps:
             if (
                 self.cfg.runner.val_check_interval > 0
                 and train_step % self.cfg.runner.val_check_interval == 0
+                and train_step > 0
             ):
                 with self.timer("eval"):
                     self.update_rollout_weights()

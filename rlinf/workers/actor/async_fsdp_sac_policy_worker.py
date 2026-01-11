@@ -33,6 +33,19 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         await replay_buffer_task
 
+    async def start_demo_buffer(self, demo_channel: Channel):
+        send_num = self._component_placement.get_world_size("rollout") * self.stage_num
+        recv_num = self._component_placement.get_world_size("actor")
+        split_num = compute_split_num(send_num, recv_num)
+
+        if self.demo_buffer is not None:
+            demo_buffer_task = asyncio.create_task(
+                self.demo_buffer.run(
+                    self.cfg, data_channel=demo_channel, split_num=split_num
+                )
+            )
+            await demo_buffer_task
+
     async def run_training(self):
         """SAC training using replay buffer"""
         if self.cfg.actor.get("enable_offload", False):

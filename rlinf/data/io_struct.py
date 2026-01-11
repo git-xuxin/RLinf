@@ -35,6 +35,7 @@ from rlinf.utils.data_iter_utils import (
 )
 from rlinf.utils.nested_dict_process import (
     cat_list_of_dict_tensor,
+    get_mask_batch,
     put_tensor_device,
     split_dict_to_chunk,
     stack_list_of_dict_tensor,
@@ -1355,6 +1356,17 @@ class EmbodiedRolloutResult:
             else None
         )
 
+        intervene_flags = []
+        for forward_input in self.forward_inputs:
+            if "intervene_flags" in forward_input:
+                intervene_flags.append(forward_input.pop("intervene_flags"))
+
+        rollout_result_dict["intervene_flags"] = (
+            torch.stack(intervene_flags, dim=0).cpu().contiguous()
+            if len(intervene_flags) > 0
+            else None
+        )
+
         merged_forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
         for k in merged_forward_inputs.keys():
             assert k not in [
@@ -1397,6 +1409,7 @@ class AsyncEmbodiedRolloutBuffer:
         default_factory=asyncio.Queue
     )
 
+    intervene_flags: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
     forward_inputs: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
 
     batches_per_send = 1
@@ -1454,6 +1467,14 @@ class AsyncEmbodiedRolloutBuffer:
             result["prev_values"].cpu().contiguous()
         )  # if "prev_values" in result else None
 
+        if "intervene_flags" in result["forward_inputs"]:
+            intervene_flags = result["forward_inputs"].pop("intervene_flags")
+        else:
+            intervene_flags = None
+        await self.intervene_flags.put(
+            intervene_flags.cpu().contiguous() if intervene_flags is not None else None
+        )
+
         await self.forward_inputs.put(
             put_tensor_device(result["forward_inputs"], "cpu")
         )
@@ -1480,7 +1501,9 @@ class AsyncEmbodiedRolloutBuffer:
         else:
             raise NotImplementedError
 
-    async def send_data(self, data_channel: Channel, split_num):
+    async def send_data(
+        self, data_channel: Channel, demo_data_channel: Channel, split_num
+    ):
         # Collect data
         prev_logprobs = []
         dones = []
@@ -1489,6 +1512,7 @@ class AsyncEmbodiedRolloutBuffer:
         rewards = []
         transitions = []
         forward_inputs = []
+        intervene_flags = []
 
         for _ in range(self.batches_per_send):
             prev_logprobs.append(await self.prev_logprobs.get())
@@ -1499,6 +1523,10 @@ class AsyncEmbodiedRolloutBuffer:
             transitions.append(await self.transitions.get())
             forward_inputs.append(await self.forward_inputs.get())
 
+            intervene_flag = await self.intervene_flags.get()
+            if intervene_flag is not None:
+                intervene_flags.append(intervene_flag)
+
         data = {
             "prev_logprobs": torch.cat(prev_logprobs, dim=0).cpu().contiguous(),
             "dones": torch.cat(dones, dim=0).cpu().contiguous(),
@@ -1507,18 +1535,28 @@ class AsyncEmbodiedRolloutBuffer:
             "rewards": torch.cat(rewards, dim=0).cpu().contiguous(),
             "transitions": cat_list_of_dict_tensor(transitions),
         }
+
+        if len(intervene_flags) > 0:
+            all_intervene_flags = torch.cat(intervene_flags, dim=0).cpu().contiguous()
+            all_intervene_flags = all_intervene_flags.any(dim=-1)
+        else:
+            all_intervene_flags = None
+
         data.update(cat_list_of_dict_tensor(forward_inputs))
         splited_data = split_dict_to_chunk(data, split_size=split_num, dim=0)
 
         # Organize data
         for i in range(split_num):
             data_channel.put(splited_data[i])
+            if all_intervene_flags is not None:
+                intervene_data = get_mask_batch(splited_data[i], all_intervene_flags)
+                demo_data_channel.put(intervene_data)
 
-    async def run(self, data_channel, split_num):
+    async def run(self, data_channel: Channel, demo_channel: Channel, split_num):
         cnt = 0
         while not self.should_stop:
             cnt += 1
-            await self.send_data(data_channel, split_num)
+            await self.send_data(data_channel, demo_channel, split_num)
 
     async def stop(self):
         self.should_stop = True

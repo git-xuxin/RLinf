@@ -213,6 +213,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             seed=seed,
         )
 
+        if self.cfg.actor.get("enable_hil", False):
+            if self.cfg.get("data", None) is None:
+                self.demo_buffer = SACReplayBuffer(
+                    capacity=self.cfg.algorithm.demo_buffer_capacity,
+                    device=self.device,
+                    seed=seed,
+                )
+            else:
+                # demo buffer will be created later
+                pass
+
         self.critic_actor_ratio = self.cfg.algorithm.get("critic_actor_ratio", 1)
         self.critic_subsample_size = self.cfg.algorithm.get("critic_subsample_size", -1)
         self.critic_sample_generator = torch.Generator(self.device)
@@ -243,6 +254,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     def recv_rollout_batch(self, input_channel: Channel):
         super().recv_rollout_batch(input_channel)
         self.replay_buffer.add_rollout_batch(self.rollout_batch)
+        if self.demo_buffer is not None:
+            if "intervene_flags" in self.rollout_batch:
+                intervene_flags = self.rollout_batch.pop(
+                    "intervene_flags"
+                )  # [T, B, chunk]
+                intervene_flags = intervene_flags.any(dim=-1)  # [T, B]
+                intervene_flags = intervene_flags.reshape(-1)
+            self.demo_buffer.add_rollout_batch(
+                self.rollout_batch, extra_preprocess=True, add_flag=intervene_flags
+            )
 
     async def recv_demo_data(self, input_channel: Channel):
         demo_data = await input_channel.get(async_op=True).async_wait()
@@ -418,7 +439,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.cfg.actor.global_batch_size // self._world_size
         )
 
-        if self.demo_buffer is not None:
+        min_demo_buffer_size = self.cfg.algorithm.get("min_single_demo_buffer_size", 1)
+
+        if self.demo_buffer is not None and self.demo_buffer.is_ready(
+            min_demo_buffer_size
+        ):
             replay_batch = self.replay_buffer.sample(global_batch_size_per_rank // 2)
             demo_batch = self.demo_buffer.sample(global_batch_size_per_rank // 2)
             global_batch = concat_batch(replay_batch, demo_batch)
@@ -515,6 +540,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             f"replay_buffer/{key}": value for key, value in replay_buffer_stats.items()
         }
         append_to_dict(metrics, replay_buffer_stats)
+
+        if self.demo_buffer is not None:
+            demo_buffer_stats = self.demo_buffer.get_stats()
+            demo_buffer_stats = {
+                f"demo_buffer/{key}": value for key, value in demo_buffer_stats.items()
+            }
+            append_to_dict(metrics, demo_buffer_stats)
+
         # Average metrics across updates
         mean_metric_dict = {}
         for key, value in metrics.items():

@@ -217,6 +217,7 @@ class MultiStepRolloutWorker(Worker):
                 forward_inputs["action"] = action
             else:
                 raise NotImplementedError(f"{forward_inputs.keys()=}")
+        forward_inputs["intervene_flags"] = intervene_flags
         return forward_inputs
 
     async def generate(

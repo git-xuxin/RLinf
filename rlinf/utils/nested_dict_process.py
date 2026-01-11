@@ -106,3 +106,15 @@ def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
         else:
             raise ValueError(f"{key=}, {type(_v0)} is not supported!")
     return ret
+
+
+def get_mask_batch(nested_dict, dict_mask):
+    sample_dict = {}
+    for key, value in nested_dict.items():
+        if isinstance(value, torch.Tensor):
+            sample_dict[key] = value[dict_mask]
+        elif isinstance(value, dict):
+            sample_dict[key] = get_mask_batch(value, dict_mask)
+        else:
+            raise NotImplementedError
+    return sample_dict

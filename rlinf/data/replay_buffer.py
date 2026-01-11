@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 from rlinf.scheduler import Channel
-from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor
+from rlinf.utils.nested_dict_process import cat_list_of_dict_tensor, get_mask_batch
 
 
 def process_nested_dict_for_replay_buffer(nested_dict, rm_extra_done=True):
@@ -220,7 +220,10 @@ class SACReplayBuffer:
         return flattened_batch, num_to_add
 
     def add_rollout_batch(
-        self, rollout_batch: dict[str, torch.Tensor], extra_preprocess=True
+        self,
+        rollout_batch: dict[str, torch.Tensor],
+        extra_preprocess=True,
+        add_flag=None,
     ):
         """
         Add a batch of transitions to the buffer.
@@ -239,6 +242,13 @@ class SACReplayBuffer:
             flattened_batch = rollout_batch
             num_to_add = flattened_batch["rewards"].shape[0]
         assert num_to_add > 0
+
+        if add_flag is not None:
+            flattened_batch = get_mask_batch(flattened_batch, add_flag)
+            num_to_add = flattened_batch["rewards"].shape[0]
+
+        if num_to_add == 0:
+            return
 
         # 2. Lazy initialization of storage tensors on first call
         if not self.buffer:

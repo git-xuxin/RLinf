@@ -24,7 +24,11 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
     async def generate(
-        self, input_channel: Channel, output_channel: Channel, replay_channel: Channel
+        self,
+        input_channel: Channel,
+        output_channel: Channel,
+        replay_channel: Channel,
+        demo_channel: Channel,
     ):
         self.buffer_list: list[AsyncEmbodiedRolloutBuffer] = [
             AsyncEmbodiedRolloutBuffer() for _ in range(self.num_pipeline_stages)
@@ -34,7 +38,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         for buffer in self.buffer_list:
             self.buffer_tasks.append(
                 asyncio.create_task(
-                    buffer.run(replay_channel, self.get_actor_split_num())
+                    buffer.run(replay_channel, demo_channel, self.get_actor_split_num())
                 )
             )
 
