@@ -137,16 +137,28 @@ def clone_dict_and_get_size(nested_dict):
     return ret_dict, size
 
 
+def get_buffer_size(nested_dict):
+    size = None
+    for value in nested_dict.values():
+        if isinstance(value, torch.Tensor):
+            return value.shape[0]
+        elif isinstance(value, dict):
+            return get_buffer_size(value)
+        else:
+            raise NotImplementedError
+    return size
+
+
 def fix_image_data(data):
     fixed_data = {}
     for key, value in data.items():
         if isinstance(value, torch.Tensor):
             if "images" in key:
                 _value = value.clone()
-                if value.dtype == torch.uint8:
+                if _value.dtype == torch.uint8:
                     _value = _value.float() / 255.0
-                elif value.shape[-1] == 3:
-                    if len(value.shape) == 3:
+                if _value.shape[-1] == 3:
+                    if len(_value.shape) == 3:
                         _value = _value.permute(2, 0, 1)
                     else:
                         _value = _value.permute(0, 3, 1, 2)
@@ -154,7 +166,7 @@ def fix_image_data(data):
             else:
                 fixed_data[key] = value.clone()
         elif isinstance(value, dict):
-            fixed_data[key] = fix_image_data(data)
+            fixed_data[key] = fix_image_data(value)
     return fixed_data
 
 
@@ -193,7 +205,7 @@ class SACReplayBuffer:
             self.random_generator = None
 
     @classmethod
-    def create_from_demo(cls, demo_path, seed=None):
+    def create_from_demo(cls, demo_path, seed=None, capacity=None):
         if not os.path.exists(demo_path):
             raise FileNotFoundError(f"File {demo_path} not found")
 
@@ -204,7 +216,9 @@ class SACReplayBuffer:
             data_ls = torch.load(demo_path)
 
         # TODO: Possibly need to convert from jax to torch.
-        instance = cls(capacity=len(data_ls), seed=seed)
+        if capacity is None:
+            capacity = len(data_ls)
+        instance = cls(capacity=capacity, seed=seed)
         for data in data_ls:
             if isinstance(data, np.ndarray):
                 data = torch.from_numpy(data)
@@ -212,11 +226,19 @@ class SACReplayBuffer:
         return instance
 
     @classmethod
-    def create_from_buffer(cls, buffer, seed):
+    def create_from_buffer(cls, buffer, seed, capacity=None):
         instance = cls(capacity=None, seed=seed)
-        instance.buffer, size = clone_dict_and_get_size(buffer)
-        instance.size = size
-        instance.capacity = size
+        if capacity is None:
+            instance.buffer, size = clone_dict_and_get_size(buffer)
+            instance.size = size
+            instance.capacity = size
+        else:
+            size = get_buffer_size(buffer)
+            instance.buffer = get_zero_nested_dict(buffer, capacity)
+            insert_nested_batch(buffer, instance.buffer, torch.arange(size))
+            instance.capacity = max(capacity, size)
+            instance.size = size
+        instance.pos = size % instance.capacity
         return instance
 
     def _initialize_storage(

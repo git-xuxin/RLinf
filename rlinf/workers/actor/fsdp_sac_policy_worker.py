@@ -267,11 +267,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
     async def recv_demo_data(self, input_channel: Channel):
         demo_data = await input_channel.get(async_op=True).async_wait()
-        self.demo_buffer = SACReplayBuffer.create_from_buffer(
-            demo_data, seed=self.cfg.actor.seed
-        )
         if self.cfg.actor.get("enable_hil", False):
-            self.demo_buffer.capacity = self.cfg.algorithm.demo_buffer_capacity
+            capacity = self.cfg.algorithm.demo_buffer_capacity
+        else:
+            capacity = None
+        self.demo_buffer = SACReplayBuffer.create_from_buffer(
+            demo_data, seed=self.cfg.actor.seed, capacity=capacity
+        )
 
     def forward_critic(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
