@@ -1359,13 +1359,14 @@ class EmbodiedRolloutResult:
         intervene_flags = []
         for forward_input in self.forward_inputs:
             if "intervene_flags" in forward_input:
-                intervene_flags.append(forward_input.pop("intervene_flags"))
+                intervene_flag = forward_input.pop("intervene_flags")
+                if intervene_flag is not None:
+                    intervene_flags.append(intervene_flag)
 
-        rollout_result_dict["intervene_flags"] = (
-            torch.stack(intervene_flags, dim=0).cpu().contiguous()
-            if len(intervene_flags) > 0
-            else None
-        )
+        if len(intervene_flags) > 0:
+            rollout_result_dict["intervene_flags"] = (
+                torch.stack(intervene_flags, dim=0).cpu().contiguous()
+            )
 
         merged_forward_inputs = stack_list_of_dict_tensor(self.forward_inputs)
         for k in merged_forward_inputs.keys():

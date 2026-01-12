@@ -241,7 +241,6 @@ class SACReplayBuffer:
         else:
             flattened_batch = rollout_batch
             num_to_add = flattened_batch["rewards"].shape[0]
-        assert num_to_add > 0
 
         if add_flag is not None:
             flattened_batch = get_mask_batch(flattened_batch, add_flag)

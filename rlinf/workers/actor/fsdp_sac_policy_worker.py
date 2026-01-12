@@ -270,6 +270,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.demo_buffer = SACReplayBuffer.create_from_buffer(
             demo_data, seed=self.cfg.actor.seed
         )
+        if self.cfg.actor.get("enable_hil", False):
+            self.demo_buffer.capacity = self.cfg.algorithm.demo_buffer_capacity
 
     def forward_critic(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
