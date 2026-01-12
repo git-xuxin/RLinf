@@ -15,6 +15,7 @@
 
 import os
 import pickle as pkl
+import warnings
 from typing import Optional
 
 import numpy as np
@@ -50,11 +51,22 @@ def get_zero_nested_dict(flattened_batch, capacity, with_batch_dim=True):
     buffer = {}
     for key, value in flattened_batch.items():
         if isinstance(value, torch.Tensor):
+            dtype = value.dtype
             if with_batch_dim:
                 tgt_shape = (capacity, *value.shape[1:])
             else:
                 tgt_shape = (capacity, *value.shape)
-            buffer[key] = torch.zeros(tgt_shape, dtype=value.dtype, device="cpu")
+
+            if "images" in key:
+                dtype = torch.float32
+                if value.dtype != torch.float32:
+                    warnings.warn(f"{key=}, {value.dtype=}")
+
+                if value.shape[-1] == 3:
+                    warnings.warn(f"{key=}, {value.shape=}")
+                    tgt_shape = (tgt_shape[0], tgt_shape[3], tgt_shape[1], tgt_shape[2])
+
+            buffer[key] = torch.zeros(tgt_shape, dtype=dtype, device="cpu")
         elif isinstance(value, dict):
             buffer[key] = get_zero_nested_dict(value, capacity, with_batch_dim)
         else:
@@ -123,6 +135,27 @@ def clone_dict_and_get_size(nested_dict):
         else:
             raise NotImplementedError
     return ret_dict, size
+
+
+def fix_image_data(data):
+    fixed_data = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            if "images" in key:
+                _value = value.clone()
+                if value.dtype == torch.uint8:
+                    _value = _value.float() / 255.0
+                elif value.shape[-1] == 3:
+                    if len(value.shape) == 3:
+                        _value = _value.permute(2, 0, 1)
+                    else:
+                        _value = _value.permute(0, 3, 1, 2)
+                fixed_data[key] = _value
+            else:
+                fixed_data[key] = value.clone()
+        elif isinstance(value, dict):
+            fixed_data[key] = fix_image_data(data)
+    return fixed_data
 
 
 class SACReplayBuffer:
@@ -197,6 +230,7 @@ class SACReplayBuffer:
         if not self.buffer:
             self._initialize_storage(data, with_batch_dim=False)
 
+        data = fix_image_data(data)
         insert_nested_batch(data, self.buffer, self.pos)
 
         self.pos = (self.pos + 1) % self.capacity

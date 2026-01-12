@@ -174,11 +174,11 @@ class CNNPolicy(BasePolicy):
         processed_env_obs["states"] = env_obs["states"].clone().to(device)
         processed_env_obs["main_images"] = (
             env_obs["main_images"].clone().to(device).float() / 255.0
-        )
+        ).permute(0, 3, 1, 2)
         if env_obs.get("extra_view_images", None) is not None:
             processed_env_obs["extra_view_images"] = (
                 env_obs["extra_view_images"].clone().to(device).float() / 255.0
-            )
+            ).permute(0, 3, 1, 2)
         return processed_env_obs
 
     def get_feature(self, obs, detach_encoder=False):
@@ -188,9 +188,6 @@ class CNNPolicy(BasePolicy):
                 images = obs["main_images"]
             else:
                 images = obs["extra_view_images"][:, img_id - 1]
-            if images.shape[3] == 3:
-                # [B, H, W, C] -> [B, C, H, W]
-                images = images.permute(0, 3, 1, 2)
             visual_features.append(self.encoders[img_id](images))
         visual_feature = torch.cat(visual_features, dim=-1)
         if detach_encoder:
