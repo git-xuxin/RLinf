@@ -129,13 +129,14 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
 
-  micro_batch_size: 1024
-  global_batch_size: 1024
+  micro_batch_size: 256
+  global_batch_size: 256
   seed: 1234
   enable_offload: False
 
   model:
     model_path: "/path/to/model"
+    num_q_heads: 10
     state_dim: 19
     action_dim: 6
 

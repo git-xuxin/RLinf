@@ -70,7 +70,7 @@ algorithm:
   loss_agg_func: "token-mean"
   
   bootstrap_type: always
-  gamma: 0.8
+  gamma: 0.9
   tau: 0.01  # Soft update coefficient for target networks
   auto_entropy_tuning: True  # Enable automatic entropy tuning
   alpha_type: softplus
@@ -128,8 +128,8 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
 
-  micro_batch_size: 1024
-  global_batch_size: 1024
+  micro_batch_size: 256
+  global_batch_size: 256
   seed: 1234
   enable_offload: False
 
