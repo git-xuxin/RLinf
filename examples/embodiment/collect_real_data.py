@@ -51,7 +51,7 @@ class DataCollector(Worker):
             if "images" in key:
                 ret_obs[key] = obs[key].clone().permute(0, 3, 1, 2)[0].float() / 255.0
             else:
-                ret_obs[key] = obs[key]
+                ret_obs[key] = obs[key][0]
         return ret_obs
 
     def run(self):
