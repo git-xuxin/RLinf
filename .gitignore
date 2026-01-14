@@ -18,3 +18,6 @@ outputs/*
 .docs-venv
 uv.lock
 rlinf/envs/maniskill/assets
+examples/embodiment/data/*
+outputs/*
+reward_checkpoints/*
