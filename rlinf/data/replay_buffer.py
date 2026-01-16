@@ -16,7 +16,7 @@
 import os
 import pickle as pkl
 import warnings
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -205,15 +205,24 @@ class SACReplayBuffer:
             self.random_generator = None
 
     @classmethod
-    def create_from_demo(cls, demo_path, seed=None, capacity=None):
-        if not os.path.exists(demo_path):
-            raise FileNotFoundError(f"File {demo_path} not found")
+    def create_from_demo(
+        cls, demo_paths_: Union[str, list[str]], seed=None, capacity=None
+    ):
+        if isinstance(demo_paths_, str):
+            demo_paths_ = [
+                demo_paths_,
+            ]
 
-        if demo_path.endswith(".pkl"):
-            with open(demo_path, "rb") as f:
-                data_ls = pkl.load(f)
-        elif demo_path.endswith(".pt"):
-            data_ls = torch.load(demo_path)
+        data_ls = []
+        for demo_path in demo_paths_:
+            if not os.path.exists(demo_path):
+                raise FileNotFoundError(f"File {demo_path} not found")
+
+            if demo_path.endswith(".pkl"):
+                with open(demo_path, "rb") as f:
+                    data_ls.extend(pkl.load(f))
+            elif demo_path.endswith(".pt"):
+                data_ls.extend(torch.load(demo_path))
 
         # TODO: Possibly need to convert from jax to torch.
         if capacity is None:
