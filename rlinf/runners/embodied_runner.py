@@ -111,11 +111,12 @@ class EmbodiedRunner:
                 self.demo_data_channel.put(sub_demo_buffer, async_op=True)
             self.actor.recv_demo_data(self.demo_data_channel).wait()
 
-    def update_rollout_weights(self):
+    def update_rollout_weights(self, enable_wait: bool = True):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
         actor_handle: Handle = self.actor.sync_model_to_rollout()
-        actor_handle.wait()
-        rollout_handle.wait()
+        if enable_wait:
+            actor_handle.wait()
+            rollout_handle.wait()
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(

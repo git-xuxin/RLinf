@@ -785,7 +785,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_offload and self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
 
-        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        state_dict = self.get_model_state_dict(cpu_offload=True, full_state_dict=True)
         for rank in self._weight_dst_rank_in_rollout:
             self.send(
                 state_dict,

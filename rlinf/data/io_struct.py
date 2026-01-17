@@ -1548,10 +1548,10 @@ class AsyncEmbodiedRolloutBuffer:
 
         # Organize data
         for i in range(split_num):
-            data_channel.put(splited_data[i])
+            await data_channel.put(splited_data[i], async_op=True).async_wait()
             if all_intervene_flags is not None:
                 intervene_data = get_mask_batch(splited_data[i], all_intervene_flags)
-                demo_data_channel.put(intervene_data)
+                await demo_data_channel.put(intervene_data, async_op=True).async_wait()
 
     async def run(self, data_channel: Channel, demo_channel: Channel, split_num):
         cnt = 0
