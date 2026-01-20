@@ -72,9 +72,33 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self.update_rollout_weights()
         self.send_demo_buffer()
 
+        if self.reward is not None:
+            # -------------------- [print] --------------------
+            print(f"\n{'=' * 20} [Proof] Reward Model Enabled {'=' * 20}")
+            print("  > Mode: Async RealWorld")
+            print("  > Data Flow: Env -> RewardWorker -> Rollout")
+            print(f"{'=' * 60}\n", flush=True)
+            # -----------------------------------------------------
+            # Env -> Reward Input -> Reward Worker -> Env Channel -> Rollout
+            current_env_output_channel = self.reward_input_channel
+
+            self.reward.run_inference_loop(
+                input_channel=self.reward_input_channel, output_channel=self.env_channel
+            )
+        else:
+            # -------------------- [print] --------------------
+            print(
+                "\n[Proof] Reward Model NOT detected. Using Environment Reward.\n",
+                flush=True,
+            )
+            # -----------------------------------------------------
+
+            # Env -> Env Channel -> Rollout
+            current_env_output_channel = self.env_channel
+
         env_handle: Handle = self.env.interact(
             input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
+            output_channel=current_env_output_channel,
             env_metric_channel=self.env_metric_channel,
         )
         rollout_handle: Handle = self.rollout.generate(
