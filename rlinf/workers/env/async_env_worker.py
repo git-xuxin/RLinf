@@ -70,12 +70,13 @@ class AsyncEnvWorker(EnvWorker):
                 self.num_done_envs = 0
                 self.num_succ_envs = 0
                 for i in range(self.stage_num):
+                    zeros_bool = torch.zeros_like(self.last_dones_list[i])
                     env_output = EnvOutput(
                         obs=self.last_obs_list[i],
                         rewards=None,
-                        dones=self.last_dones_list[i],
-                        terminations=self.last_terminations_list[i],
-                        truncations=self.last_truncations_list[i],
+                        dones=zeros_bool,
+                        terminations=zeros_bool,
+                        truncations=zeros_bool,
                         intervene_actions=self.last_intervened_info_list[i][0],
                         intervene_flags=self.last_intervened_info_list[i][1],
                     )
