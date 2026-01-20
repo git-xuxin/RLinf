@@ -17,6 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
+import time
 
 import torch
 from omegaconf import DictConfig
@@ -1548,6 +1549,8 @@ class AsyncEmbodiedRolloutBuffer:
 
         # Organize data
         for i in range(split_num):
+            send_time = time.time()
+            splited_data[i]["send_time"] = send_time
             await data_channel.put(splited_data[i], async_op=True).async_wait()
             if all_intervene_flags is not None:
                 intervene_data = get_mask_batch(splited_data[i], all_intervene_flags)

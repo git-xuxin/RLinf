@@ -390,6 +390,8 @@ class NodeProbe:
         current_env_vars = os.environ
         modified_env_vars = {}
         for key, value in current_env_vars.items():
+            if key == "LD_LIBRARY_PATH":
+                continue
             if (
                 key not in head_node_default_env_vars
                 or head_node_default_env_vars[key] != value
