@@ -22,14 +22,17 @@ class KeyboardListener:
         self.state_lock = threading.Lock()
         self.latest_data = {"key": None}
 
-        self.listener = keyboard.Listener(on_press=self.on_key_press)
+        self.listener = keyboard.Listener(on_press=self.on_key_press, on_release=self.on_key_release)
         self.listener.start()
         self.last_intervene = 0
 
     def on_key_press(self, key):
-        while True:
-            with self.state_lock:
-                self.latest_data["key"] = key.char if hasattr(key, "char") else str(key)
+        with self.state_lock:
+            self.latest_data["key"] = key.char if hasattr(key, "char") else str(key)
+
+    def on_key_release(self, key):
+        with self.state_lock:
+            self.latest_data["key"] = None
 
     def get_key(self) -> str | None:
         """Returns the latest key pressed."""
