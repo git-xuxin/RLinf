@@ -12,12 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any, SupportsFloat
 import gymnasium as gym
-
+from gymnasium.core import ActType, ObsType
 from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
 
 
-class KeyboardBinaryRewardWrapper(gym.RewardWrapper):
+class KeyboardBinaryRewardDoneWrapper(gym.Wrapper):
     """
     Modify the reward based on keyboard input.
     Pressing 'u' increases the reward by 1.
@@ -31,6 +32,7 @@ class KeyboardBinaryRewardWrapper(gym.RewardWrapper):
 
     def _check_keypress(self) -> None:
         key = self.listener.get_key()
+        print(f"Key pressed: {key}")
         if key not in ["a", "b", "c"]:
             return False, 0
         if key == "a":
@@ -40,7 +42,16 @@ class KeyboardBinaryRewardWrapper(gym.RewardWrapper):
         elif key == "c":
             reward = 1
         return True, reward
+    
+    def step(
+        self, action: ActType
+    ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
+        """Modifies the :attr:`env` :meth:`step` reward using :meth:`self.reward`."""
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        updated_reward, updated_terminated = self.reward_terminated()
+        return observation, updated_reward, updated_terminated, truncated, info
 
-    def reward(self, reward) -> float:
+    def reward_terminated(self, ) -> float:
         last_intervened, keyboard_reward = self._check_keypress()
-        return keyboard_reward
+        terminated = keyboard_reward >= 1
+        return keyboard_reward, terminated

@@ -28,7 +28,7 @@ from omegaconf import OmegaConf
 
 from rlinf.envs.realworld.common.wrappers import (
     GripperCloseEnv,
-    KeyboardBinaryRewardWrapper,
+    KeyboardBinaryRewardDoneWrapper,
     Quat2EulerWrapper,
     RelativeFrame,
     SpacemouseIntervention,
@@ -95,7 +95,7 @@ class RealWorldEnv(gym.Env):
         if not env.config.is_dummy and self.cfg.get(
             "use_keyboard_reward_wrapper", True
         ):
-            env = KeyboardBinaryRewardWrapper(env)
+            env = KeyboardBinaryRewardDoneWrapper(env)
         env = RelativeFrame(env)
         env = Quat2EulerWrapper(env)
         return env

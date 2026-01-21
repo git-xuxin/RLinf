@@ -23,7 +23,6 @@ class KeyboardListener:
         self.latest_data = {"key": None}
 
         self.listener = keyboard.Listener(on_press=self.on_key_press)
-        self.thread.daemon = True
         self.listener.start()
         self.last_intervene = 0
 
