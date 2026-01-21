@@ -108,9 +108,11 @@ def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
     return ret
 
 
-def get_mask_batch(nested_dict, dict_mask):
+def get_mask_batch(nested_dict, dict_mask, ignore_keys=[]):
     sample_dict = {}
     for key, value in nested_dict.items():
+        if key in ignore_keys:
+            continue
         if isinstance(value, torch.Tensor):
             sample_dict[key] = value[dict_mask]
         elif isinstance(value, dict):
