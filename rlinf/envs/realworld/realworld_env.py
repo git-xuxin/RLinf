@@ -28,6 +28,7 @@ from omegaconf import OmegaConf
 
 from rlinf.envs.realworld.common.wrappers import (
     GripperCloseEnv,
+    KeyboardBinaryRewardWrapper,
     Quat2EulerWrapper,
     RelativeFrame,
     SpacemouseIntervention,
@@ -91,6 +92,10 @@ class RealWorldEnv(gym.Env):
         env = GripperCloseEnv(env)
         if not env.config.is_dummy and self.cfg.get("use_spacemouse", True):
             env = SpacemouseIntervention(env)
+        if not env.config.is_dummy and self.cfg.get(
+            "use_keyboard_reward_wrapper", True
+        ):
+            env = KeyboardBinaryRewardWrapper(env)
         env = RelativeFrame(env)
         env = Quat2EulerWrapper(env)
         return env
@@ -256,9 +261,7 @@ class RealWorldEnv(gym.Env):
             }
             self.add_new_frames(raw_obs["frames"], plot_infos)
 
-        infos = self._record_metrics(
-            step_reward, terminations, intervene_flag, infos
-        )
+        infos = self._record_metrics(step_reward, terminations, intervene_flag, infos)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False

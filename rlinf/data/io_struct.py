@@ -13,11 +13,11 @@
 # limitations under the License.
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
-import time
 
 import torch
 from omegaconf import DictConfig
@@ -1553,7 +1553,9 @@ class AsyncEmbodiedRolloutBuffer:
             splited_data[i]["send_time"] = send_time
             await data_channel.put(splited_data[i], async_op=True).async_wait()
             if all_intervene_flags is not None:
-                intervene_data = get_mask_batch(splited_data[i], all_intervene_flags, ignore_keys=["send_time"])
+                intervene_data = get_mask_batch(
+                    splited_data[i], all_intervene_flags, ignore_keys=["send_time"]
+                )
                 intervene_data["send_time"] = time.time()
                 await demo_data_channel.put(intervene_data, async_op=True).async_wait()
 
