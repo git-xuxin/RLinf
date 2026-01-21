@@ -966,6 +966,24 @@ class ImageRewardWorker(Worker):
                     logger.info("Received stop signal, ending inference loop")
                     break
 
+                dones = data.get("dones")
+                final_obs = data.get("final_obs")
+
+                is_done_flag = False
+                if dones is not None:
+                    if isinstance(dones, torch.Tensor):
+                        is_done_flag = dones.any().item()
+                    else:
+                        is_done_flag = bool(dones)
+
+                # If Done=True is displayed but there's no final_obs, it means this is the starting frame after a Reset.
+                # In this case, Reward should not be calculated, as it would trigger an Invariant check in RolloutWorker.
+                if is_done_flag and final_obs is None:
+                    output_data = data.copy()  # copy.deepcopy(data)
+                    output_data["rewards"] = None
+                    output_channel.put(output_data, key=target_key, async_op=True)
+                    continue
+
                 images = data.get("images")
                 if images is None:
                     images = data.get("main_images")
