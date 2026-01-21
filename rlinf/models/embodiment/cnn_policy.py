@@ -178,7 +178,7 @@ class CNNPolicy(BasePolicy):
         if env_obs.get("extra_view_images", None) is not None:
             processed_env_obs["extra_view_images"] = (
                 env_obs["extra_view_images"].clone().to(device).float() / 255.0
-            ).permute(0, 3, 1, 2)
+            ).permute(0, 1, 4, 2, 3)
         return processed_env_obs
 
     def get_feature(self, obs, detach_encoder=False):
