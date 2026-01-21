@@ -93,7 +93,7 @@ class RealWorldEnv(gym.Env):
         if not env.config.is_dummy and self.cfg.get("use_spacemouse", True):
             env = SpacemouseIntervention(env)
         if not env.config.is_dummy and self.cfg.get(
-            "use_keyboard_reward_wrapper", True
+            "use_keyboard_reward_wrapper", False
         ):
             env = KeyboardBinaryRewardDoneWrapper(env)
         env = RelativeFrame(env)

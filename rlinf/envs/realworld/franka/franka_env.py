@@ -260,7 +260,7 @@ class FrankaEnv(gym.Env):
         else:
             return 0.0
 
-    def reset(self, *, seed=None, options=None):
+    def reset(self, joint_reset=False, seed=None, options=None):
         if self.config.is_dummy:
             observation = self._get_observation()
             return observation, {}

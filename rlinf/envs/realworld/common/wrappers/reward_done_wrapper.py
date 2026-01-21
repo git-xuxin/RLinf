@@ -13,8 +13,10 @@
 # limitations under the License.
 
 from typing import Any, SupportsFloat
+
 import gymnasium as gym
 from gymnasium.core import ActType, ObsType
+
 from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
 
 
@@ -42,7 +44,7 @@ class KeyboardBinaryRewardDoneWrapper(gym.Wrapper):
         elif key == "c":
             reward = 1
         return True, reward
-    
+
     def step(
         self, action: ActType
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
@@ -51,7 +53,9 @@ class KeyboardBinaryRewardDoneWrapper(gym.Wrapper):
         updated_reward, updated_terminated = self.reward_terminated()
         return observation, updated_reward, updated_terminated, truncated, info
 
-    def reward_terminated(self, ) -> float:
+    def reward_terminated(
+        self,
+    ) -> float:
         last_intervened, keyboard_reward = self._check_keypress()
         terminated = keyboard_reward >= 1
         return keyboard_reward, terminated

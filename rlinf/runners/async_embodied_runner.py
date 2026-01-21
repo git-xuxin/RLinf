@@ -116,7 +116,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             train_step += 1
 
             with self.timer("sync_weights"):
-                self.update_rollout_weights(enable_wait=False)
+                self.update_rollout_weights(enable_wait=True)
 
             training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
             self.metric_logger.log(training_metrics, train_step)

@@ -14,6 +14,9 @@
 
 from gymnasium.envs.registration import register
 
+from rlinf.envs.realworld.franka.tasks.franka_bin_relocation import (
+    FrankaBinRelocationEnv as FrankaBinRelocationEnv,
+)
 from rlinf.envs.realworld.franka.tasks.peg_insertion_env import (
     PegInsertionEnv as PegInsertionEnv,
 )
@@ -21,4 +24,9 @@ from rlinf.envs.realworld.franka.tasks.peg_insertion_env import (
 register(
     id="PegInsertionEnv-v1",
     entry_point="rlinf.envs.realworld.franka.tasks:PegInsertionEnv",
+)
+
+register(
+    id="FrankaBinRelocationEnv-v1",
+    entry_point="rlinf.envs.realworld.franka.tasks:FrankaBinRelocationEnv",
 )
