@@ -51,7 +51,9 @@ class DataCollector(Worker):
             if key == "main_images":
                 ret_obs[key] = obs[key].clone().permute(0, 3, 1, 2)[0].float() / 255.0
             elif key == "extra_view_images":
-                ret_obs[key] = obs[key].clone().permute(0, 1, 4, 2, 3)[0].float() / 255.0
+                ret_obs[key] = (
+                    obs[key].clone().permute(0, 1, 4, 2, 3)[0].float() / 255.0
+                )
             else:
                 ret_obs[key] = obs[key][0]
         return ret_obs

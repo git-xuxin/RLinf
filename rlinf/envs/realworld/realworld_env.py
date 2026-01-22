@@ -28,7 +28,8 @@ from omegaconf import OmegaConf
 
 from rlinf.envs.realworld.common.wrappers import (
     GripperCloseEnv,
-    KeyboardBinaryRewardDoneWrapper,
+    KeyboardRewardDoneMultiStageWrapper,
+    KeyboardRewardDoneWrapper,
     Quat2EulerWrapper,
     RelativeFrame,
     SpacemouseIntervention,
@@ -93,10 +94,12 @@ class RealWorldEnv(gym.Env):
             env = GripperCloseEnv(env)
         if not env.config.is_dummy and self.cfg.get("use_spacemouse", True):
             env = SpacemouseIntervention(env)
-        if not env.config.is_dummy and self.cfg.get(
-            "use_keyboard_reward_wrapper", False
-        ):
-            env = KeyboardBinaryRewardDoneWrapper(env)
+        if not env.config.is_dummy and self.cfg.get("keyboard_reward_wrapper", None):
+            if self.cfg.keyboard_reward_wrapper == "multi_stage":
+                env = KeyboardRewardDoneMultiStageWrapper(env)
+            elif self.cfg.keyboard_reward_wrapper == "single_stage":
+                env = KeyboardRewardDoneWrapper(env)
+
         env = RelativeFrame(env)
         env = Quat2EulerWrapper(env)
         return env
