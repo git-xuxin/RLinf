@@ -20,30 +20,14 @@ from gymnasium.core import ActType, ObsType
 from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListener
 
 
-class KeyboardBinaryRewardDoneWrapper(gym.Wrapper):
-    """
-    Modify the reward based on keyboard input.
-    Pressing 'u' increases the reward by 1.
-    Pressing 'd' decreases the reward by 1.
-    """
-
+class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
     def __init__(self, env: gym.Env):
         super().__init__(env)
         self.reward_modifier = 0
         self.listener = KeyboardListener()
 
-    def _check_keypress(self) -> None:
-        key = self.listener.get_key()
-        print(f"Key pressed: {key}")
-        if key not in ["a", "b", "c"]:
-            return False, 0
-        if key == "a":
-            reward = -1
-        elif key == "b":
-            reward = 0
-        elif key == "c":
-            reward = 1
-        return True, reward
+    def _check_keypress(self) -> tuple[bool, bool, float]:
+        raise NotImplementedError
 
     def step(
         self, action: ActType
@@ -55,7 +39,56 @@ class KeyboardBinaryRewardDoneWrapper(gym.Wrapper):
 
     def reward_terminated(
         self,
-    ) -> float:
-        last_intervened, keyboard_reward = self._check_keypress()
-        terminated = keyboard_reward >= 1
+    ) -> tuple[float, bool]:
+        last_intervened, terminated, keyboard_reward = self._check_keypress()
         return keyboard_reward, terminated
+
+
+class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
+    def _check_keypress(self) -> tuple[bool, bool, float]:
+        last_intervened = False
+        done = False
+        reward = 0
+        key = self.listener.get_key()
+        print(f"Key pressed: {key}")
+        if key not in ["a", "b", "c"]:
+            return last_intervened, done, reward
+        if key == "a":
+            reward = -1
+            done = True
+        elif key == "b":
+            reward = 0
+        elif key == "c":
+            reward = 1
+            done = True
+        return last_intervened, done, reward
+
+
+class KeyboardRewardDoneMultiStageWrapper(BaseKeyboardRewardDoneWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.stage_rewards = [0, 1, 2]
+
+    def reset(self, *, seed=None, options=None):
+        self.reward_stage = 0
+        return super().reset(seed=seed, options=options)
+
+    def _check_keypress(self) -> tuple[bool, bool, float]:
+        last_intervened = False
+        done = False
+        reward = 0
+        key = self.listener.get_key()
+        print(f"Key pressed: {key}")
+        if key == "a":
+            self.reward_stage = 0
+        elif key == "b":
+            self.reward_stage = 1
+        elif key == "c":
+            self.reward_stage = 2
+            done = True
+
+        reward = self.stage_rewards[self.reward_stage]
+        if key == "q":
+            reward = -1
+            done = True
+        return last_intervened, done, reward
