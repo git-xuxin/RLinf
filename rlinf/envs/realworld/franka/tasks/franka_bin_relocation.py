@@ -86,8 +86,8 @@ class BinEnvConfig(FrankaRobotConfig):
         self.action_scale = np.array([0.05, 0.1, 1])
         self.ee_pose_limit_min = np.array(
             [
-                self.target_ee_pose[0] - self.random_xy_range,
-                self.target_ee_pose[1] - self.random_xy_range,
+                self.target_ee_pose[0] - self.random_x_range,
+                self.target_ee_pose[1] - self.random_y_range,
                 self.target_ee_pose[2] - self.random_z_range_low,
                 self.target_ee_pose[3] - 0.01,
                 self.target_ee_pose[4] - 0.01,
@@ -96,8 +96,8 @@ class BinEnvConfig(FrankaRobotConfig):
         )
         self.ee_pose_limit_max = np.array(
             [
-                self.target_ee_pose[0] + self.random_xy_range,
-                self.target_ee_pose[1] + self.random_xy_range,
+                self.target_ee_pose[0] + self.random_x_range,
+                self.target_ee_pose[1] + self.random_y_range,
                 self.target_ee_pose[2] + self.random_z_range_high,
                 self.target_ee_pose[3] + 0.01,
                 self.target_ee_pose[4] + 0.01,
@@ -110,7 +110,7 @@ class FrankaBinRelocationEnv(FrankaEnv):
     def __init__(self, override_cfg, worker_info=None, hardware_info=None, env_idx=0):
         config = BinEnvConfig(**override_cfg)
         super().__init__(config, worker_info, hardware_info, env_idx)
-        # self.observation_space["images"] = gym.spaces.Dict(
+        # self.observation_space["frames"] = gym.spaces.Dict(
         #     {
         #         "wrist_1": gym.spaces.Box(0, 255, shape=(128, 128, 3), dtype=np.uint8),
         #         "front": gym.spaces.Box(0, 255, shape=(128, 128, 3), dtype=np.uint8),
@@ -181,24 +181,18 @@ class FrankaBinRelocationEnv(FrankaEnv):
 
     def _crop_frame(self, name, image):
         """Crop realsense images to be a square."""
-        if name == "wrist_1":
-            return image[:, 80:560, :]
-        elif name == "front":
-            # return image[:, 80:560, :]
-            return image
-        else:
-            return ValueError(f"Camera {name} not recognized in cropping")
+        return image[:, 80:560, :]
 
     def _get_camera_frames(self):
         images = {}
         display_images = {}
         for camera in self._cameras:
             try:
-                rgb = camera.get_frames()
+                rgb = camera.get_frame()
                 cropped_rgb = self._crop_frame(camera.name, rgb)
                 resized = cv2.resize(
                     cropped_rgb,
-                    self.observation_space["images"][camera.name].shape[:2][::-1],
+                    self.observation_space["frames"][camera.name].shape[:2][::-1],
                 )
                 images[camera.name] = resized[..., ::-1]
                 display_images[camera.name] = resized
