@@ -64,9 +64,16 @@ class DataCollector(Worker):
         progress_bar = tqdm(
             range(self.num_data_episodes), desc="Collecting Data Episodes:"
         )
+        action_dim = 6 if self.cfg.env.eval.get("no_gripper", True) else 7
         while success_cnt < self.num_data_episodes:
-            action = np.zeros((1, 6))
-            next_obs, reward, done, _, info = self.env.step(action)
+            action = np.zeros((1, action_dim), dtype=np.float32)
+            next_obs, reward, terminated, truncated, info = self.env.step(action)
+            if self.cfg.env.eval.get("enable_truncated", False):
+                done = torch.logical_or(terminated, truncated)
+            else:
+                done = terminated.clone()
+                truncated = torch.zeros_like(terminated)
+
             if "intervene_action" in info:
                 action = info["intervene_action"]
 
@@ -76,10 +83,14 @@ class DataCollector(Worker):
             single_action = action[0]
             single_reward = reward[0]
             single_done = done[0]
+            single_terminated = terminated[0]
+            single_truncated = truncated[0]
 
             # Handle chunk
             chunk_done = single_done[None, ...]
             chunk_reward = single_reward[None, ...]
+            chunk_terminated = single_terminated[None, ...]
+            chunk_truncated = single_truncated[None, ...]
 
             transition = copy.deepcopy(
                 {
@@ -93,8 +104,8 @@ class DataCollector(Worker):
                     "action": single_action,
                     "rewards": chunk_reward,
                     "dones": chunk_done,
-                    "terminations": chunk_done,
-                    "truncations": torch.zeros_like(chunk_done),
+                    "terminations": chunk_terminated,
+                    "truncations": chunk_truncated,
                 }
             )
             self.data_list.append(data)
@@ -102,7 +113,7 @@ class DataCollector(Worker):
             obs = next_obs
 
             if done:
-                success_cnt += reward
+                success_cnt += 1
                 self.total_cnt += 1
                 self.log_info(
                     f"{reward}\tGot {success_cnt} successes of {self.total_cnt} trials. {self.num_data_episodes} successes needed."
