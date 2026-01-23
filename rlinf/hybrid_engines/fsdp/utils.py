@@ -45,6 +45,7 @@ from torch.distributed.fsdp.wrap import (
 from torch.optim import Optimizer
 from transformers.trainer_pt_utils import get_module_class_from_name
 
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from rlinf.hybrid_engines.fsdp import (
     BackwardPrefetch,
     CPUOffloadPolicy,
@@ -96,7 +97,7 @@ def get_init_weight_context_manager(use_meta_tensor=True):
     return init_context
 
 
-def get_fsdp_wrap_policy(module, config=None, is_lora=False, is_openvla_model=False):
+def get_fsdp_wrap_policy(module, config=None, is_lora=False, is_openvla_model=False, is_small_model=False):
     """
     FSDP wrap policy that handles both standard transformer models and VLA models.
 
@@ -108,6 +109,12 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, is_openvla_model=Fa
     Returns:
         FSDP auto wrap policy function
     """
+    if is_small_model:
+        auto_wrap_policy = functools.partial(
+            size_based_auto_wrap_policy,
+            min_num_params=0,
+        )
+        return auto_wrap_policy
     if config is None:
         config = {}
 
