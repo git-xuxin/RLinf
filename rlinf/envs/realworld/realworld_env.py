@@ -186,7 +186,7 @@ class RealWorldEnv(gym.Env):
         self.returns += step_reward
         self.success_once = self.success_once | terminations
         self.intervened_once = self.intervened_once | intervene_current_step
-        self.intervened_steps += self.intervened_steps.astype(int)
+        self.intervened_steps += intervene_current_step.astype(int)
 
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()

@@ -83,22 +83,24 @@ class CNNPolicy(BasePolicy):
         self.cfg = cfg
         self.in_channels = self.cfg.image_size[0]
 
-        self.encoders = nn.ModuleList()
-        encoder_out_dim = 0
+        self.encoders = nn.ModuleDict()
+        resnet_encoders = nn.ModuleList()
+        self.encoder_out_dim = 0
         if self.cfg.backbone == "resnet":
             sample_x = torch.randn(1, *self.cfg.image_size)
             for img_id in range(self.cfg.image_num):
-                self.encoders.append(
+                resnet_encoders.append(
                     ResNetEncoder(
                         sample_x, out_dim=256, encoder_cfg=self.cfg.encoder_config
                     )
                 )
-                encoder_out_dim += self.encoders[img_id].out_dim
+                self.encoder_out_dim += resnet_encoders[img_id].out_dim
         else:
             raise NotImplementedError
+        self.encoders["resnet_encoders"] = resnet_encoders
 
         if self.cfg.backbone == "resnet":
-            self.state_proj = nn.Sequential(
+            state_proj = nn.Sequential(
                 *make_mlp(
                     in_channels=self.cfg.state_dim,
                     mlp_channels=[
@@ -109,10 +111,12 @@ class CNNPolicy(BasePolicy):
                     use_layer_norm=True,
                 )
             )
-            init_mlp_weights(self.state_proj, nonlinearity="tanh")
+            init_mlp_weights(state_proj, nonlinearity="tanh")
+            self.encoders["state_proj"] = state_proj
+
             self.mix_proj = nn.Sequential(
                 *make_mlp(
-                    in_channels=encoder_out_dim + self.cfg.state_latent_dim,
+                    in_channels=self.encoder_out_dim + self.cfg.state_latent_dim,
                     mlp_channels=[256, 256],
                     act_builder=nn.Tanh,
                     last_act=True,
@@ -132,7 +136,7 @@ class CNNPolicy(BasePolicy):
             )
         if self.cfg.add_q_head:
             if self.cfg.backbone == "resnet":
-                hidden_size = encoder_out_dim + self.cfg.state_latent_dim
+                hidden_size = self.encoder_out_dim + self.cfg.state_latent_dim
                 hidden_dims = [256, 256, 256]
             if self.cfg.q_head_type == "default":
                 self.q_head = MultiQHead(
@@ -167,6 +171,15 @@ class CNNPolicy(BasePolicy):
     @property
     def num_action_chunks(self):
         return self.cfg.num_action_chunks
+    
+    @property
+    def resnet_encoders(self):
+        return self.encoders["resnet_encoders"]
+
+    @property
+    def state_proj(self):
+        return self.encoders["state_proj"]
+
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -188,7 +201,7 @@ class CNNPolicy(BasePolicy):
                 images = obs["main_images"]
             else:
                 images = obs["extra_view_images"][:, img_id - 1]
-            visual_features.append(self.encoders[img_id](images))
+            visual_features.append(self.resnet_encoders[img_id](images))
         visual_feature = torch.cat(visual_features, dim=-1)
         if detach_encoder:
             visual_feature = visual_feature.detach()

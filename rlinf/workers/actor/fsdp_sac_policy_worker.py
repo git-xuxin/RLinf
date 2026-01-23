@@ -112,7 +112,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         else:
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    if "q_head" in name:
+                    if "q_head" in name or "encoders" in name:
                         params_critic.append(param)
                     else:
                         params_actor.append(param)
