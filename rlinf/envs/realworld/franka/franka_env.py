@@ -276,8 +276,11 @@ class FrankaEnv(gym.Env):
                     f"Current reward={reward}",
                 )
 
-            if self.config.enable_gripper_penalty and is_gripper_action_effective:
-                reward -= self.config.gripper_penalty
+            # Use getattr for backward compatibility with older configs
+            enable_gripper_penalty = getattr(self.config, "enable_gripper_penalty", True)
+            gripper_penalty = getattr(self.config, "gripper_penalty", 0.1)
+            if enable_gripper_penalty and is_gripper_action_effective:
+                reward -= gripper_penalty
 
             return reward
         else:

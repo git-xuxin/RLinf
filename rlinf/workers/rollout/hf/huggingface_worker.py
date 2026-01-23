@@ -174,8 +174,8 @@ class MultiStepRolloutWorker(Worker):
         return actions, result
 
     def compute_gripper_penalty(
-        self, env_output: dict[str, torch.Tensor], actions: torch.Tensor
-    ) -> torch.Tensor:
+        self, env_output: dict[str, torch.Tensor], actions
+    ):
         """Compute gripper penalty for effective gripper actions (from SERL PR 65).
         
         Effective gripper actions are those that would change the gripper state:
@@ -186,11 +186,13 @@ class MultiStepRolloutWorker(Worker):
         
         Args:
             env_output: Environment output containing 'obs' with states
-            actions: Predicted actions tensor, shape (B, action_dim) or (B, num_chunks, action_dim)
+            actions: Predicted actions (tensor or numpy array), shape (B, action_dim) or (B, num_chunks, action_dim)
             
         Returns:
-            Penalty tensor of shape (B,) or (B, num_chunks) matching rewards shape
+            Tuple of (penalty, is_effective, is_effective_close, gripper_state, gripper_actions) or None
         """
+        import numpy as np
+        
         if not self.enable_gripper_penalty:
             return None
         
@@ -201,6 +203,9 @@ class MultiStepRolloutWorker(Worker):
         if states is None:
             return None
         
+        # Convert states to torch tensor if needed
+        if isinstance(states, np.ndarray):
+            states = torch.from_numpy(states)
         if isinstance(states, torch.Tensor):
             states = states.cpu()
         
@@ -212,7 +217,9 @@ class MultiStepRolloutWorker(Worker):
         # Determine if gripper is currently open (higher value = more open)
         is_gripper_open = gripper_state > self.gripper_open_threshold  # [B,]
         
-        # Get gripper action from predicted actions
+        # Convert actions to torch tensor if needed
+        if isinstance(actions, np.ndarray):
+            actions = torch.from_numpy(actions)
         if isinstance(actions, torch.Tensor):
             actions = actions.cpu()
         
@@ -251,30 +258,88 @@ class MultiStepRolloutWorker(Worker):
             torch.zeros_like(gripper_actions, dtype=torch.float32)
         )
         
-        # Log for debugging
+        return penalty, is_effective, is_effective_close, gripper_state, gripper_actions
+
+    def apply_gripper_penalty_to_rewards(
+        self, env_output: dict[str, torch.Tensor], actions, rewards
+    ):
+        """Apply gripper penalty to rewards and log the results.
+        
+        This method computes the gripper penalty and adds it to the rewards.
+        It also logs detailed information about the penalty application.
+        
+        Args:
+            env_output: Environment output containing 'obs' with states
+            actions: Predicted actions tensor
+            rewards: Current rewards tensor, can be None (for first step)
+            
+        Returns:
+            Modified rewards tensor with gripper penalty applied, or original rewards if penalty not applicable
+        """
+        if not self.enable_gripper_penalty:
+            return rewards
+        
+        if rewards is None:
+            # First step has no rewards, skip penalty
+            return rewards
+        
+        result = self.compute_gripper_penalty(env_output, actions)
+        if result is None:
+            return rewards
+        
+        penalty, is_effective, is_effective_close, gripper_state, gripper_actions = result
+        
+        # Log for debugging (within Debug: log reward info section)
         if is_effective.any():
             batch_size = gripper_state.shape[0]
             for i in range(batch_size):
                 if gripper_actions.dim() == 1:
                     if is_effective[i]:
                         action_type = "CLOSE" if is_effective_close[i] else "OPEN"
+                        reward_val = rewards[i, 0].item() if rewards.dim() > 1 else rewards[i].item()
+                        penalty_val = penalty[i].item()
+                        final_reward = reward_val + penalty_val
                         logger.info(
-                            f"[Rollout] Gripper penalty: state={gripper_state[i].item():.4f}, "
+                            f"Debug: log reward info - gripper_state={gripper_state[i].item():.4f}, "
                             f"action={gripper_actions[i].item():.4f}, type={action_type}, "
-                            f"penalty={penalty[i].item():.2f}"
+                            f"rm_reward={reward_val:.2f}, gripper_penalty={penalty_val:.2f}, "
+                            f"final_reward={final_reward:.2f}"
                         )
                 else:
                     if is_effective[i].any():
                         for j in range(gripper_actions.shape[1]):
                             if is_effective[i, j]:
                                 action_type = "CLOSE" if is_effective_close[i, j] else "OPEN"
+                                reward_val = rewards[i, j].item() if rewards.dim() > 1 else rewards[i].item()
+                                penalty_val = penalty[i, j].item()
+                                final_reward = reward_val + penalty_val
                                 logger.info(
-                                    f"[Rollout] Gripper penalty: state={gripper_state[i].item():.4f}, "
+                                    f"Debug: log reward info - gripper_state={gripper_state[i].item():.4f}, "
                                     f"action[{j}]={gripper_actions[i, j].item():.4f}, type={action_type}, "
-                                    f"penalty={penalty[i, j].item():.2f}"
+                                    f"rm_reward={reward_val:.2f}, gripper_penalty={penalty_val:.2f}, "
+                                    f"final_reward={final_reward:.2f}"
                                 )
         
-        return penalty
+        # Apply penalty to rewards
+        # Ensure shapes match
+        if rewards.dim() == 1 and penalty.dim() == 1:
+            # Both are [B,]
+            modified_rewards = rewards + penalty
+        elif rewards.dim() == 2 and penalty.dim() == 1:
+            # rewards is [B, num_chunks], penalty is [B,]
+            # Expand penalty to match
+            modified_rewards = rewards + penalty.unsqueeze(1)
+        elif rewards.dim() == 2 and penalty.dim() == 2:
+            # Both are [B, num_chunks]
+            modified_rewards = rewards + penalty
+        else:
+            # Shape mismatch, just return original
+            logger.warning(
+                f"[Rollout] Gripper penalty shape mismatch: rewards={rewards.shape}, penalty={penalty.shape}"
+            )
+            return rewards
+        
+        return modified_rewards
 
     def get_dones_and_rewards(
         self, env_output: dict[str, torch.Tensor], extracted_obs: dict[str, Any]
@@ -411,6 +476,10 @@ class MultiStepRolloutWorker(Worker):
                         env_output, extracted_obs
                     )
                     actions, result = self.predict(extracted_obs)
+                    
+                    # Apply gripper penalty to rewards (bypasses env reward since combine_mode="replace")
+                    rewards = self.apply_gripper_penalty_to_rewards(env_output, actions, rewards)
+                    
                     chunk_step_result = ChunkStepResult(
                         prev_logprobs=result["prev_logprobs"],
                         prev_values=result["prev_values"],
@@ -445,6 +514,13 @@ class MultiStepRolloutWorker(Worker):
                 dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                     env_output, extracted_obs
                 )
+                
+                with self.worker_timer():
+                    actions, result = self.predict(extracted_obs)
+                
+                # Apply gripper penalty to rewards (bypasses env reward since combine_mode="replace")
+                rewards = self.apply_gripper_penalty_to_rewards(env_output, actions, rewards)
+                
                 self.buffer_list[stage_id].dones.append(dones)
                 self.buffer_list[stage_id].truncations.append(env_output["truncations"])
                 self.buffer_list[stage_id].terminations.append(
@@ -454,9 +530,6 @@ class MultiStepRolloutWorker(Worker):
                 self.buffer_list[stage_id].forward_inputs.append(
                     put_tensor_device(last_forward_inputs[stage_id], "cpu")
                 )
-
-                with self.worker_timer():
-                    actions, result = self.predict(extracted_obs)
                 # For the final step, we only need prev_values for bootstrapping
                 # This is a special case that doesn't create a full ChunkStepResult
                 if "prev_values" in result:
@@ -537,7 +610,7 @@ class MultiStepRolloutWorker(Worker):
         if self.reward_processor is not None and mode == "train":
             batch = self.reward_processor.process_env_batch(batch)
             
-            # Debug: log reward info
+            # Debug: log reward info (gripper penalty will be logged separately after predict())
             rewards = batch.get("rewards")
             probs = batch.get("probabilities")
             if rewards is not None and probs is not None:
@@ -545,7 +618,7 @@ class MultiStepRolloutWorker(Worker):
                     prob_val = probs[i].item()
                     reward_val = rewards[i, 0].item() if rewards.dim() > 1 else rewards[i].item()
                     result = "SUCCESS" if reward_val > 0 else "FAIL"
-                    logger.info(f"[Rollout] Reward: prob={prob_val:.4f}, reward={reward_val:.1f}, result={result}")
+                    logger.info(f"Debug: log reward info - prob={prob_val:.4f}, rm_reward={reward_val:.1f}, result={result}")
 
         return batch
 

@@ -74,6 +74,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     )
 
                     actions, result = self.predict(extracted_obs)
+                    
+                    # Apply gripper penalty to rewards (bypasses env reward since combine_mode="replace")
+                    rewards = self.apply_gripper_penalty_to_rewards(env_output, actions, rewards)
 
                     await self.buffer_list[stage_id].add(
                         "truncations",
@@ -111,6 +114,13 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                     env_output, extracted_obs
                 )
+                
+                with self.worker_timer():
+                    actions, result = self.predict(extracted_obs)
+                
+                # Apply gripper penalty to rewards (bypasses env reward since combine_mode="replace")
+                rewards = self.apply_gripper_penalty_to_rewards(env_output, actions, rewards)
+                
                 await self.buffer_list[i].add(
                     "truncations", env_output["truncations"].bool().cpu().contiguous()
                 )
@@ -124,9 +134,6 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     await self.buffer_list[i].add_result(
                         put_tensor_device(last_results[i], "cpu")
                     )
-
-                with self.worker_timer():
-                    actions, result = self.predict(extracted_obs)
                 if "prev_values" in result:
                     await self.buffer_list[i].add(
                         "prev_values", result["prev_values"].cpu().contiguous()

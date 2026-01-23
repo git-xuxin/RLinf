@@ -199,6 +199,17 @@ reward:
   reward_weight: 1.0
   env_reward_weight: 0.0
   
+  # Gripper penalty configuration (from SERL PR 65)
+  # Penalizes effective gripper actions (command close when open, vice versa)
+  # to prevent the policy from excessively opening and closing the gripper.
+  # This penalty is applied AFTER reward model output (bypasses env reward since combine_mode="replace").
+  enable_gripper_penalty: True       # Enable gripper penalty
+  gripper_penalty: 0.1               # Penalty value for effective gripper actions (default: -0.1)
+  binary_gripper_threshold: 0.5      # Threshold to determine gripper command (action > threshold = open, < -threshold = close)
+  gripper_state_index: 0             # Index of gripper state in sorted observation states (gripper_position is first after sort)
+  gripper_action_index: 6            # Index of gripper action in action vector (7th element, index 6)
+  gripper_open_threshold: 0.04       # Threshold to determine if gripper is currently open (based on gripper_position value)
+  
   model:
     model_type: "resnet_reward"
     arch: "resnet18"
