@@ -26,9 +26,17 @@ from rlinf.workers.env.env_worker import EnvWorker
 class AsyncEnvWorker(EnvWorker):
     async def recv_chunk_actions(
         self, input_channel: Channel, mode="train"
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, torch.Tensor | None]:
+        """Receive actions (and optionally terminations) from rollout worker.
+        
+        Returns:
+            Tuple of (chunk_actions, reward_terminations).
+            reward_terminations is None if not provided by rollout.
+        """
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         chunk_action = []
+        chunk_reward_terminations = []
+        
         for gather_id in range(self.gather_num):
             src_rank_in_rollout = gather_id + self._rank * self.gather_num
             work = self.recv(
@@ -36,11 +44,11 @@ class AsyncEnvWorker(EnvWorker):
             )
 
             def _callback():
-                rollout_mode, recv_action = work.wait()
+                rollout_mode, recv_data = work.wait()
                 if rollout_mode == "train":
-                    self.train_queue.put(recv_action)
+                    self.train_queue.put(recv_data)
                 elif rollout_mode == "eval":
-                    self.eval_queue.put(recv_action)
+                    self.eval_queue.put(recv_data)
 
             work.then(_callback)
 
@@ -51,10 +59,26 @@ class AsyncEnvWorker(EnvWorker):
 
             while queue.empty():
                 await asyncio.sleep(0.001)
-            action = queue.get_nowait()
-            chunk_action.append(action)
+            data = queue.get_nowait()
+            
+            # Handle new format: dict with actions and reward_terminations
+            if isinstance(data, dict):
+                chunk_action.append(data["actions"])
+                if "reward_terminations" in data and data["reward_terminations"] is not None:
+                    chunk_reward_terminations.append(data["reward_terminations"])
+            else:
+                # Legacy format: just actions
+                chunk_action.append(data)
+                
         chunk_action = np.concatenate(chunk_action, axis=0)
-        return chunk_action
+        
+        # Combine reward_terminations if any
+        if chunk_reward_terminations:
+            reward_terminations = torch.cat(chunk_reward_terminations, dim=0)
+        else:
+            reward_terminations = None
+            
+        return chunk_action, reward_terminations
 
     async def interact(
         self,
@@ -120,9 +144,9 @@ class AsyncEnvWorker(EnvWorker):
 
             for _ in range(n_chunk_steps):
                 for stage_id in range(self.stage_num):
-                    raw_chunk_actions = await self.recv_chunk_actions(input_channel)
+                    raw_chunk_actions, reward_terminations = await self.recv_chunk_actions(input_channel)
                     env_output, env_info = self.env_interact_step(
-                        raw_chunk_actions, stage_id
+                        raw_chunk_actions, stage_id, reward_terminations=reward_terminations
                     )
                     self.send_env_batch(output_channel, env_output.to_dict())
                     env_output_list[stage_id] = env_output

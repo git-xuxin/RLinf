@@ -101,7 +101,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     last_extracted_obs[stage_id] = extracted_obs
                     last_results[stage_id] = result
 
-                    self.send_chunk_actions(output_channel, actions)
+                    # Get reward-based termination signal (if reward processor detected success)
+                    reward_terminations = env_output.get("reward_terminations")
+                    self.send_chunk_actions(output_channel, actions, reward_terminations=reward_terminations)
 
             for i in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)

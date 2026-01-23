@@ -78,17 +78,10 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self.update_rollout_weights()
         self.send_demo_buffer()
 
-        if self.reward is not None:
-            # When reward model is enabled:
-            # Env -> (send to RewardGroup) -> RewardWorker -> (send to RolloutGroup) -> Rollout
-            # Start the reward worker inference loop (it uses send/recv internally)
-            self.reward.run_inference_loop(
-                input_channel=self.reward_input_channel,  # Not used, kept for API compatibility
-                output_channel=self.env_channel  # Not used, kept for API compatibility
-            )
+        # Data flow: env -> send -> rollout (reward processing integrated in rollout)
+        # If reward worker is configured, it will be called by rollout worker
+        # during recv_env_output() via reward_worker.process_env_batch()
 
-        # env.interact output_channel is not used when reward model is enabled
-        # (data is sent directly via send/recv)
         env_handle: Handle = self.env.interact(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,

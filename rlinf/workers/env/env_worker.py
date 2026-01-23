@@ -72,6 +72,10 @@ class EnvWorker(Worker):
         self.last_terminations_list = []
         self.last_truncations_list = []
         self.last_intervened_info_list = []
+        
+        # Pending reset flags for reward-based termination
+        # When reward model detects success, we need to reset env at next step
+        self.pending_reset_list = []
 
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
         assert (
@@ -228,14 +232,44 @@ class EnvWorker(Worker):
                 self.last_terminations_list.append(dones.clone())
                 self.last_truncations_list.append(dones.clone())
                 self.last_intervened_info_list.append((None, None))
+                # Initialize pending reset flag (no pending reset initially)
+                self.pending_reset_list.append(torch.zeros((self.train_num_envs_per_stage,), dtype=bool))
                 self.env_list[i].stop_env()
 
     def env_interact_step(
-        self, chunk_actions: torch.Tensor, stage_id: int
+        self, chunk_actions: torch.Tensor, stage_id: int, reward_terminations: torch.Tensor = None
     ) -> tuple[EnvOutput, dict[str, Any]]:
         """
         This function is used to interact with the environment.
+        
+        Args:
+            chunk_actions: Actions to execute
+            stage_id: Pipeline stage ID
+            reward_terminations: Optional termination signal from reward model (for early stopping on success)
         """
+        # Check if we need to reset due to previous reward-based termination
+        if self.pending_reset_list and self.pending_reset_list[stage_id].any():
+            # Reset the env for envs that had reward-based termination
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[Env] Performing pending reset for stage {stage_id} due to reward-based termination")
+            extracted_obs, infos = self.env_list[stage_id].reset()
+            # Clear the pending reset flag
+            self.pending_reset_list[stage_id] = torch.zeros_like(self.pending_reset_list[stage_id])
+            # Return reset observation with done=True to signal episode end
+            dones = torch.ones((self.train_num_envs_per_stage,), dtype=bool).unsqueeze(1).repeat(1, self.cfg.actor.model.num_action_chunks)
+            env_output = EnvOutput(
+                obs=extracted_obs,
+                final_obs=None,
+                rewards=None,
+                dones=dones,
+                terminations=dones.clone(),
+                truncations=torch.zeros_like(dones),
+                intervene_actions=None,
+                intervene_flags=None,
+            )
+            return env_output, {}
+        
         chunk_actions = prepare_actions(
             raw_chunk_actions=chunk_actions,
             env_type=self.cfg.env.train.env_type,
@@ -249,6 +283,19 @@ class EnvWorker(Worker):
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
+        
+        # Check for reward-based terminations and set pending reset for next step
+        if reward_terminations is not None and reward_terminations.any():
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"[Env] Reward-based termination detected, setting pending reset for stage {stage_id}")
+            # Set pending reset flag for next step
+            if self.pending_reset_list:
+                self.pending_reset_list[stage_id] = reward_terminations.clone()
+            # Update terminations and dones to reflect reward-based termination
+            reward_term_expanded = reward_terminations.unsqueeze(1).expand_as(chunk_terminations)
+            chunk_terminations = torch.logical_or(chunk_terminations, reward_term_expanded)
+            
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
@@ -272,7 +319,8 @@ class EnvWorker(Worker):
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
         if self.cfg.env.train.auto_reset and chunk_dones.any():
-            if "intervene_action" in infos["final_info"]:
+            # Check if final_info exists (may not exist if termination was triggered by reward model)
+            if "final_info" in infos and "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
 
@@ -328,9 +376,17 @@ class EnvWorker(Worker):
         )
         return env_output, env_info
 
-    def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
+    def recv_chunk_actions(self, input_channel: Channel, mode="train") -> tuple[np.ndarray, torch.Tensor | None]:
+        """Receive actions (and optionally terminations) from rollout worker.
+        
+        Returns:
+            Tuple of (chunk_actions, reward_terminations).
+            reward_terminations is None if not provided by rollout.
+        """
         assert mode in ["train", "eval"], f"{mode=} is not supported"
         chunk_action = []
+        chunk_reward_terminations = []
+        
         for gather_id in range(self.gather_num):
             src_rank_in_rollout = gather_id + self._rank * self.gather_num
             work = self.recv(
@@ -338,21 +394,37 @@ class EnvWorker(Worker):
             )
 
             def _callback():
-                rollout_mode, recv_action = work.wait()
+                rollout_mode, recv_data = work.wait()
                 if rollout_mode == "train":
-                    self.train_queue.put(recv_action)
+                    self.train_queue.put(recv_data)
                 elif rollout_mode == "eval":
-                    self.eval_queue.put(recv_action)
+                    self.eval_queue.put(recv_data)
 
             work.then(_callback)
 
             if mode == "train":
-                action = self.train_queue.get()
+                data = self.train_queue.get()
             elif mode == "eval":
-                action = self.eval_queue.get()
-            chunk_action.append(action)
+                data = self.eval_queue.get()
+            
+            # Handle new format: dict with actions and reward_terminations
+            if isinstance(data, dict):
+                chunk_action.append(data["actions"])
+                if "reward_terminations" in data and data["reward_terminations"] is not None:
+                    chunk_reward_terminations.append(data["reward_terminations"])
+            else:
+                # Legacy format: just actions
+                chunk_action.append(data)
+                
         chunk_action = np.concatenate(chunk_action, axis=0)
-        return chunk_action
+        
+        # Combine reward_terminations if any
+        if chunk_reward_terminations:
+            reward_terminations = torch.cat(chunk_reward_terminations, dim=0)
+        else:
+            reward_terminations = None
+            
+        return chunk_action, reward_terminations
 
     def finish_rollout(self, mode="train"):
         # reset
@@ -403,32 +475,15 @@ class EnvWorker(Worker):
     def send_env_batch(self, output_channel: Channel, env_batch, mode="train"):
         # split env_batch into num_processes chunks, each chunk contains gather_num env_batch
         assert mode in ["train", "eval"], f"{mode=} is not supported"
-        
-        # Check if reward model is enabled - if so, send to RewardGroup first
-        use_reward_model = self.cfg.get("reward", {}).get("use_reward_model", False)
-        
         for gather_id in range(self.gather_num):
             env_batch_i = self.split_env_batch(env_batch, gather_id, mode)
             dst_rank_in_rollout = gather_id + self._rank * self.gather_num
-            
-            if use_reward_model and mode == "train":
-                # When reward model is enabled, send to RewardGroup first
-                # RewardGroup will process and forward to RolloutGroup
-                reward_group_name = self.cfg.reward.get("group_name", "RewardGroup")
-                self.send(
-                    (mode, env_batch_i, dst_rank_in_rollout),  # Include dst_rank for forwarding
-                    reward_group_name,
-                    0,  # Send to rank 0 of reward group
-                    async_op=True,
-                )
-            else:
-                # Original behavior: direct send to rollout group
-                self.send(
-                    (mode, env_batch_i),
-                    self.cfg.rollout.group_name,
-                    dst_rank_in_rollout,
-                    async_op=True,
-                )
+            self.send(
+                (mode, env_batch_i),
+                self.cfg.rollout.group_name,
+                dst_rank_in_rollout,
+                async_op=True,
+            )
 
     def interact(self, input_channel: Channel, output_channel: Channel):
         for env in self.env_list:
@@ -490,9 +545,9 @@ class EnvWorker(Worker):
 
             for _ in range(n_chunk_steps):
                 for stage_id in range(self.stage_num):
-                    raw_chunk_actions = self.recv_chunk_actions(input_channel)
+                    raw_chunk_actions, reward_terminations = self.recv_chunk_actions(input_channel)
                     env_output, env_info = self.env_interact_step(
-                        raw_chunk_actions, stage_id
+                        raw_chunk_actions, stage_id, reward_terminations=reward_terminations
                     )
                     self.send_env_batch(output_channel, env_output.to_dict())
                     env_output_list[stage_id] = env_output

@@ -742,17 +742,19 @@ class ImageRewardWorker(Worker):
     """Image-based Reward Worker for inference during RL training.
 
     This worker loads a trained ResNetRewardModel checkpoint and computes
-    rewards for images received via channel communication.
+    rewards for images received via send/recv communication.
+
+    Data flow: env worker -> send -> reward worker -> send -> rollout worker
 
     Usage:
         - Configure with checkpoint_path pointing to trained model
-        - Connect input_channel (receives images) and output_channel (sends rewards)
-        - Call compute_rewards() in the training loop
+        - Call run_inference_loop() in the training loop
     """
 
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
         self.cfg = cfg
+        self.should_stop = False
 
         # Device setup
         torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
@@ -761,37 +763,45 @@ class ImageRewardWorker(Worker):
         # Placement
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
+        # Communication setup (same as env/rollout workers)
+        self.gather_num = self._component_placement.get_world_size(
+            "rollout"
+        ) // self._component_placement.get_world_size("env")
+
+        # Local queues for async recv
+        self.train_queue = Channel.create(name="reward_train_queue", local=True)
+        self.eval_queue = Channel.create(name="reward_eval_queue", local=True)
+
         # Model will be loaded in init_worker
         self.model = None
 
-        self.debug_save_dir = os.environ.get("DEBUG_IMAGE_SAVE_DIR", None)
-        self.debug_success_count = 0
-        self.debug_fail_count = 0
-        
         # Get reward config
         reward_cfg = cfg.get("reward", {})
         self.reward_threshold = reward_cfg.get("reward_threshold", 0.5)
         self.terminate_on_success = reward_cfg.get("terminate_on_success", False)
         self.success_reward = reward_cfg.get("success_reward", 1.0)
         self.fail_reward = reward_cfg.get("fail_reward", 0.0)
+        
+        # Gripper penalty configuration (from SERL PR 65)
+        # Penalizes effective gripper actions (command close when open, vice versa)
+        # to prevent the policy from excessively opening and closing the gripper
+        self.enable_gripper_penalty = reward_cfg.get("enable_gripper_penalty", False)
+        self.gripper_penalty = reward_cfg.get("gripper_penalty", 0.1)
+        self.binary_gripper_threshold = reward_cfg.get("binary_gripper_threshold", 0.5)
+        # Index of gripper state in observation state vector (default: first element after sort)
+        self.gripper_state_index = reward_cfg.get("gripper_state_index", 0)
+        # Index of gripper action in action vector (default: 7th element, index 6)
+        self.gripper_action_index = reward_cfg.get("gripper_action_index", 6)
+        # Threshold to determine if gripper is currently open (based on gripper_position value)
+        self.gripper_open_threshold = reward_cfg.get("gripper_open_threshold", 0.04)
+        
+        # Track previous gripper state for detecting effective actions
+        self._prev_gripper_open = None
 
     def init_worker(self):
         """Initialize the reward model from checkpoint."""
         reward_cfg = self.cfg.get("reward", {})
         model_cfg = reward_cfg.get("model", {})
-
-        # Get debug save dir from config or environment variable
-        self.debug_save_dir = model_cfg.get("debug_save_dir") or os.environ.get(
-            "DEBUG_IMAGE_SAVE_DIR", None
-        )
-
-        # Setup debug image saving directories
-        if self.debug_save_dir:
-            os.makedirs(os.path.join(self.debug_save_dir, "success"), exist_ok=True)
-            os.makedirs(os.path.join(self.debug_save_dir, "fail"), exist_ok=True)
-            logger.info(f"[Reward] debug_save_dir enabled: {self.debug_save_dir}")
-        else:
-            logger.warning(f"[Reward] debug_save_dir is None/disabled")
         checkpoint_path = model_cfg.get("checkpoint_path")
 
         if checkpoint_path is None:
@@ -803,6 +813,8 @@ class ImageRewardWorker(Worker):
         # Move to device and set eval mode
         self.model = self.model.to(self.device)
         self.model.eval()
+        
+        logger.info(f"[Reward] Initialized model from {checkpoint_path}")
 
     def compute_rewards(self, input_channel: Channel, output_channel: Channel):
         """Compute rewards for images received from input channel.
@@ -862,26 +874,6 @@ class ImageRewardWorker(Worker):
                 # Compute termination signal if terminate_on_success is enabled
                 terminations = is_success if self.terminate_on_success else torch.zeros_like(is_success, dtype=torch.bool)
 
-            if self.debug_save_dir:
-                original_images = data.get("main_images")
-                if original_images is None:
-                    original_images = data.get("images")
-                if original_images is None:
-                    original_images = data.get("reward_images")
-                if original_images is not None:
-                    if isinstance(original_images, np.ndarray):
-                        original_images = torch.from_numpy(original_images)
-                    original_images = original_images.to(self.device)
-                    if original_images.dim() == 4 and original_images.shape[-1] in [
-                        1,
-                        3,
-                        4,
-                    ]:
-                        original_images = original_images.permute(0, 3, 1, 2)
-                    if original_images.dtype == torch.uint8:
-                        original_images = original_images.float() / 255.0
-                    self._save_debug_images(original_images, rewards, probs)
-
             output_data = {
                 "rewards": rewards.cpu(),
                 "terminations": terminations.cpu(),
@@ -924,187 +916,264 @@ class ImageRewardWorker(Worker):
 
         return images
 
-    def _preprocess_images_for_save(self, images) -> torch.Tensor:
-        """Preprocess images for saving (convert to (B, C, H, W) in [0, 1] without normalization)."""
-        if isinstance(images, np.ndarray):
-            images = torch.from_numpy(images)
+    # =========================================================================
+    # Send/Recv based interface (for env -> reward -> rollout data flow)
+    # =========================================================================
 
-        if images.dim() == 4 and images.shape[-1] in [1, 3, 4]:
-            images = images.permute(0, 3, 1, 2)
+    def recv_env_batch(self, mode="train") -> dict:
+        """Receive environment batch from env worker using send/recv.
 
-        if images.dtype == torch.uint8:
-            images = images.float() / 255.0
-        elif images.dtype != torch.float32:
-            images = images.float()
-        
-        # Clamp to [0, 1] for saving
-        images = images.clamp(0, 1)
-
-        return images
-
-    def _save_debug_images(
-        self, images: torch.Tensor, rewards: torch.Tensor, probs: torch.Tensor = None
-    ):
-        """Save debug images based on ResNet classification results.
+        This mirrors the pattern in RolloutWorker.recv_env_output().
 
         Args:
-            images: Preprocessed images (B, C, H, W) in [0, 1]
-            rewards: Reward values from ResNet model (B,)
-            probs: Raw probability outputs from ResNet (B,), used for filename
-        
-        File naming format: {result}-{prob}.png
-            - result: "success" or "fail" based on threshold
-            - prob: probability value from the model (e.g., 0.8523)
+            mode: "train" or "eval"
+
+        Returns:
+            Environment batch dict with obs, rewards, dones, etc.
         """
-        from PIL import Image
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        src_rank_in_env = self._rank // self.gather_num
+        work = self.recv(
+            self.cfg.env.group_name, src_rank=src_rank_in_env, async_op=True
+        )
 
-        images_np = images.cpu().numpy()
-        rewards_np = rewards.cpu().numpy()
-        probs_np = probs.cpu().numpy() if probs is not None else rewards_np
+        def _callback():
+            env_mode, env_batch = work.wait()
+            if env_mode == "train":
+                self.train_queue.put_nowait(env_batch)
+            elif env_mode == "eval":
+                self.eval_queue.put_nowait(env_batch)
 
-        for idx in range(len(rewards_np)):
-            reward = rewards_np[idx]
-            prob = probs_np[idx]
-            img = images_np[idx]
+        work.then(_callback)
 
-            if img.shape[0] in [1, 3, 4]:
-                img = img.transpose(1, 2, 0)
-            img = (img * 255).clip(0, 255).astype(np.uint8)
-            if img.shape[-1] == 1:
-                img = img.squeeze(-1)
+        if mode == "train":
+            queue = self.train_queue
+        elif mode == "eval":
+            queue = self.eval_queue
 
-            is_success = reward > self.reward_threshold
-            if is_success:
-                self.debug_success_count += 1
-                result_str = "success"
-                count = self.debug_success_count
-                save_dir = os.path.join(self.debug_save_dir, "success")
+        # Blocking wait for data
+        return queue.get()
+
+    async def recv_env_batch_async(self, mode="train") -> dict:
+        """Async version of recv_env_batch for use in async context.
+
+        Args:
+            mode: "train" or "eval"
+
+        Returns:
+            Environment batch dict with obs, rewards, dones, etc.
+        """
+        import asyncio
+
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        src_rank_in_env = self._rank // self.gather_num
+        work = self.recv(
+            self.cfg.env.group_name, src_rank=src_rank_in_env, async_op=True
+        )
+
+        def _callback():
+            env_mode, env_batch = work.wait()
+            if env_mode == "train":
+                self.train_queue.put_nowait(env_batch)
+            elif env_mode == "eval":
+                self.eval_queue.put_nowait(env_batch)
+
+        work.then(_callback)
+
+        if mode == "train":
+            queue = self.train_queue
+        elif mode == "eval":
+            queue = self.eval_queue
+
+        while queue.empty():
+            await asyncio.sleep(0.001)
+        return queue.get_nowait()
+
+    def send_to_rollout(self, data: dict, mode="train"):
+        """Send processed data to rollout worker using send/recv.
+
+        This mirrors the pattern in EnvWorker.send_env_batch().
+
+        Args:
+            data: Processed environment batch with rewards added
+            mode: "train" or "eval"
+        """
+        assert mode in ["train", "eval"], f"{mode=} is not supported"
+        dst_rank_in_rollout = self._rank
+        return self.send(
+            (mode, data),
+            self.cfg.rollout.group_name,
+            dst_rank=dst_rank_in_rollout,
+            async_op=True,
+        )
+
+    def process_env_batch(self, env_batch: dict) -> dict:
+        """Process environment batch and add rewards.
+
+        Args:
+            env_batch: Environment batch dict from env worker
+
+        Returns:
+            Processed batch with rewards added
+        """
+        dones = env_batch.get("dones")
+        final_obs = env_batch.get("final_obs")
+
+        is_done_flag = False
+        if dones is not None:
+            if isinstance(dones, torch.Tensor):
+                is_done_flag = dones.any().item()
             else:
-                self.debug_fail_count += 1
-                result_str = "fail"
-                count = self.debug_fail_count
-                save_dir = os.path.join(self.debug_save_dir, "fail")
+                is_done_flag = bool(dones)
+
+        # If Done=True but no final_obs, this is the starting frame after Reset.
+        # Don't compute reward as it would trigger an Invariant check in RolloutWorker.
+        if is_done_flag and final_obs is None:
+            output_data = env_batch.copy()
+            output_data["rewards"] = None
+            return output_data
+
+        # Try to find images in the batch
+        images = env_batch.get("images")
+        if images is None:
+            images = env_batch.get("main_images")
+        if images is None and "obs" in env_batch and isinstance(env_batch["obs"], dict):
+            images = env_batch["obs"].get("main_images")
+
+        if images is None:
+            logger.warning("[Reward] No images found in env_batch")
+            return env_batch
+
+        images = self._preprocess_images(images)
+        images = images.to(self.device)
+        self.model.eval()
+
+        with torch.no_grad():
+            outputs = self.model(images)
+            probs = outputs["probabilities"]
+
+            # Determine success/fail based on threshold
+            is_success = probs > self.reward_threshold
+
+            # Map to binary rewards
+            rewards = torch.where(
+                is_success,
+                torch.full_like(probs, self.success_reward),
+                torch.full_like(probs, self.fail_reward),
+            )
+
+            # Compute termination signal if terminate_on_success is enabled
+            if self.terminate_on_success:
+                # Mark as terminated if success detected
+                reward_terminations = is_success
+            else:
+                reward_terminations = None
+
+        output_data = env_batch.copy()
+        cpu_rewards = rewards.cpu()
+        if cpu_rewards.dim() == 1:
+            cpu_rewards = cpu_rewards.unsqueeze(1)
+        output_data["rewards"] = cpu_rewards
+        output_data["probabilities"] = probs.cpu()
+        
+        # Add reward_terminations signal for env to trigger early reset
+        if reward_terminations is not None:
+            output_data["reward_terminations"] = reward_terminations.cpu()
             
-            # Filename format: {count}_{result}-{prob}.png (e.g., 000001_success-0.8523.png)
-            filename = f"{count:06d}_{result_str}-{prob:.4f}.png"
+            # Also update terminations/dones for rollout buffer
+            existing_terminations = env_batch.get("terminations")
+            if existing_terminations is not None:
+                # Merge: terminate if either env or reward says terminate
+                # reward_terminations shape: (B,), existing_terminations shape: (B, num_chunks)
+                reward_term_expanded = reward_terminations.cpu().unsqueeze(1).expand_as(existing_terminations)
+                output_data["terminations"] = torch.logical_or(existing_terminations, reward_term_expanded)
+                output_data["dones"] = torch.logical_or(env_batch.get("dones", existing_terminations), reward_term_expanded)
+            else:
+                output_data["terminations"] = reward_terminations.cpu()
+                output_data["dones"] = reward_terminations.cpu()
 
-            os.makedirs(save_dir, exist_ok=True)
-            try:
-                pil_img = Image.fromarray(img)
-                save_path = os.path.join(save_dir, filename)
-                pil_img.save(save_path)
-                logger.info(f"[Debug] Saved image: {save_path}")
-            except Exception as e:
-                logger.error(f"[Debug] Failed to save image: {e}")
+        return output_data
 
-    def run_inference_loop(self, input_channel: Channel, output_channel: Channel):
-        """Run continuous inference loop (for use in RL training).
+    async def run_inference_loop_async(self, mode="train"):
+        """Run continuous inference loop using send/recv (async version).
 
-        This method receives data from EnvWorker via self.recv(), computes rewards,
-        and forwards the data to RolloutWorker via self.send().
+        Data flow: env worker -> recv -> process -> send -> rollout worker
 
         Args:
-            input_channel: Channel (not used, kept for API compatibility)
-            output_channel: Channel (not used, kept for API compatibility)
+            mode: "train" or "eval"
         """
-        logger.info("Starting ImageRewardWorker inference loop")
-        
-        env_group_name = self.cfg.env.group_name
-        rollout_group_name = self.cfg.rollout.group_name
+        logger.info(f"Starting ImageRewardWorker inference loop (mode={mode})")
 
-        while True:
+        while not self.should_stop:
             try:
-                # Receive data from EnvWorker using point-to-point communication
-                work = self.recv(env_group_name, src_rank=None, async_op=True)
-                recv_data = work.wait()
-                
-                if recv_data is None:
-                    logger.info("Received stop signal, ending inference loop")
-                    break
+                # Receive from env worker
+                env_batch = await self.recv_env_batch_async(mode=mode)
 
-                # Unpack: (mode, env_batch, dst_rank_in_rollout)
-                mode, env_batch, dst_rank_in_rollout = recv_data
-                
-                # Skip eval mode - just forward without reward computation
-                if mode != "train":
-                    self.send(
-                        (mode, env_batch),
-                        rollout_group_name,
-                        dst_rank_in_rollout,
-                        async_op=True,
-                    )
-                    continue
+                # Process and add rewards
+                output_data = self.process_env_batch(env_batch)
 
-                # Extract images for reward computation
-                images = env_batch.get("images")
-                if images is None:
-                    images = env_batch.get("main_images")
-                if images is None and "obs" in env_batch and isinstance(env_batch["obs"], dict):
-                    images = env_batch["obs"].get("main_images")
-
-                if images is None:
-                    logger.warning("Received data but no images found, forwarding without reward")
-                    self.send(
-                        (mode, env_batch),
-                        rollout_group_name,
-                        dst_rank_in_rollout,
-                        async_op=True,
-                    )
-                    continue
-
-                # 保存原始图片用于 debug
-                original_images = images.clone() if isinstance(images, torch.Tensor) else images
-                
-                images = self._preprocess_images(images)
-                images = images.to(self.device)
-                self.model.eval()
-
-                with torch.no_grad():
-                    outputs = self.model(images)
-                    probs = outputs["probabilities"]
-                    
-                    # Determine success/fail based on threshold
-                    is_success = probs > self.reward_threshold
-                    
-                    # Map to binary rewards
-                    rewards = torch.where(
-                        is_success,
-                        torch.full_like(probs, self.success_reward),
-                        torch.full_like(probs, self.fail_reward),
-                    )
-
-                # 打印 reward 信息
-                for i in range(len(probs)):
-                    prob_val = probs[i].item()
-                    reward_val = rewards[i].item()
-                    result = "SUCCESS" if is_success[i].item() else "FAIL"
-                    logger.info(f"[Reward] prob={prob_val:.4f}, reward={reward_val:.1f}, result={result}")
-
-                # 保存 debug 图片 (使用原始图片，而不是预处理后的)
-                if self.debug_save_dir:
-                    logger.info(f"[Debug] Saving {len(probs)} images to {self.debug_save_dir}")
-                    debug_images = self._preprocess_images_for_save(original_images)
-                    self._save_debug_images(debug_images, rewards, probs)
-
-                # Add rewards to env_batch
-                cpu_rewards = rewards.cpu()
-                if cpu_rewards.dim() == 1:
-                    cpu_rewards = cpu_rewards.unsqueeze(1)
-                env_batch["rewards"] = cpu_rewards
-                env_batch["probabilities"] = probs.cpu()
-
-                # Forward to RolloutWorker
-                self.send(
-                    (mode, env_batch),
-                    rollout_group_name,
-                    dst_rank_in_rollout,
-                    async_op=True,
-                )
+                # Send to rollout worker
+                self.send_to_rollout(output_data, mode=mode)
 
             except Exception as e:
                 logger.warning(f"Error in inference loop: {e}")
                 import traceback
+
                 traceback.print_exc()
+                continue
+
+        logger.info("ImageRewardWorker inference loop ended")
+
+    def run_inference_step(self, mode="train"):
+        """Run single inference step using send/recv (sync version).
+
+        Data flow: env worker -> recv -> process -> send -> rollout worker
+
+        Args:
+            mode: "train" or "eval"
+        """
+        # Receive from env worker
+        env_batch = self.recv_env_batch(mode=mode)
+
+        # Process and add rewards
+        output_data = self.process_env_batch(env_batch)
+
+        # Send to rollout worker
+        self.send_to_rollout(output_data, mode=mode)
+
+    async def stop(self):
+        """Stop the inference loop."""
+        self.should_stop = True
+
+    # =========================================================================
+    # Legacy Channel-based interface (kept for backward compatibility)
+    # =========================================================================
+
+    def run_inference_loop(self, input_channel: Channel, output_channel: Channel):
+        """Run continuous inference loop (legacy channel-based version).
+
+        This method runs until input_channel signals completion (returns None).
+
+        Args:
+            input_channel: Channel to receive image batches from
+            output_channel: Channel to send computed rewards to
+        """
+        logger.info("Starting ImageRewardWorker inference loop (channel mode)")
+
+        while True:
+            try:
+                data = input_channel.get()
+                if data is None:
+                    logger.info("Received stop signal, ending inference loop")
+                    break
+
+                # Process and add rewards
+                output_data = self.process_env_batch(data)
+
+                output_channel.put(output_data, async_op=True)
+
+            except Exception as e:
+                logger.warning(f"Error in inference loop: {e}")
                 continue
 
         logger.info("ImageRewardWorker inference loop ended")
