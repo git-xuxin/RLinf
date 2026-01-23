@@ -403,15 +403,32 @@ class EnvWorker(Worker):
     def send_env_batch(self, output_channel: Channel, env_batch, mode="train"):
         # split env_batch into num_processes chunks, each chunk contains gather_num env_batch
         assert mode in ["train", "eval"], f"{mode=} is not supported"
+        
+        # Check if reward model is enabled - if so, send to RewardGroup first
+        use_reward_model = self.cfg.get("reward", {}).get("use_reward_model", False)
+        
         for gather_id in range(self.gather_num):
             env_batch_i = self.split_env_batch(env_batch, gather_id, mode)
             dst_rank_in_rollout = gather_id + self._rank * self.gather_num
-            self.send(
-                (mode, env_batch_i),
-                self.cfg.rollout.group_name,
-                dst_rank_in_rollout,
-                async_op=True,
-            )
+            
+            if use_reward_model and mode == "train":
+                # When reward model is enabled, send to RewardGroup first
+                # RewardGroup will process and forward to RolloutGroup
+                reward_group_name = self.cfg.reward.get("group_name", "RewardGroup")
+                self.send(
+                    (mode, env_batch_i, dst_rank_in_rollout),  # Include dst_rank for forwarding
+                    reward_group_name,
+                    0,  # Send to rank 0 of reward group
+                    async_op=True,
+                )
+            else:
+                # Original behavior: direct send to rollout group
+                self.send(
+                    (mode, env_batch_i),
+                    self.cfg.rollout.group_name,
+                    dst_rank_in_rollout,
+                    async_op=True,
+                )
 
     def interact(self, input_channel: Channel, output_channel: Channel):
         for env in self.env_list:

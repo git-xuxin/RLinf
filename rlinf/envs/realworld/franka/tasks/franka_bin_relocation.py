@@ -124,8 +124,11 @@ class FrankaBinRelocationEnv(FrankaEnv):
         and clips actions that will lead to collision.
         """
         self.inner_safety_box = gym.spaces.Box(
-            self.config.target_ee_pose[:3] - np.array([0.07, 0.03, 0.001]),
-            self.config.target_ee_pose[:3] + np.array([0.07, 0.03, 0.04]),
+            # self.config.target_ee_pose[:3] - np.array([0.07, 0.03, 0.001]),
+            self.config.target_ee_pose[:3] - np.array([0.001, 0.001, 0.001]),
+            # self.config.target_ee_pose[:3] + np.array([0.07, 0.03, 0.04]),
+            self.config.target_ee_pose[:3] + np.array([0.001, 0.001, 0.001]),
+            
             dtype=np.float64,
         )
 

@@ -24,6 +24,9 @@ cluster:
     rollout:
       node_group: "4090"
       placement: 0 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
+    reward:
+      node_group: "4090"
+      placement: 0 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
   node_groups:
     - label: "4090" # GPU node group
       node_ranks: 0  # The ranks of the nodes to be included in this group， change this if your training node is not rank 0
@@ -40,7 +43,7 @@ data:
   channel:
     name: demo_data
   path: 
-    - "/home/xuxin/Workspace/Beijing/data/pnp/data.pkl"
+    - "/home/xuxin/Workspace/Beijing/data/pnp/data_1.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-205709_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-215309_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-220208_2cam.pkl"
@@ -177,7 +180,39 @@ actor:
       buffer_dtype: ${actor.model.precision}
 
 reward:
-  use_reward_model: False
+  use_reward_model: True
+  group_name: "RewardGroup"
+  
+  # Reward mode: "per_step" computes reward for every frame
+  reward_mode: "per_step"
+  
+  # Termination: when reward model predicts success (prob > threshold), terminate episode
+  terminate_on_success: True
+  
+  # Reward mapping
+  success_reward: 1.0   # Reward for success (prob > threshold)
+  fail_reward: 0.0      # Reward for fail (prob < threshold)
+  reward_threshold: 0.5 # Probability threshold for success/fail classification
+  
+  # Combine mode: "replace" uses only learned rewards
+  combine_mode: "replace"
+  reward_weight: 1.0
+  env_reward_weight: 0.0
+  
+  model:
+    model_type: "resnet_reward"
+    arch: "resnet18"
+    hidden_dim: 256
+    dropout: 0.0
+    image_size: [3, 128, 128]
+    normalize: true
+    precision: "bf16"
+    
+    # Path to trained reward model checkpoint (需要重新训练以匹配 PR #596 格式)
+    checkpoint_path: "/home/xuxin/Workspace/Beijing/RLinf_zhz/resnet_training/reward_model_20260123_214043.pt"  # TODO: 设置为训练好的 reward model 路径
+    
+    # Debug image save directory (set to path to enable, null to disable)
+    debug_save_dir: "/home/xuxin/Workspace/Beijing/RLinf_zhz/logs/reward_debug_images"
 
 critic:
   use_critic_model: False

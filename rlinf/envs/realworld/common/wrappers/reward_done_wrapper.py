@@ -50,7 +50,7 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
         done = False
         reward = 0
         key = self.listener.get_key()
-        print(f"Key pressed: {key}")
+        # print(f"Key pressed: {key}")
         if key not in ["a", "b", "c"]:
             return last_intervened, done, reward
         if key == "a":
@@ -78,7 +78,7 @@ class KeyboardRewardDoneMultiStageWrapper(BaseKeyboardRewardDoneWrapper):
         done = False
         reward = 0
         key = self.listener.get_key()
-        print(f"Key pressed: {key}")
+        # print(f"Key pressed: {key}")
         if key == "a":
             self.reward_stage = 0
         elif key == "b":

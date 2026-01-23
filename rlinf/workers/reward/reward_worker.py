@@ -767,7 +767,13 @@ class ImageRewardWorker(Worker):
         self.debug_save_dir = os.environ.get("DEBUG_IMAGE_SAVE_DIR", None)
         self.debug_success_count = 0
         self.debug_fail_count = 0
-        self.reward_threshold = 0.6
+        
+        # Get reward config
+        reward_cfg = cfg.get("reward", {})
+        self.reward_threshold = reward_cfg.get("reward_threshold", 0.5)
+        self.terminate_on_success = reward_cfg.get("terminate_on_success", False)
+        self.success_reward = reward_cfg.get("success_reward", 1.0)
+        self.fail_reward = reward_cfg.get("fail_reward", 0.0)
 
     def init_worker(self):
         """Initialize the reward model from checkpoint."""
@@ -783,6 +789,9 @@ class ImageRewardWorker(Worker):
         if self.debug_save_dir:
             os.makedirs(os.path.join(self.debug_save_dir, "success"), exist_ok=True)
             os.makedirs(os.path.join(self.debug_save_dir, "fail"), exist_ok=True)
+            logger.info(f"[Reward] debug_save_dir enabled: {self.debug_save_dir}")
+        else:
+            logger.warning(f"[Reward] debug_save_dir is None/disabled")
         checkpoint_path = model_cfg.get("checkpoint_path")
 
         if checkpoint_path is None:
@@ -839,11 +848,19 @@ class ImageRewardWorker(Worker):
             with torch.no_grad():
                 outputs = self.model(images)
                 probs = outputs["probabilities"]
+                
+                # Determine success/fail based on threshold
+                is_success = probs > self.reward_threshold
+                
+                # Map to binary rewards: success_reward if success, fail_reward otherwise
                 rewards = torch.where(
-                    probs > self.reward_threshold,
-                    probs,
-                    torch.zeros_like(probs),
+                    is_success,
+                    torch.full_like(probs, self.success_reward),
+                    torch.full_like(probs, self.fail_reward),
                 )
+                
+                # Compute termination signal if terminate_on_success is enabled
+                terminations = is_success if self.terminate_on_success else torch.zeros_like(is_success, dtype=torch.bool)
 
             if self.debug_save_dir:
                 original_images = data.get("main_images")
@@ -865,7 +882,11 @@ class ImageRewardWorker(Worker):
                         original_images = original_images.float() / 255.0
                     self._save_debug_images(original_images, rewards, probs)
 
-            output_data = {"rewards": rewards.cpu()}
+            output_data = {
+                "rewards": rewards.cpu(),
+                "terminations": terminations.cpu(),
+                "probabilities": probs.cpu(),
+            }
             if "episode_ids" in data:
                 output_data["episode_ids"] = data["episode_ids"]
 
@@ -903,6 +924,24 @@ class ImageRewardWorker(Worker):
 
         return images
 
+    def _preprocess_images_for_save(self, images) -> torch.Tensor:
+        """Preprocess images for saving (convert to (B, C, H, W) in [0, 1] without normalization)."""
+        if isinstance(images, np.ndarray):
+            images = torch.from_numpy(images)
+
+        if images.dim() == 4 and images.shape[-1] in [1, 3, 4]:
+            images = images.permute(0, 3, 1, 2)
+
+        if images.dtype == torch.uint8:
+            images = images.float() / 255.0
+        elif images.dtype != torch.float32:
+            images = images.float()
+        
+        # Clamp to [0, 1] for saving
+        images = images.clamp(0, 1)
+
+        return images
+
     def _save_debug_images(
         self, images: torch.Tensor, rewards: torch.Tensor, probs: torch.Tensor = None
     ):
@@ -912,6 +951,10 @@ class ImageRewardWorker(Worker):
             images: Preprocessed images (B, C, H, W) in [0, 1]
             rewards: Reward values from ResNet model (B,)
             probs: Raw probability outputs from ResNet (B,), used for filename
+        
+        File naming format: {result}-{prob}.png
+            - result: "success" or "fail" based on threshold
+            - prob: probability value from the model (e.g., 0.8523)
         """
         from PIL import Image
 
@@ -933,89 +976,135 @@ class ImageRewardWorker(Worker):
             is_success = reward > self.reward_threshold
             if is_success:
                 self.debug_success_count += 1
+                result_str = "success"
+                count = self.debug_success_count
                 save_dir = os.path.join(self.debug_save_dir, "success")
-                filename = f"{self.debug_success_count:06d}_prob{prob:.4f}.png"
             else:
                 self.debug_fail_count += 1
+                result_str = "fail"
+                count = self.debug_fail_count
                 save_dir = os.path.join(self.debug_save_dir, "fail")
-                filename = f"{self.debug_fail_count:06d}_prob{prob:.4f}.png"
+            
+            # Filename format: {count}_{result}-{prob}.png (e.g., 000001_success-0.8523.png)
+            filename = f"{count:06d}_{result_str}-{prob:.4f}.png"
 
             os.makedirs(save_dir, exist_ok=True)
             try:
                 pil_img = Image.fromarray(img)
-                pil_img.save(os.path.join(save_dir, filename))
-            except Exception:
-                pass
+                save_path = os.path.join(save_dir, filename)
+                pil_img.save(save_path)
+                logger.info(f"[Debug] Saved image: {save_path}")
+            except Exception as e:
+                logger.error(f"[Debug] Failed to save image: {e}")
 
     def run_inference_loop(self, input_channel: Channel, output_channel: Channel):
         """Run continuous inference loop (for use in RL training).
 
-        This method runs until input_channel signals completion (returns None).
+        This method receives data from EnvWorker via self.recv(), computes rewards,
+        and forwards the data to RolloutWorker via self.send().
 
         Args:
-            input_channel: Channel to receive image batches from
-            output_channel: Channel to send computed rewards to
+            input_channel: Channel (not used, kept for API compatibility)
+            output_channel: Channel (not used, kept for API compatibility)
         """
         logger.info("Starting ImageRewardWorker inference loop")
-        target_key = "0_train"
+        
+        env_group_name = self.cfg.env.group_name
+        rollout_group_name = self.cfg.rollout.group_name
 
         while True:
             try:
-                data = input_channel.get(key=target_key)
-                if data is None:
+                # Receive data from EnvWorker using point-to-point communication
+                work = self.recv(env_group_name, src_rank=None, async_op=True)
+                recv_data = work.wait()
+                
+                if recv_data is None:
                     logger.info("Received stop signal, ending inference loop")
                     break
 
-                dones = data.get("dones")
-                final_obs = data.get("final_obs")
-
-                is_done_flag = False
-                if dones is not None:
-                    if isinstance(dones, torch.Tensor):
-                        is_done_flag = dones.any().item()
-                    else:
-                        is_done_flag = bool(dones)
-
-                # If Done=True is displayed but there's no final_obs, it means this is the starting frame after a Reset.
-                # In this case, Reward should not be calculated, as it would trigger an Invariant check in RolloutWorker.
-                if is_done_flag and final_obs is None:
-                    output_data = data.copy()  # copy.deepcopy(data)
-                    output_data["rewards"] = None
-                    output_channel.put(output_data, key=target_key, async_op=True)
+                # Unpack: (mode, env_batch, dst_rank_in_rollout)
+                mode, env_batch, dst_rank_in_rollout = recv_data
+                
+                # Skip eval mode - just forward without reward computation
+                if mode != "train":
+                    self.send(
+                        (mode, env_batch),
+                        rollout_group_name,
+                        dst_rank_in_rollout,
+                        async_op=True,
+                    )
                     continue
 
-                images = data.get("images")
+                # Extract images for reward computation
+                images = env_batch.get("images")
                 if images is None:
-                    images = data.get("main_images")
-                if images is None and "obs" in data and isinstance(data["obs"], dict):
-                    images = data["obs"].get("main_images")
+                    images = env_batch.get("main_images")
+                if images is None and "obs" in env_batch and isinstance(env_batch["obs"], dict):
+                    images = env_batch["obs"].get("main_images")
 
                 if images is None:
-                    logger.warning("Received data but no images found")
-                    output_channel.put(data, key=target_key, async_op=True)
+                    logger.warning("Received data but no images found, forwarding without reward")
+                    self.send(
+                        (mode, env_batch),
+                        rollout_group_name,
+                        dst_rank_in_rollout,
+                        async_op=True,
+                    )
                     continue
 
+                # 保存原始图片用于 debug
+                original_images = images.clone() if isinstance(images, torch.Tensor) else images
+                
                 images = self._preprocess_images(images)
                 images = images.to(self.device)
                 self.model.eval()
 
                 with torch.no_grad():
-                    rewards = self.model.compute_reward({"images": images})
+                    outputs = self.model(images)
+                    probs = outputs["probabilities"]
+                    
+                    # Determine success/fail based on threshold
+                    is_success = probs > self.reward_threshold
+                    
+                    # Map to binary rewards
+                    rewards = torch.where(
+                        is_success,
+                        torch.full_like(probs, self.success_reward),
+                        torch.full_like(probs, self.fail_reward),
+                    )
 
-                # # print reward model output
-                # r_mean = rewards.mean().item()
-                # print(f"Model Inference | Reward Val: {r_mean:.4f}", flush=True)
+                # 打印 reward 信息
+                for i in range(len(probs)):
+                    prob_val = probs[i].item()
+                    reward_val = rewards[i].item()
+                    result = "SUCCESS" if is_success[i].item() else "FAIL"
+                    logger.info(f"[Reward] prob={prob_val:.4f}, reward={reward_val:.1f}, result={result}")
 
-                output_data = data.copy()  # copy.deepcopy(data)
+                # 保存 debug 图片 (使用原始图片，而不是预处理后的)
+                if self.debug_save_dir:
+                    logger.info(f"[Debug] Saving {len(probs)} images to {self.debug_save_dir}")
+                    debug_images = self._preprocess_images_for_save(original_images)
+                    self._save_debug_images(debug_images, rewards, probs)
+
+                # Add rewards to env_batch
                 cpu_rewards = rewards.cpu()
                 if cpu_rewards.dim() == 1:
                     cpu_rewards = cpu_rewards.unsqueeze(1)
-                output_data["rewards"] = cpu_rewards
+                env_batch["rewards"] = cpu_rewards
+                env_batch["probabilities"] = probs.cpu()
 
-                output_channel.put(output_data, key=target_key, async_op=True)
+                # Forward to RolloutWorker
+                self.send(
+                    (mode, env_batch),
+                    rollout_group_name,
+                    dst_rank_in_rollout,
+                    async_op=True,
+                )
 
             except Exception as e:
                 logger.warning(f"Error in inference loop: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
 
         logger.info("ImageRewardWorker inference loop ended")
