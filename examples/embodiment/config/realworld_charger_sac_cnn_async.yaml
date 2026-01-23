@@ -55,8 +55,9 @@ runner:
   only_eval: False
   val_check_interval: -1
   save_interval: -1
-  seq_length: 4096
-  max_prompt_length: 30
+
+  resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
+  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   update_epoch: 32
@@ -75,7 +76,7 @@ algorithm:
   auto_entropy_tuning: True  # Enable automatic entropy tuning
   alpha_type: softplus
   initial_alpha: 0.01  # Initial temperature value
-  target_entropy: -4  # Target entropy (-action_dim)
+  target_entropy: -4  # Target entropy
   alpha_lr: 3.0e-4  # Learning rate for temperature parameter
   
   # Replay buffer settings
@@ -116,7 +117,6 @@ env:
 rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
-  model_dir: ""
   enable_offload: False
   pipeline_stage_num: 1
 

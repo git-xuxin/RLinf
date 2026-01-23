@@ -27,6 +27,34 @@ from rlinf.scheduler import Channel, Cluster, Worker
 from rlinf.utils.placement import HybridComponentPlacement
 
 
+class SimpleEnvWrapper:
+    """Simple wrapper to replace EnvManager when not using multi-process"""
+
+    def __init__(self, env):
+        self.env = env
+        self.is_start = True
+
+    def start_env(self):
+        pass
+
+    def stop_env(self):
+        pass
+
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
+
+    def chunk_step(self, *args, **kwargs):
+        return self.env.chunk_step(*args, **kwargs)
+
+    def flush_video(self):
+        if hasattr(self.env, "flush_video"):
+            self.env.flush_video()
+
+    def update_reset_state_ids(self):
+        if hasattr(self.env, "update_reset_state_ids"):
+            self.env.update_reset_state_ids()
+
+
 class EnvWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -98,7 +126,7 @@ class EnvWorker(Worker):
             setattr(self.cfg.env.eval, "override_cfg", override_cfg)
 
     def init_worker(self):
-        enable_offload = self.cfg.env.enable_offload
+        self.enable_offload = self.cfg.env.enable_offload
         self.update_env_cfg()
 
         train_env_cls = get_env_cls(self.cfg.env.train.env_type, self.cfg.env.train)
@@ -108,34 +136,79 @@ class EnvWorker(Worker):
         # Essential for RealWorld env to ensure initial ROS node setup is done
         self.broadcast(True, list(range(self._world_size)))
 
+        dc_cfg = getattr(self.cfg.env, "data_collection", None)
+        dc_enabled = (
+            dc_cfg and getattr(dc_cfg, "enabled", False) and not self.enable_offload
+        )
+        use_full_state = getattr(self.cfg.env, "use_full_state", False)
+
         if not self.only_eval:
             for stage_id in range(self.stage_num):
-                self.env_list.append(
-                    EnvManager(
-                        self.cfg.env.train,
-                        rank=self._rank,
-                        num_envs=self.train_num_envs_per_stage,
-                        seed_offset=self._rank * self.stage_num + stage_id,
-                        total_num_processes=self._world_size * self.stage_num,
-                        env_cls=train_env_cls,
-                        worker_info=self.worker_info,
-                        enable_offload=enable_offload,
-                    )
+                # Create environment directly without EnvManager
+                env = train_env_cls(
+                    self.cfg.env.train,
+                    self.train_num_envs_per_stage,
+                    self._rank * self.stage_num + stage_id,
+                    self._world_size * self.stage_num,
+                    self.worker_info,
                 )
+
+                # Apply wrappers directly
+                if use_full_state and self.cfg.env.train.env_type == "maniskill":
+                    from rlinf.envs.maniskill import ManiskillFullStateWrapper
+
+                    env = ManiskillFullStateWrapper(
+                        env, num_envs=self.train_num_envs_per_stage
+                    )
+                if dc_enabled:
+                    from rlinf.envs.wrappers import DataCollectorWrapper
+
+                    env = DataCollectorWrapper(
+                        env,
+                        save_dir=dc_cfg.save_dir,
+                        rank=self._rank,
+                        mode=getattr(dc_cfg, "mode", "train"),
+                        num_envs=self.train_num_envs_per_stage,
+                        sample_rate_success=getattr(dc_cfg, "sample_rate_success", 1.0),
+                        sample_rate_fail=getattr(dc_cfg, "sample_rate_fail", 0.1),
+                    )
+
+                # Wrap in SimpleEnvWrapper for compatibility
+                self.env_list.append(SimpleEnvWrapper(env))
+
         if self.enable_eval:
             for stage_id in range(self.stage_num):
-                self.eval_env_list.append(
-                    EnvManager(
-                        self.cfg.env.eval,
-                        rank=self._rank,
-                        num_envs=self.eval_num_envs_per_stage,
-                        seed_offset=self._rank * self.stage_num + stage_id,
-                        total_num_processes=self._world_size * self.stage_num,
-                        env_cls=eval_env_cls,
-                        worker_info=self.worker_info,
-                        enable_offload=enable_offload,
-                    )
+                # Create environment directly without EnvManager
+                env = eval_env_cls(
+                    self.cfg.env.eval,
+                    self.eval_num_envs_per_stage,
+                    self._rank * self.stage_num + stage_id,
+                    self._world_size * self.stage_num,
+                    self.worker_info,
                 )
+
+                # Apply wrappers directly
+                if use_full_state and self.cfg.env.eval.env_type == "maniskill":
+                    from rlinf.envs.maniskill import ManiskillFullStateWrapper
+
+                    env = ManiskillFullStateWrapper(
+                        env, num_envs=self.eval_num_envs_per_stage
+                    )
+                if dc_enabled:
+                    from rlinf.envs.wrappers import DataCollectorWrapper
+
+                    env = DataCollectorWrapper(
+                        env,
+                        save_dir=dc_cfg.save_dir,
+                        rank=self._rank,
+                        mode=getattr(dc_cfg, "mode", "eval"),
+                        num_envs=self.eval_num_envs_per_stage,
+                        sample_rate_success=getattr(dc_cfg, "sample_rate_success", 1.0),
+                        sample_rate_fail=getattr(dc_cfg, "sample_rate_fail", 0.1),
+                    )
+
+                # Wrap in SimpleEnvWrapper for compatibility
+                self.eval_env_list.append(SimpleEnvWrapper(env))
 
         if not self.only_eval:
             self._init_env()
@@ -344,6 +417,9 @@ class EnvWorker(Worker):
         for env in self.env_list:
             env.start_env()
 
+        # Clear previous rollout images in wrappers
+        self.clear_rollout_images()
+
         n_chunk_steps = (
             self.cfg.env.train.max_steps_per_rollout_epoch
             // self.cfg.actor.model.num_action_chunks
@@ -437,6 +513,80 @@ class EnvWorker(Worker):
         env_metrics["rank_id"] = self._rank
 
         return env_metrics
+
+    def get_rollout_images(self):
+        """Get collected main_images from all stage wrappers.
+
+        Returns:
+            torch.Tensor or None: Stacked images with shape (n_steps, total_envs, H, W, C)
+        """
+        all_images = []
+        for env_wrapper in self.env_list:
+            env = env_wrapper.env
+            # Check if env has the method (ManiskillFullStateWrapper)
+            if hasattr(env, "get_rollout_images"):
+                images = env.get_rollout_images()
+                if images is not None:
+                    all_images.append(images)
+
+        if len(all_images) == 0:
+            return None
+
+        # Each has shape (n_steps, envs_per_stage, H, W, C)
+        # Concatenate along env dimension to get (n_steps, total_envs, H, W, C)
+        return torch.cat(all_images, dim=1)
+
+    def get_episode_final_images(self):
+        """Get episode-ending images for terminal reward mode.
+
+        For each env, returns the image from when its episode actually ended,
+        NOT the last rollout image (which might be from a new episode after reset).
+
+        Returns:
+            torch.Tensor or None: Images with shape (total_envs, H, W, C)
+        """
+        all_images = []
+        for env_wrapper in self.env_list:
+            env = env_wrapper.env
+            if hasattr(env, "get_episode_final_images"):
+                images = env.get_episode_final_images()
+                if images is not None:
+                    all_images.append(images)
+
+        if len(all_images) == 0:
+            return None
+
+        # Each has shape (envs_per_stage, H, W, C)
+        # Concatenate along env dimension to get (total_envs, H, W, C)
+        return torch.cat(all_images, dim=0)
+
+    def get_episode_final_steps(self):
+        """Get the step at which each env's episode ended.
+
+        Returns:
+            torch.Tensor: Step indices with shape (total_envs,), -1 means no episode ended.
+        """
+        all_steps = []
+        for env_wrapper in self.env_list:
+            env = env_wrapper.env
+            if hasattr(env, "get_episode_final_steps"):
+                steps = env.get_episode_final_steps()
+                if steps is not None:
+                    all_steps.append(steps)
+
+        if len(all_steps) == 0:
+            return None
+
+        # Each has shape (envs_per_stage,)
+        # Concatenate to get (total_envs,)
+        return torch.cat(all_steps, dim=0)
+
+    def clear_rollout_images(self):
+        """Clear collected images in all environment wrappers."""
+        for env_wrapper in self.env_list:
+            env = env_wrapper.env
+            if hasattr(env, "clear_rollout_images"):
+                env.clear_rollout_images()
 
     def evaluate(self, input_channel: Channel, output_channel: Channel):
         eval_metrics = defaultdict(list)

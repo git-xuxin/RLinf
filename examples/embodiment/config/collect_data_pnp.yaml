@@ -44,4 +44,4 @@ env:
     keyboard_reward_wrapper: "single_stage" # options: "single_stage", "multi_stage"
     use_spacemouse: True
     override_cfg:
-      target_ee_pose: [0.56, 0.0, 0.05, -3.14, 0.0, 0.0]
+      target_ee_pose: [0.564, 0.045, 0.05, -3.14, 0.0, 0.0]

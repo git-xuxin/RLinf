@@ -42,3 +42,4 @@ env:
     use_spacemouse: True
     override_cfg:
       target_ee_pose: [0.51573866, 0.02374934, 0.07331224, -3.13803461, 0.03418677, -0.01341346]
+      success_hold_steps: 1  # define how many consecutive steps the robot must hold the position to succeed

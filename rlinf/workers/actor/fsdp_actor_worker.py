@@ -33,7 +33,7 @@ from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
     FSDPModelManager,
 )
 from rlinf.models import get_model
-from rlinf.scheduler import Channel, Cluster, Worker
+from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.data_iter_utils import get_iterator_k_split
 from rlinf.utils.distributed import all_reduce_dict, masked_normalization
 from rlinf.utils.distributed import (
@@ -552,9 +552,9 @@ class FSDPActor(FSDPModelManager, Worker):
 
             mbs_metrics_data.update(
                 {
-                    "final_loss": loss.detach(),
-                    "entropy_loss": entropy_loss.detach(),
-                    "kl_loss": kl_loss.detach(),
+                    "actor/final_loss": loss.detach(),
+                    "actor/entropy_loss": entropy_loss.detach(),
+                    "actor/kl_loss": kl_loss.detach(),
                 }
             )
 
@@ -739,6 +739,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.enable_offload = self.cfg.actor.get("enable_offload", False)
         self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
 
+        # Sync weight comm options
+        max_ctas = cfg.rollout.get("sync_weight_nccl_max_ctas", None)
+        min_ctas = cfg.rollout.get("sync_weight_nccl_min_ctas", None)
+        self._sync_weight_comm_options = CollectiveGroupOptions(
+            accel_max_ctas=max_ctas, accel_min_ctas=min_ctas
+        )
+
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
         Setup destination ranks for weight communication.
@@ -767,13 +774,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
+
         self._setup_rollout_weight_dst_ranks()
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
-        if model is not None:
-            return model
-        return super().model_provider_func()
+        if model is None:
+            model = super().model_provider_func()
+
+        if self.cfg.runner.get("ckpt_path", None):
+            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            model.load_state_dict(model_dict)
+
+        return model
 
     def sync_model_to_rollout(self) -> None:
         """
@@ -792,6 +805,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self._rollout_group_name,
                 rank,
                 async_op=True,
+                options=self._sync_weight_comm_options,
             )
         if self.enable_offload and not self.is_weight_offloaded:
             self.offload_param_and_grad()
@@ -893,6 +907,59 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 rollout_batch["loss_mask"] = reward_filter_mask
 
         return rollout_batch
+
+    def get_reward_images(self):
+        """Get main_images from rollout_batch for reward model computation.
+
+        Returns:
+            Tensor of main_images or None if not available.
+        """
+        if not hasattr(self, "rollout_batch") or self.rollout_batch is None:
+            return None
+        return self.rollout_batch.get("main_images")
+
+    def update_rewards(self, rewards):
+        """Update rollout_batch rewards with computed reward model rewards.
+
+        Args:
+            rewards: Tensor of rewards from reward model, shape (n_steps, n_envs, 1).
+        """
+        if not hasattr(self, "rollout_batch") or self.rollout_batch is None:
+            return
+
+        # Store original env rewards
+        if "env_rewards" not in self.rollout_batch:
+            self.rollout_batch["env_rewards"] = self.rollout_batch["rewards"].clone()
+
+        # Get reward combination mode from config
+        reward_cfg = self.cfg.get("reward", {})
+        combine_mode = reward_cfg.get("combine_mode", "replace")
+        reward_weight = reward_cfg.get("reward_weight", 1.0)
+        env_reward_weight = reward_cfg.get("env_reward_weight", 0.0)
+
+        # Move rewards to correct device
+        rewards = rewards.to(self.rollout_batch["rewards"].device)
+
+        # Check shape compatibility
+        target_shape = self.rollout_batch["rewards"].shape
+        if rewards.shape != target_shape:
+            # Try to reshape if total elements match
+            if rewards.numel() == self.rollout_batch["rewards"].numel():
+                rewards = rewards.view(target_shape)
+            else:
+                return
+
+        if combine_mode == "replace":
+            self.rollout_batch["rewards"] = reward_weight * rewards
+        elif combine_mode == "add":
+            self.rollout_batch["rewards"] = (
+                self.rollout_batch["env_rewards"] + reward_weight * rewards
+            )
+        elif combine_mode == "weighted":
+            self.rollout_batch["rewards"] = (
+                env_reward_weight * self.rollout_batch["env_rewards"]
+                + reward_weight * rewards
+            )
 
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         """

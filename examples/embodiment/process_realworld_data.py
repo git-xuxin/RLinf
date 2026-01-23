@@ -52,7 +52,6 @@ REMOVE_ZERO_ACTIONS = True
 # Threshold to consider an action as "zero" or stationary.
 ZERO_ACTION_THRESHOLD = 1e-5
 
-IMAGE_SOURCE = "main_images"  # "main_images" or "extra_view_images"
 
 def ensure_dir(path: str):
     """
@@ -72,26 +71,18 @@ def ensure_dir(path: str):
 
 def process_image(img_tensor: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
     """
-    处理图像：转为CPU NumPy，处理维度顺序 (CHW -> HWC)，并可选转为 uint8。
+    Converts an image tensor to a NumPy array on the CPU.
+    Optionally converts the data type from float to uint8.
     """
     if isinstance(img_tensor, torch.Tensor):
         img_data = img_tensor.detach().cpu().numpy()
     else:
-        img_data = img_tensor
+        img_data = img_tensor  # Already a NumPy array
 
-    # 1. 处理维度：去掉 size=1 的维度 (例如把 [1, 3, 128, 128] 变成 [3, 128, 128])
-    if img_data.ndim == 4 and img_data.shape[0] == 1:
-        img_data = np.squeeze(img_data, axis=0)
-
-    # 2. 处理通道顺序：如果输入是 [3, H, W]，转置为 [H, W, 3]
-    # 这是因为原脚本处理的是 [128, 128, 3]，大多数可视化和存储习惯使用 HWC
-    if img_data.shape[0] == 3 and img_data.ndim == 3:
-        img_data = img_data.transpose(1, 2, 0)
-
-    # 3. 转换类型
     if TO_UINT8 and img_data.dtype != np.uint8:
         if np.issubdtype(img_data.dtype, np.floating):
-            img_data = (img_data * 255.0).clip(0, 255).round().astype(np.uint8)
+            # Assumes float data is in the [0.0, 1.0] range
+            img_data = (img_data * 255.0).round().astype(np.uint8)
 
     return img_data
 
@@ -178,46 +169,54 @@ def main(args):
     total_frames_kept = 0
 
     for i, transition in enumerate(tqdm(raw_data, desc="Processing Transitions")):
-        # --- 1. 获取终止标志 ---
+        # --- 1. Get original termination flags ---
         raw_term = transition["terminations"].item()
         raw_trunc = transition["truncations"].item()
+        # An episode ends if terminated, truncated, or it's the last transition in the file.
         is_raw_end_of_episode = raw_term or raw_trunc or (i == len(raw_data) - 1)
 
-        # --- 2. 决定是否保留当前帧 ---
+        # --- 2. Decide whether to keep the current frame ---
         should_keep_frame = True
+
         action = transition["action"]
         if isinstance(action, torch.Tensor):
             action = action.detach().cpu()
 
         if REMOVE_ZERO_ACTIONS:
-            # 即使 action 维度从 6 变到了 7，这里的 sum(abs) 依然有效
+            # If the action magnitude is negligible, we consider it a stationary frame.
+            # We skip it unless it's the final, successful frame of an episode.
             if torch.sum(torch.abs(action)) < ZERO_ACTION_THRESHOLD and not raw_term:
                 should_keep_frame = False
 
-        # --- 3. 处理并添加到 buffer ---
+        # --- 3. If keeping the frame, process and add to buffer ---
         if should_keep_frame:
+            # Process Observation
             raw_obs = transition["transitions"]["obs"]
-            
-            # --- 修改处：动态提取图像 ---
-            if IMAGE_SOURCE not in raw_obs:
-                raise KeyError(f"Key '{IMAGE_SOURCE}' not found in observation. Available: {list(raw_obs.keys())}")
-            
-            img_tensor = raw_obs[IMAGE_SOURCE]
-            img = process_image(img_tensor)
-            # --------------------------
-
+            img = process_image(raw_obs["main_images"])
             state = raw_obs["states"]
             if isinstance(state, torch.Tensor):
                 state = state.detach().cpu()
 
+            # Process Reward and generate a boolean success label
             raw_reward = transition["rewards"]
-            reward_val = raw_reward.item() if isinstance(raw_reward, torch.Tensor) else raw_reward
+            reward_val = (
+                raw_reward.item()
+                if isinstance(raw_reward, torch.Tensor)
+                else raw_reward
+            )
+
+            # Map reward to a boolean flag: reward > 0.5 is considered a success
             is_obj_placed = reward_val > 0.5
+
             info = {"is_obj_placed": is_obj_placed}
 
-            current_episode["observations"].append({"main_images": img, "states": state})
+            # Append processed data to the current episode buffer
+            current_episode["observations"].append(
+                {"main_images": img, "states": state}
+            )
             current_episode["actions"].append(action)
             current_episode["rewards"].append(torch.tensor(reward_val))
+            # Append False for now; will be corrected if this is the last frame of the episode.
             current_episode["terminated"].append(False)
             current_episode["truncated"].append(False)
             current_episode["infos"].append(info)

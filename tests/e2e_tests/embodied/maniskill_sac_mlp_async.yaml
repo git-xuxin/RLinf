@@ -33,8 +33,6 @@ runner:
   only_eval: False
   val_check_interval: 200
   save_interval: -1
-  seq_length: 4096
-  max_prompt_length: 30
 
 algorithm:
   update_epoch: 32
@@ -106,7 +104,6 @@ env:
 rollout:
   group_name: "RolloutGroup"
   backend: "huggingface"
-  model_dir: ""
   enable_offload: False
   pipeline_stage_num: 1
 
