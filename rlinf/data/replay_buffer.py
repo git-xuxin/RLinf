@@ -300,6 +300,8 @@ class SACReplayBuffer:
             rollout_batch.pop("prev_logprobs")
         if "prev_values" in rollout_batch:
             rollout_batch.pop("prev_values")
+        if "send_time" in rollout_batch:
+            rollout_batch.pop("send_time")
 
         if extra_preprocess:
             flattened_batch, num_to_add = self._preprocess_rollout_batch(rollout_batch)

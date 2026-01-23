@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+按 Episode 分组存储图片
+
+输出目录结构:
+    output_dir/
+    ├── episode_0000/
+    │   ├── main_images/
+    │   │   ├── frame_0000.png
+    │   │   ├── frame_0001.png
+    │   │   └── ...
+    │   └── extra_view_images/
+    │       ├── frame_0000.png
+    │       └── ...
+    ├── episode_0001/
+    │   └── ...
+    └── ...
+
+使用方法:
+    python generate_pic_by_episode.py --input pnp/data.pkl --output pnp/episodes
+"""
+
+import argparse
+import os
+import pickle
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
+
+
+def save_any_image(img_data: Any, save_path: str) -> bool:
+    """
+    通用图像保存函数：自动处理 Tensor/Numpy, CHW/HWC, 归一化/非归一化
+    
+    Returns:
+        bool: 是否成功保存
+    """
+    if img_data is None:
+        return False
+
+    # 1. 如果是 Tensor，转为 Numpy
+    if isinstance(img_data, torch.Tensor):
+        img_data = img_data.detach().cpu().numpy()
+        # 处理 batch 维度 [1, 3, 128, 128] -> [3, 128, 128]
+        if img_data.ndim == 4:
+            img_data = img_data.squeeze(0)
+        # 处理通道顺序 [3, H, W] -> [H, W, 3]
+        if img_data.shape[0] == 3 and img_data.ndim == 3:
+            img_data = img_data.transpose(1, 2, 0)
+
+    # 2. 此时 img_data 应该是 Numpy [H, W, 3]
+    # 如果是浮点数且在 0-1 之间，还原到 0-255
+    if img_data.dtype != np.uint8:
+        if img_data.max() <= 1.01:  # 容忍浮点误差
+            img_data = (img_data * 255).clip(0, 255).astype(np.uint8)
+        else:
+            img_data = img_data.astype(np.uint8)
+
+    # 3. 保存
+    img = Image.fromarray(img_data)
+    img.save(save_path)
+    return True
+
+
+def get_bool_value(val: Any) -> bool:
+    """从各种类型中提取 bool 值"""
+    if isinstance(val, torch.Tensor):
+        return val.item() if val.numel() == 1 else val.any().item()
+    elif isinstance(val, np.ndarray):
+        return val.item() if val.size == 1 else val.any()
+    elif isinstance(val, (list, tuple)):
+        return any(get_bool_value(v) for v in val)
+    else:
+        return bool(val)
+
+
+def process_pkl_by_episode(file_path: str, output_dir: str = None):
+    """
+    按 episode 分组处理 pkl 文件并保存图片
+    根据 dones/terminations/truncations 信号分割 episode
+    
+    Args:
+        file_path: pkl 文件路径
+        output_dir: 输出目录，默认为 pkl 文件同目录下的 'episodes' 文件夹
+    """
+    if not os.path.exists(file_path):
+        print(f"错误: 找不到文件 {file_path}")
+        return
+
+    print(f"加载数据: {file_path}")
+    with open(file_path, 'rb') as f:
+        data = pickle.load(f)
+
+    if not isinstance(data, list):
+        print(f"错误: 期望数据是列表，实际是 {type(data)}")
+        return
+    
+    print(f"总共 {len(data)} 帧数据")
+    
+    # 创建输出目录
+    if output_dir is None:
+        base_dir = os.path.dirname(file_path)
+        output_dir = os.path.join(base_dir, 'episodes')
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 按 done 信号分割 episode
+    episodes = []
+    current_episode = {'frames': [], 'rewards': []}
+    
+    for i, item in enumerate(data):
+        # 获取 obs
+        obs = None
+        if 'transitions' in item and isinstance(item['transitions'], dict):
+            obs = item['transitions'].get('obs', None)
+        
+        if obs is not None:
+            current_episode['frames'].append(obs)
+        
+        # 获取 reward
+        reward = item.get('rewards', 0)
+        if isinstance(reward, torch.Tensor):
+            reward = reward.item() if reward.numel() == 1 else reward.sum().item()
+        current_episode['rewards'].append(reward)
+        
+        # 检查是否结束当前 episode
+        is_done = (
+            get_bool_value(item.get('dones', False)) or
+            get_bool_value(item.get('terminations', False)) or
+            get_bool_value(item.get('truncations', False))
+        )
+        
+        if is_done:
+            episodes.append(current_episode)
+            current_episode = {'frames': [], 'rewards': []}
+    
+    # 处理最后一个未完成的 episode
+    if current_episode['frames']:
+        episodes.append(current_episode)
+    
+    print(f"共分割出 {len(episodes)} 个 episodes")
+    
+    # 保存每个 episode 的图片
+    total_frames = 0
+    
+    for ep_id, episode in enumerate(episodes):
+        frames = episode['frames']
+        rewards = episode['rewards']
+        
+        if not frames:
+            continue
+        
+        # 创建 episode 目录
+        ep_dir = os.path.join(output_dir, f"episode_{ep_id:04d}")
+        main_dir = os.path.join(ep_dir, 'main_images')
+        extra_dir = os.path.join(ep_dir, 'extra_view_images')
+        os.makedirs(main_dir, exist_ok=True)
+        os.makedirs(extra_dir, exist_ok=True)
+        
+        # 保存该 episode 的所有帧
+        for frame_idx, obs in enumerate(frames):
+            # 处理 main_images
+            if 'main_images' in obs:
+                save_any_image(obs['main_images'], os.path.join(main_dir, f"frame_{frame_idx:04d}.png"))
+            
+            # 处理 extra_view_images
+            if 'extra_view_images' in obs:
+                save_any_image(obs['extra_view_images'], os.path.join(extra_dir, f"frame_{frame_idx:04d}.png"))
+        
+        total_frames += len(frames)
+        
+        # 计算统计信息并保存
+        total_reward = sum(rewards) if rewards else 0
+        with open(os.path.join(ep_dir, 'info.txt'), 'w') as f:
+            f.write(f"Episode ID: {ep_id}\n")
+            f.write(f"Num Frames: {len(frames)}\n")
+            f.write(f"Total Reward: {total_reward}\n")
+        
+        print(f"Episode {ep_id:04d}: {len(frames)} 帧, reward={total_reward:.2f}")
+    
+    print(f"\n处理完成!")
+    print(f"总计: {len(episodes)} 个 episodes, {total_frames} 帧")
+    print(f"输出目录: {output_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="按 Episode 分组存储图片")
+    parser.add_argument("--input", "-i", type=str, default="pnp/data.pkl",
+                        help="输入 pkl 文件路径")
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="输出目录路径（默认为 pkl 同目录下的 'episodes' 文件夹）")
+    args = parser.parse_args()
+    
+    process_pkl_by_episode(args.input, args.output)
+
+
+if __name__ == "__main__":
+    main()

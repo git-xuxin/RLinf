@@ -21,9 +21,9 @@ cluster:
       hardware:
         type: Franka
         configs:
-          - robot_ip: 10.100.25.107
+          - robot_ip: 172.16.0.2
             node_rank: 0
-            camera_serials: ["0000000000", "1111111111"]
+            # camera_serials: ["213622078826"]  # wist "233622071437"
 
 runner:
   task_type: embodied
@@ -44,4 +44,4 @@ env:
     keyboard_reward_wrapper: "single_stage" # options: "single_stage", "multi_stage"
     use_spacemouse: True
     override_cfg:
-      target_ee_pose: TARGET_EE_POSE
+      target_ee_pose: [0.56, 0.0, 0.05, -3.14, 0.0, 0.0]

@@ -13,36 +13,37 @@ hydra:
     - file://${oc.env:EMBODIED_PATH}/config/
 
 cluster:
-  num_nodes: 3
+  num_nodes: 2
   component_placement:
     actor: 
       node_group: "4090"
-      placement: 0-0 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
+      placement: 0 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
     env:
       node_group: franka
-      placement: 0-0 # Local robot rank in the franka node group (n for the n+1 th robot)
+      placement: 0 # Local robot rank in the franka node group (n for the n+1 th robot)
     rollout:
       node_group: "4090"
-      placement: 1-1 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
+      placement: 0 # Local GPU rank in the 4090 node group (n for the n+1 th GPU)
   node_groups:
     - label: "4090" # GPU node group
-      node_ranks: 0-1  # The ranks of the nodes to be included in this group， change this if your training node is not rank 0
+      node_ranks: 0  # The ranks of the nodes to be included in this group， change this if your training node is not rank 0
     - label: franka
-      node_ranks: 2-2 # Change this if your robot node is not rank 1
+      node_ranks: 1 # Change this if your robot node is not rank 1
       hardware:
         type: Franka
         configs:
-          - robot_ip: 192.168.1.2
-            node_rank: 2
+          - robot_ip: 172.16.0.2
+            node_rank: 1
 
 data:
   type: robot_demo
   channel:
     name: demo_data
   path: 
-    - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-205709_2cam.pkl"
-    - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-215309_2cam.pkl"
-    - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-220208_2cam.pkl"
+    - "/home/xuxin/Workspace/Beijing/data/pnp/data.pkl"
+    # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-205709_2cam.pkl"
+    # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-215309_2cam.pkl"
+    # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-220208_2cam.pkl"
 
 runner:
   task_type: embodied
@@ -118,8 +119,9 @@ env:
     use_spacemouse: True
 
     override_cfgs:
-      - target_ee_pose: [ 0.66131751,  0.05864266, -0.04215348,  3.13851331, -0.06959385, -0.05439162]
-        camera_serials: ["141722075170", "136622074722"]
+      - target_ee_pose: [0.564, 0.045, 0.05, -3.14, 0.0, 0.0]
+        # camera_serials: ["141722075170", "136622074722"]
+        # camera_serials: ["213622078826",]
     override_cfg:
       use_dense_reward: False
       is_dummy: False
@@ -133,8 +135,8 @@ rollout:
 
   model:
     action_dim: 7
-    image_num: 2
-    model_path: "/mnt/RLinf"
+    # image_num: 2
+    model_path: "/home/xuxin/Workspace/realwordRL_model/RLinf-Reset10-pretrained/"
     precision: ${actor.model.precision}
     num_q_heads: 10
 
@@ -150,10 +152,10 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/mnt/RLinf"
+    model_path: "/home/xuxin/Workspace/realwordRL_model/RLinf-Reset10-pretrained/"
     state_dim: 19
     action_dim: 7
-    image_num: 2
+    image_num: 1
     num_q_heads: 10
 
   optim:
@@ -168,6 +170,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
+    use_orig_params: true
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}

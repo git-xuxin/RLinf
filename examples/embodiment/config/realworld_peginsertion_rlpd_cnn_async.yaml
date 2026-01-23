@@ -32,14 +32,14 @@ cluster:
       hardware:
         type: Franka
         configs:
-          - robot_ip: ROBOT_IP # Replace with your robot's IP address
+          - robot_ip: 172.16.0.2 # Replace with your robot's IP address
             node_rank: 1
 
 data:
   type: robot_demo
   channel:
     name: demo_data
-  path: "/path/to/demo_data"
+  path: "/home/xuxin/Workspace/Beijing/data/peg_insertion_demos/data.pkl"
 
 runner:
   task_type: embodied
@@ -59,13 +59,14 @@ runner:
   max_prompt_length: 30
 
 algorithm:
-  update_epoch: 30
+  update_epoch: 8
   group_size: 1
   agg_q: mean
 
   backup_entropy: False
   critic_subsample_size: 2
   eval_rollout_epoch: 1
+  # rollout_epoch: 1  # sync
 
   adv_type: embodied_sac
   loss_type: embodied_sac
@@ -111,7 +112,7 @@ env:
     override_cfg:
       is_dummy: False
       use_dense_reward: False
-      target_ee_pose: TARGET_EE_POSE # Replace with your target end-effector pose
+      target_ee_pose: [0.51573866, 0.02374934, 0.07331224, -3.13803461, 0.03418677, -0.01341346] # Replace with your target end-effector pose
 
 rollout:
   group_name: "RolloutGroup"
@@ -121,7 +122,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model"
+    model_path: "/home/xuxin/Workspace/realwordRL_model/RLinf-Reset10-pretrained/"
     precision: ${actor.model.precision}
     num_q_heads: 10
 
@@ -135,7 +136,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/path/to/model"
+    model_path: "/home/xuxin/Workspace/realwordRL_model/RLinf-Reset10-pretrained/"
     num_q_heads: 10
     state_dim: 19
     action_dim: 6
