@@ -18,6 +18,7 @@ from .relative_frame import RelativeFrame
 from .reward_done_wrapper import (
     KeyboardRewardDoneMultiStageWrapper,
     KeyboardRewardDoneWrapper,
+    GripperPenaltyWrapper
 )
 from .spacemouse_intervention import SpacemouseIntervention
 
@@ -28,4 +29,5 @@ __all__ = [
     "SpacemouseIntervention",
     "KeyboardRewardDoneWrapper",
     "KeyboardRewardDoneMultiStageWrapper",
+    "GripperPenaltyWrapper"
 ]
