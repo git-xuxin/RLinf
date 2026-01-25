@@ -34,14 +34,16 @@ class BaseKeyboardRewardDoneWrapper(gym.Wrapper):
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
         """Modifies the :attr:`env` :meth:`step` reward using :meth:`self.reward`."""
         observation, reward, terminated, truncated, info = self.env.step(action)
-        updated_reward, updated_terminated = self.reward_terminated()
-        return observation, updated_reward, updated_terminated, truncated, info
+        last_intervened, updated_reward, updated_terminated = self.reward_terminated()
+        if last_intervened:
+            reward = updated_reward
+        return observation, reward, updated_terminated, truncated, info
 
     def reward_terminated(
         self,
     ) -> tuple[float, bool]:
         last_intervened, terminated, keyboard_reward = self._check_keypress()
-        return keyboard_reward, terminated
+        return last_intervened, keyboard_reward, terminated
 
 
 class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
@@ -120,6 +122,5 @@ class GripperPenaltyWrapper(gym.RewardWrapper):
             info["grasp_penalty"] = 0.0
 
         self.last_gripper_pos = observation["state"]["gripper_position"][0]
-
-        reward += self.penalty
+        
         return observation, reward, terminated, truncated, info

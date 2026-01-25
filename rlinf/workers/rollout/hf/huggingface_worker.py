@@ -267,6 +267,7 @@ class MultiStepRolloutWorker(Worker):
                         truncations=env_output["truncations"],
                         terminations=env_output["terminations"],
                         rewards=rewards,  # the first step is reset step, reward is none, which will not be appended to the buffer
+                        grasp_penalty=env_output["grasp_penalty"], 
                         forward_inputs=last_forward_inputs[stage_id],
                     )
                     self.buffer_list[stage_id].append_result(chunk_step_result)
@@ -298,6 +299,7 @@ class MultiStepRolloutWorker(Worker):
                     env_output["terminations"]
                 )
                 self.buffer_list[stage_id].rewards.append(rewards)
+                self.buffer_list[stage_id].grasp_penalty.append(env_output["grasp_penalty"])
                 self.buffer_list[stage_id].forward_inputs.append(
                     put_tensor_device(last_forward_inputs[stage_id], "cpu")
                 )

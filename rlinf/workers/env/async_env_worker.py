@@ -97,6 +97,7 @@ class AsyncEnvWorker(EnvWorker):
                         else None,
                         intervene_actions=None,
                         intervene_flags=None,
+                        grasp_penalty=None
                     )
                     env_output_list.append(env_output)
             else:
@@ -111,6 +112,7 @@ class AsyncEnvWorker(EnvWorker):
                         truncations=self.last_truncations_list[i],
                         intervene_actions=self.last_intervened_info_list[i][0],
                         intervene_flags=self.last_intervened_info_list[i][1],
+                        grasp_penalty=None
                     )
                     env_output_list.append(env_output)
 

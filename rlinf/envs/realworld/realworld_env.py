@@ -282,6 +282,9 @@ class RealWorldEnv(gym.Env):
         infos["intervene_action"] = to_tensor(intervene_action)
         infos["intervene_flag"] = to_tensor(intervene_flag)
 
+        if "grasp_penalty" not in infos:
+            infos["grasp_penalty"] = np.zeros(self.num_envss)
+
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
         if dones.any() and _auto_reset:
@@ -305,6 +308,8 @@ class RealWorldEnv(gym.Env):
 
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
+
+        raw_chunk_grasp_penalty = []
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
@@ -313,6 +318,8 @@ class RealWorldEnv(gym.Env):
             if "intervene_action" in infos:
                 raw_chunk_intervene_actions.append(infos["intervene_action"])
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
+            
+            raw_chunk_grasp_penalty.append(infos["grasp_penalty"])
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
@@ -334,6 +341,9 @@ class RealWorldEnv(gym.Env):
             raw_chunk_intervene_actions, dim=1
         ).reshape(self.num_envs, -1)
         infos["intervene_flag"] = torch.stack(raw_chunk_intervene_flag, dim=1)
+        infos["grasp_penalty"] = torch.stack(
+            raw_chunk_grasp_penalty, dim=1
+        )
 
         if past_dones.any() and self.auto_reset:
             extracted_obs, infos = self._handle_auto_reset(

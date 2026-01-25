@@ -198,10 +198,15 @@ class EnvWorker(Worker):
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
+        grasp_penalty = infos["grasp_penalty"] if "grasp_penalty" in infos else torch.zeros_like(chunk_rewards)
         if self.cfg.env.train.auto_reset and chunk_dones.any():
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
                 intervene_flags = infos["final_info"]["intervene_flag"]
+            if "grasp_penalty" in infos["final_info"]:
+                grasp_penalty = infos["final_info"]["grasp_penalty"]
+            else:
+                grasp_penalty = torch.zeros_like(chunk_rewards)
 
         env_output = EnvOutput(
             obs=extracted_obs,
@@ -214,6 +219,7 @@ class EnvWorker(Worker):
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
+            grasp_penalty=grasp_penalty
         )
         return env_output, env_info
 
@@ -374,6 +380,7 @@ class EnvWorker(Worker):
                         else None,
                         intervene_actions=None,
                         intervene_flags=None,
+                        grasp_penalty=None
                     )
                     env_output_list.append(env_output)
             else:
@@ -388,6 +395,7 @@ class EnvWorker(Worker):
                         truncations=self.last_truncations_list[stage_id],
                         intervene_actions=self.last_intervened_info_list[stage_id][0],
                         intervene_flags=self.last_intervened_info_list[stage_id][1],
+                        grasp_penalty=None
                     )
                     env_output_list.append(env_output)
 

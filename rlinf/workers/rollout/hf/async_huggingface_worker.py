@@ -86,6 +86,10 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     await self.buffer_list[stage_id].add("dones", dones)
                     if rewards is not None:
                         await self.buffer_list[stage_id].add("rewards", rewards)
+                    if env_output["grasp_penalty"] is not None:
+                        await self.buffer_list[stage_id].add(
+                            "grasp_penalty", env_output["grasp_penalty"]
+                        )
                     if last_results[stage_id] is not None:
                         await self.buffer_list[stage_id].add_result(
                             last_results[stage_id]
@@ -118,6 +122,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 await self.buffer_list[i].add("dones", dones)
                 if rewards is not None:
                     await self.buffer_list[i].add("rewards", rewards)
+                if env_output["grasp_penalty"] is not None:
+                    await self.buffer_list[i].add("grasp_penalty", env_output["grasp_penalty"])
                 if last_results is not None:
                     await self.buffer_list[i].add_result(
                         put_tensor_device(last_results[i], "cpu")

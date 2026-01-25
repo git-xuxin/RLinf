@@ -1172,6 +1172,7 @@ class EnvOutput:
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
+    grasp_penalty: Optional[torch.Tensor] = None # [B]
 
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
@@ -1202,6 +1203,11 @@ class EnvOutput:
         self.intervene_flags = (
             self.intervene_flags.cpu().contiguous()
             if self.intervene_flags is not None
+            else None
+        )
+        self.grasp_penalty = (
+            self.grasp_penalty.cpu().contiguous()
+            if self.grasp_penalty is not None
             else None
         )
 
@@ -1239,6 +1245,7 @@ class EnvOutput:
         env_output_dict["rewards"] = self.rewards
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
+        env_output_dict["grasp_penalty"] = self.grasp_penalty
 
         return env_output_dict
 
@@ -1252,6 +1259,7 @@ class ChunkStepResult:
     truncations: torch.Tensor = None  # [B, 1]
     terminations: torch.Tensor = None  # [B, 1]
     rewards: torch.Tensor = None  # [B, 1]
+    grasp_penalty: torch.Tensor = None # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -1267,6 +1275,8 @@ class ChunkStepResult:
             self.truncations = self.truncations.cpu().contiguous()
         if self.rewards is not None:
             self.rewards = self.rewards.cpu().contiguous()
+        if self.grasp_penalty is not None:
+            self.grasp_penalty = self.grasp_penalty.cpu().contiguous()
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
 
@@ -1293,6 +1303,9 @@ class EmbodiedRolloutResult:
     rewards: list[torch.Tensor] = field(
         default_factory=list
     )  # lens of results is rollout_epoch * n_chunk_steps
+    grasp_penalty: list[torch.Tensor] = field(
+        default_factory=list
+    )
     forward_inputs: list[dict[str, list[torch.Tensor]]] = field(
         default_factory=list
     )  # lens of results is rollout_epoch * n_chunk_steps
@@ -1315,6 +1328,8 @@ class EmbodiedRolloutResult:
             self.rewards.append(result.rewards)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        if result.grasp_penalty:
+            self.grasp_penalty.append(result.grasp_penalty)
 
     def add_transition(self, obs, next_obs):
         self.transitions.append(
@@ -1356,6 +1371,11 @@ class EmbodiedRolloutResult:
             if len(self.rewards) > 0
             else None
         )
+        rollout_result_dict["grasp_penalty"] = (
+            torch.stack(self.grasp_penalty, dim=0).cpu().contiguous()
+            if len(self.grasp_penalty) > 0
+            else None
+        )
 
         intervene_flags = []
         for forward_input in self.forward_inputs:
@@ -1378,6 +1398,7 @@ class EmbodiedRolloutResult:
                 "rewards",
                 "prev_logprobs",
                 "prev_values",
+                "grasp_penalty"
             ]
             rollout_result_dict[k] = merged_forward_inputs[k]
 
@@ -1407,6 +1428,7 @@ class AsyncEmbodiedRolloutBuffer:
     terminations: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
     truncations: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
     rewards: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
+    grasp_penalty: asyncio.Queue[torch.Tensor] = field(default_factory=asyncio.Queue)
     transitions: asyncio.Queue[tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=asyncio.Queue
     )
@@ -1428,6 +1450,7 @@ class AsyncEmbodiedRolloutBuffer:
         truncations = asyncio.Queue()
         terminations = asyncio.Queue()
         rewards = asyncio.Queue()
+        grasp_penalty = asyncio.Queue()
         transitions = asyncio.Queue()
         forward_inputs = asyncio.Queue()
 
@@ -1444,6 +1467,8 @@ class AsyncEmbodiedRolloutBuffer:
                 terminations.put(data_dict["terminations"])
             if "rewards" in data_dict_keys:
                 rewards.put(data_dict["rewards"])
+            if "grasp_penalty" in data_dict_keys:
+                grasp_penalty.put(data_dict["grasp_penalty"])
             if "transitions" in data_dict_keys:
                 transitions.put(data_dict["transitions"])
             if "forward_inputs" in data_dict_keys:
@@ -1456,6 +1481,7 @@ class AsyncEmbodiedRolloutBuffer:
             terminations=terminations,
             truncations=truncations,
             rewards=rewards,
+            grasp_penalty=grasp_penalty, 
             forward_inputs=forward_inputs,
             transitions=transitions,
         )
@@ -1492,6 +1518,8 @@ class AsyncEmbodiedRolloutBuffer:
     async def add(self, key, items):
         if key == "rewards":
             await self.rewards.put(items)
+        elif key == "grasp_penalty":
+            await self.grasp_penalty.put(items)
         elif key == "dones":
             await self.dones.put(items)
         elif key == "terminations":
@@ -1512,6 +1540,7 @@ class AsyncEmbodiedRolloutBuffer:
         truncations = []
         terminations = []
         rewards = []
+        grasp_penalty = []
         transitions = []
         forward_inputs = []
         intervene_flags = []
@@ -1522,6 +1551,7 @@ class AsyncEmbodiedRolloutBuffer:
             truncations.append(await self.truncations.get())
             terminations.append(await self.terminations.get())
             rewards.append(await self.rewards.get())
+            grasp_penalty.append(await self.grasp_penalty.get())
             transitions.append(await self.transitions.get())
             forward_inputs.append(await self.forward_inputs.get())
 
@@ -1535,6 +1565,7 @@ class AsyncEmbodiedRolloutBuffer:
             "truncations": torch.cat(truncations, dim=0).cpu().contiguous(),
             "terminations": torch.cat(terminations, dim=0).cpu().contiguous(),
             "rewards": torch.cat(rewards, dim=0).cpu().contiguous(),
+            "grasp_penalty": torch.cat(grasp_penalty, dim=0).cpu().contiguous(), 
             "transitions": cat_list_of_dict_tensor(transitions),
         }
 
