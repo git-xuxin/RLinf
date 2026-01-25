@@ -40,6 +40,7 @@ class EnvWorker(Worker):
         self.eval_env_list: list[EnvManager] = []
 
         self.last_obs_list = []
+        self.last_final_obs_list = []
         self.last_dones_list = []
         self.last_terminations_list = []
         self.last_truncations_list = []
@@ -151,6 +152,7 @@ class EnvWorker(Worker):
                     .repeat(1, self.cfg.actor.model.num_action_chunks)
                 )
                 self.last_obs_list.append(extracted_obs)
+                self.last_final_obs_list.append(None)
                 self.last_dones_list.append(dones)
                 self.last_terminations_list.append(dones.clone())
                 self.last_truncations_list.append(dones.clone())
@@ -389,6 +391,7 @@ class EnvWorker(Worker):
                 for stage_id in range(self.stage_num):
                     env_output = EnvOutput(
                         obs=self.last_obs_list[stage_id],
+                        final_obs=self.last_final_obs_list[stage_id],  
                         rewards=None,
                         dones=self.last_dones_list[stage_id],
                         terminations=self.last_terminations_list[stage_id],
@@ -424,6 +427,7 @@ class EnvWorker(Worker):
                             env_metrics[key].append(value)
 
             self.last_obs_list = [env_output.obs for env_output in env_output_list]
+            self.last_final_obs_list = [env_output.final_obs for env_output in env_output_list]
             self.last_dones_list = [env_output.dones for env_output in env_output_list]
             self.last_truncations_list = [
                 env_output.truncations for env_output in env_output_list
