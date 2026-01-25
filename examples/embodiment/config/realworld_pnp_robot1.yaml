@@ -44,6 +44,9 @@ data:
     name: demo_data
   path: 
     - "/home/xuxin/Workspace/Beijing/data/pnp/data_1.pkl"
+    - "/home/xuxin/Workspace/Beijing/data/pnp/data_2.pkl"
+    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_noforce_1.pkl"
+    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_noforce_2.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-205709_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-215309_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-220208_2cam.pkl"
@@ -56,7 +59,7 @@ runner:
     experiment_name: "sac_mlp"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 8000
+  max_epochs: 10000
   max_steps: -1
 
   only_eval: False
@@ -66,9 +69,11 @@ runner:
   max_prompt_length: 30
 
 algorithm:
-  update_epoch: 8
+  update_epoch: 32
   group_size: 1
-  agg_q: mean
+  agg_q: mean  # Default fallback value
+  agg_q_actor: mean  # Use mean for actor
+  agg_q_critic: min  # Use min for critic
 
   backup_entropy: False
   critic_subsample_size: 2
@@ -220,7 +225,7 @@ reward:
     precision: "bf16"
     
     # Path to trained reward model checkpoint (需要重新训练以匹配 PR #596 格式)
-    checkpoint_path: "/home/xuxin/Workspace/Beijing/RLinf_zhz/resnet_training/reward_model_20260123_214043.pt"  # TODO: 设置为训练好的 reward model 路径
+    checkpoint_path: "/home/xuxin/Workspace/Beijing/RLinf_zhz/resnet_training/reward_model_20260124_151755.pt"  # TODO: 设置为训练好的 reward model 路径
     
     # Debug image save directory (set to path to enable, null to disable)
     debug_save_dir: "/home/xuxin/Workspace/Beijing/RLinf_zhz/logs/reward_debug_images"

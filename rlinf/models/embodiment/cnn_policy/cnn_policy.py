@@ -273,7 +273,7 @@ class CNNPolicy(nn.Module, BasePolicy):
         mix_feature = self.mix_proj(full_feature)
         action_mean = self.actor_mean(mix_feature)
         action_logstd = self.actor_logstd(mix_feature)
-        action_logstd = torch.tanh(action_logstd)
+        # action_logstd = torch.tanh(action_logstd)
 
         action_std = torch.exp(action_logstd)
         if self.cfg.std_range is not None:
@@ -312,8 +312,8 @@ class CNNPolicy(nn.Module, BasePolicy):
         else:
             action_logstd = self.actor_logstd(mix_feature)
 
-        if self.cfg.final_tanh:
-            action_logstd = torch.tanh(action_logstd)
+        # if self.cfg.final_tanh:
+        #     action_logstd = torch.tanh(action_logstd)
 
         action_std = action_logstd.exp()
         if self.cfg.std_range is not None:

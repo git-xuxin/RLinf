@@ -279,7 +279,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     def forward_critic(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
-        agg_q = self.cfg.algorithm.get("agg_q", "min")
+        agg_q = self.cfg.algorithm.get("agg_q_critic", self.cfg.algorithm.get("agg_q", "min"))
         rewards = batch["rewards"].to(self.torch_dtype)
         terminations = batch["terminations"].to(self.torch_dtype)
 
@@ -392,7 +392,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
     def forward_actor(self, batch):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
-        agg_q = self.cfg.algorithm.get("agg_q", "min")
+        agg_q = self.cfg.algorithm.get("agg_q_actor", self.cfg.algorithm.get("agg_q", "min"))
         curr_obs = batch["transitions"]["obs"]
         kwargs = {}
         if self.cfg.actor.model.model_type in ["openvla", "openvla_oft"]:

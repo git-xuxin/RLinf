@@ -106,6 +106,18 @@ class ResNetEncoder(nn.Module):
         self.pooling_method = "spatial_learned_embeddings"
         self.use_pretrain = True
 
+        # ImageNet mean and std for normalization
+        self.register_buffer(
+            "_mean",
+            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_std",
+            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
         self.resnet_backbone = ResNet10(pre_pooling=self.use_pretrain)
         if self.use_pretrain:
             self._load_pretrained_weights()
@@ -145,6 +157,9 @@ class ResNetEncoder(nn.Module):
             p.requires_grad = False
 
     def forward(self, x):
+        # Apply ImageNet normalization: (x - mean) / std
+        # x is expected to be in [0, 1] range (already divided by 255.0 in preprocess_env_obs)
+        x = (x - self._mean) / self._std
         x = self.resnet_backbone(x)
 
         if self.use_pretrain:

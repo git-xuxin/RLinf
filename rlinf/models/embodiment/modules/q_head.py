@@ -43,7 +43,7 @@ class QHead(nn.Module):
         self.action_feature_dim = action_feature_dim
         self.train_action_encoder = train_action_encoder
 
-        self.nonlinearity = "relu"
+        self.nonlinearity = "tanh"
 
         if self.train_action_encoder:
             self.action_encoder = nn.Sequential(
@@ -71,7 +71,7 @@ class QHead(nn.Module):
 
         self._init_weights(self.nonlinearity)
 
-    def _init_weights(self, nonlinearity="relu"):
+    def _init_weights(self, nonlinearity="tanh"):
         for m in self.net:
             if isinstance(m, nn.Linear):
                 if m is self.net[-1]:
@@ -79,9 +79,13 @@ class QHead(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
                 else:
-                    nn.init.kaiming_normal_(
-                        m.weight, mode="fan_out", nonlinearity=nonlinearity
-                    )
+                    if nonlinearity == "tanh":
+                        # For tanh, use xavier uniform initialization
+                        nn.init.xavier_uniform_(m.weight)
+                    else:
+                        nn.init.kaiming_normal_(
+                            m.weight, mode="fan_out", nonlinearity=nonlinearity
+                        )
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
@@ -171,7 +175,7 @@ class CrossQHead(nn.Module):
         self.action_feature_dim = action_feature_dim
         self.train_action_encoder = train_action_encoder
 
-        self.nonlinearity = "relu"
+        self.nonlinearity = "tanh"
 
         if train_action_encoder:
             raise NotImplementedError
@@ -200,7 +204,7 @@ class CrossQHead(nn.Module):
 
         self._init_weights(self.nonlinearity)
 
-    def _init_weights(self, nonlinearity="relu"):
+    def _init_weights(self, nonlinearity="tanh"):
         for m in self.net:
             if isinstance(m, nn.Linear):
                 if m is self.net[-1]:
@@ -208,9 +212,13 @@ class CrossQHead(nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
                 else:
-                    nn.init.kaiming_normal_(
-                        m.weight, mode="fan_out", nonlinearity=nonlinearity
-                    )
+                    if nonlinearity == "tanh":
+                        # For tanh, use xavier uniform initialization
+                        nn.init.xavier_uniform_(m.weight)
+                    else:
+                        nn.init.kaiming_normal_(
+                            m.weight, mode="fan_out", nonlinearity=nonlinearity
+                        )
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
