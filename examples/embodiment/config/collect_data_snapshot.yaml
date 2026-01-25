@@ -1,0 +1,54 @@
+# collect_data/examples/embodiment/config/collect_data_snapshot.yaml
+
+defaults:
+  - env/realworld_bin_relocation@env.eval
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env:
+      node_group: franka
+      placement: 0
+  node_groups:
+    - label: franka
+      node_ranks: 0
+      hardware:
+        type: Franka
+        configs:
+          - robot_ip: 172.16.0.2
+            node_rank: 0
+            # camera_serials: ["0000000000", "1111111111"]
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: null
+    project_name: rlinf
+    experiment_name: "collect-snapshot"
+    logger_backends: ["tensorboard"] 
+  num_data_episodes: 10000 
+  record_task_description: False
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    no_gripper: False
+    
+    # --- 关键修改 ---
+    ignore_terminations: True  # 忽略任务结束信号
+    auto_reset: False          # 禁止环境包装器自动重置
+    # ----------------
+    
+    keyboard_reward_wrapper: null 
+    use_spacemouse: True
+    override_cfg:
+      target_ee_pose: [0.564, 0.045, 0.05, -3.14, 0.0, 0.0]
+      max_num_steps: 1000000   # 设置一个极大的步数限制，防止底层truncated
