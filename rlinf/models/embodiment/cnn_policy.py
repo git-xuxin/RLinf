@@ -58,6 +58,9 @@ class CNNConfig:
         self._update_info()
 
     def _update_info(self):
+        if self.state_dim <= 0:
+            self.state_latent_dim = 0
+
         if self.add_q_head:
             self.independent_std = False
             if self.action_scale is None:
@@ -100,19 +103,20 @@ class CNNPolicy(BasePolicy):
         self.encoders["resnet_encoders"] = resnet_encoders
 
         if self.cfg.backbone == "resnet":
-            state_proj = nn.Sequential(
-                *make_mlp(
-                    in_channels=self.cfg.state_dim,
-                    mlp_channels=[
-                        self.cfg.state_latent_dim,
-                    ],
-                    act_builder=nn.Tanh,
-                    last_act=True,
-                    use_layer_norm=True,
+            if self.cfg.state_dim > 0:
+                state_proj = nn.Sequential(
+                    *make_mlp(
+                        in_channels=self.cfg.state_dim,
+                        mlp_channels=[
+                            self.cfg.state_latent_dim,
+                        ],
+                        act_builder=nn.Tanh,
+                        last_act=True,
+                        use_layer_norm=True,
+                    )
                 )
-            )
-            init_mlp_weights(state_proj, nonlinearity="tanh")
-            self.encoders["state_proj"] = state_proj
+                init_mlp_weights(state_proj, nonlinearity="tanh")
+                self.encoders["state_proj"] = state_proj
 
             self.mix_proj = nn.Sequential(
                 *make_mlp(
@@ -205,8 +209,11 @@ class CNNPolicy(BasePolicy):
         visual_feature = torch.cat(visual_features, dim=-1)
         if detach_encoder:
             visual_feature = visual_feature.detach()
-        state_embed = self.state_proj(obs["states"])
-        x = torch.cat([visual_feature, state_embed], dim=1)
+        if self.cfg.state_dim > 0:
+            state_embed = self.state_proj(obs["states"])
+            x = torch.cat([visual_feature, state_embed], dim=1)
+        else:
+            x = visual_feature.clone()
         return x, visual_feature
 
     def forward(self, forward_type="default_forward", **kwargs):
