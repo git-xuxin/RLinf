@@ -457,25 +457,25 @@ class FrankaEnv(gym.Env):
     def _gripper_action(self, position: float, is_binary: bool = True):        
         if is_binary:
             if (
-                (position <= -0.5) 
-                and (self._franka_state.gripper_position > 0.85) 
-                and (time.time() - self.last_gripper_act > 0.6)
-            ):  # close gripper
+                position <= -self.config.binary_gripper_threshold
+                and self._franka_state.gripper_open
+            ):
+                # Close gripper
                 self._controller.close_gripper().wait()
-                self.last_gripper_act = time.time()
                 time.sleep(0.6)
+                return True
             elif (
-                (position >= 0.5) 
-                and (self._franka_state.gripper_position < 0.85) 
-                and (time.time() - self.last_gripper_act > 0.6)
-            ):  # open gripper
-                self._controller.close_gripper().wait()
-                self.last_gripper_act = time.time()
+                position >= self.config.binary_gripper_threshold
+                and not self._franka_state.gripper_open
+            ):
+                # Open gripper
+                self._controller.open_gripper().wait()
                 time.sleep(0.6)
-            else: 
-                return
+                return True
+            else:  # No change
+                return False
         else:
-            raise NotImplementedError("Continuous gripper control is optional")
+            raise NotImplementedError("Non-binary gripper action not implemented.")
 
     def _interpolate_move(self, pose: np.ndarray, timeout: float = 1.5):
         num_steps = int(timeout * self.config.step_frequency)
