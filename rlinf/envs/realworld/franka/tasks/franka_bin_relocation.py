@@ -26,8 +26,8 @@ from ..franka_env import FrankaEnv, FrankaRobotConfig
 
 @dataclass
 class BinEnvConfig(FrankaRobotConfig):
-    random_x_range: float = 0.07
-    random_y_range: float = 0.15
+    random_x_range: float = 0.03
+    random_y_range: float = 0.13
     random_z_range_high: float = 0.1
     random_z_range_low: float = 0.001
     random_rz_range: float = np.pi / 6
@@ -125,10 +125,13 @@ class FrankaBinRelocationEnv(FrankaEnv):
         """
         self.inner_safety_box = gym.spaces.Box(
             # self.config.target_ee_pose[:3] - np.array([0.07, 0.03, 0.001]),
-            self.config.target_ee_pose[:3] - np.array([0.001, 0.001, 0.001]),
+            self.config.target_ee_pose[:3] - np.array([0.042, 0.198, 0.03]),
             # self.config.target_ee_pose[:3] + np.array([0.07, 0.03, 0.04]),
-            self.config.target_ee_pose[:3] + np.array([0.001, 0.001, 0.001]),
-            
+            self.config.target_ee_pose[:3] + np.array([0.029, -0.033, -0.005]),
+            # 0.522  0.012  0.045
+            # 0.593 -0.153  0.020
+
+            # 0.564, 0.045, 0.05
             dtype=np.float64,
         )
 
