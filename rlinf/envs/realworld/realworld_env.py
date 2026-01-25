@@ -32,8 +32,7 @@ from rlinf.envs.realworld.common.wrappers import (
     KeyboardRewardDoneWrapper,
     Quat2EulerWrapper,
     RelativeFrame,
-    SpacemouseIntervention,
-    GripperPenaltyWrapper
+    SpacemouseIntervention
 )
 from rlinf.envs.realworld.venv import NoAutoResetSyncVectorEnv
 from rlinf.envs.utils import (
@@ -93,8 +92,6 @@ class RealWorldEnv(gym.Env):
         )
         if self.cfg.get("no_gripper", True):
             env = GripperCloseEnv(env)
-        if self.cfg.get("enable_gripper_penalty", False):
-            env = GripperPenaltyWrapper(env)
         if not env.config.is_dummy and self.cfg.get("use_spacemouse", True):
             env = SpacemouseIntervention(env)
         if not env.config.is_dummy and self.cfg.get("keyboard_reward_wrapper", None):
@@ -283,7 +280,7 @@ class RealWorldEnv(gym.Env):
         infos["intervene_flag"] = to_tensor(intervene_flag)
 
         if "grasp_penalty" not in infos:
-            infos["grasp_penalty"] = np.zeros(self.num_envss)
+            infos["grasp_penalty"] = np.zeros(self.num_envs)
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
