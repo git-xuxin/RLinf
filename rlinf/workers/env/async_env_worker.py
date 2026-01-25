@@ -106,6 +106,7 @@ class AsyncEnvWorker(EnvWorker):
                 for i in range(self.stage_num):
                     env_output = EnvOutput(
                         obs=self.last_obs_list[i],
+                        final_obs=self.last_final_obs_list[i], 
                         rewards=None,
                         dones=self.last_dones_list[i],
                         terminations=self.last_terminations_list[i],
@@ -146,6 +147,7 @@ class AsyncEnvWorker(EnvWorker):
             env_metric_channel.put(env_metrics)
 
             self.last_obs_list = [env_output.obs for env_output in env_output_list]
+            self.last_final_obs_list = [env_output.final_obs for env_output in env_output_list]
             self.last_dones_list = [env_output.dones for env_output in env_output_list]
             self.last_truncations_list = [
                 env_output.truncations for env_output in env_output_list
