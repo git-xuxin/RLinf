@@ -20,6 +20,7 @@ ResNet-18 二分类训练脚本 (兼容 RLinf ResNetRewardModel 格式)
 输出格式与 rlinf/models/embodiment/reward/resnet_reward_model.py 兼容。
 
 使用方法:
+    python resnet_training/train_resnet18_classifier.py --data_dir ~/Workspace/Beijing/data/pnp/classified
     python train_resnet18_classifier.py --data_dir /path/to/data
 
     # 指定输出路径
