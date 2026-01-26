@@ -118,6 +118,11 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 time.sleep(1.0)
                 continue
             train_step += 1
+            # Update global_step to keep it in sync with train_step
+            self.global_step = train_step
+            # Set global step for actor and rollout workers
+            self.actor.set_global_step(self.global_step)
+            self.rollout.set_global_step(self.global_step)
 
             with self.timer("sync_weights"):
                 self.update_rollout_weights(enable_wait=True)
