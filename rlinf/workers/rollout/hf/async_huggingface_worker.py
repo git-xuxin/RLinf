@@ -53,6 +53,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
             disable=(self._rank != 0),
         )
 
+        is_first_step = True
         while not self.should_stop:
             last_extracted_obs = [None for i in range(self.num_pipeline_stages)]
             last_results = [None for i in range(self.num_pipeline_stages)]
@@ -75,15 +76,19 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
 
                     actions, result = self.predict(extracted_obs)
 
-                    await self.buffer_list[stage_id].add(
-                        "truncations",
-                        env_output["truncations"].bool().cpu().contiguous(),
-                    )
-                    await self.buffer_list[stage_id].add(
-                        "terminations",
-                        env_output["terminations"].bool().cpu().contiguous(),
-                    )
-                    await self.buffer_list[stage_id].add("dones", dones)
+                    if not is_first_step:
+                        await self.buffer_list[stage_id].add(
+                            "truncations",
+                            env_output["truncations"].bool().cpu().contiguous(),
+                        )
+                        await self.buffer_list[stage_id].add(
+                            "terminations",
+                            env_output["terminations"].bool().cpu().contiguous(),
+                        )
+                        await self.buffer_list[stage_id].add("dones", dones)
+                    else:
+                        is_first_step = False
+
                     if rewards is not None:
                         await self.buffer_list[stage_id].add("rewards", rewards)
                     if env_output["grasp_penalty"] is not None:
@@ -109,6 +114,13 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
 
             for i in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
+                if last_results[stage_id] is not None:
+                    last_results[stage_id]["forward_inputs"] = (
+                        self.update_intervene_actions(
+                            env_output, last_results[stage_id]["forward_inputs"]
+                        )
+                    )
+                
                 extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
                 dones, rewards, real_extracted_obs = self.get_dones_and_rewards(
                     env_output, extracted_obs

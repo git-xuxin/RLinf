@@ -139,12 +139,18 @@ class ResNetEncoder(nn.Module):
         )
         model_dict = torch.load(self.encoder_cfg["ckpt_path"])
         self.resnet_backbone.load_state_dict(model_dict)
+        self.pretrain_mean = torch.tensor([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        self.pretrain_std = torch.tensor([0.229, 0.224, 0.225]).reshape(3, 1, 1)
 
     def _freeze_backbone_weights(self):
         for p in self.resnet_backbone.parameters():
             p.requires_grad = False
 
     def forward(self, x):
+        self.pretrain_mean = self.pretrain_mean.to(x.device)
+        self.pretrain_std = self.pretrain_std.to(x.device)
+
+        x = (x - self.pretrain_mean) / self.pretrain_std
         x = self.resnet_backbone(x)
 
         if self.use_pretrain:

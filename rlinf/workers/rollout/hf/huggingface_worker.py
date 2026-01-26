@@ -149,16 +149,21 @@ class MultiStepRolloutWorker(Worker):
         """
         # First step: no rewards yet, only dones
         real_extracted_obs = None
+        dones = env_output["dones"].bool().cpu().contiguous()
+
         if env_output["rewards"] is None:
             if hasattr(self.hf_model, "q_head"):
                 real_extracted_obs = init_real_obs(extracted_obs)
+                if dones.any() and hasattr(self.hf_model, "q_head"):
+                    final_obs = env_output["final_obs"]
+                    final_extracted_obs = self.hf_model.preprocess_env_obs(final_obs)
+                    real_extracted_obs = init_real_obs(final_extracted_obs)
             return (
-                env_output["dones"].bool().cpu().contiguous(),
+                dones,
                 None,
                 real_extracted_obs,
             )
 
-        dones = env_output["dones"].bool().cpu().contiguous()
         rewards = env_output["rewards"].cpu().contiguous()
 
         # Handle auto_reset: add bootstrap value to rewards for done episodes
