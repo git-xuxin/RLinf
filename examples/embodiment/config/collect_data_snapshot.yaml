@@ -36,6 +36,17 @@ runner:
     logger_backends: ["tensorboard"] 
   num_data_episodes: 10000 
   record_task_description: False
+  
+  # --- 新增配置：快照按键映射 ---
+  snapshot_config:
+    # 模式选择: 'default' (旧模式: s=success, f=failure) 或 'custom' (自定义)
+    mode: "custom" 
+    
+    # 自定义映射: 按键: 文件夹名
+    mappings:
+      a: "stage0"
+      s: "stage1"
+      d: "stage2"
 
 env:
   group_name: "EnvGroup"

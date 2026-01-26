@@ -27,20 +27,42 @@ class SnapshotCollector(Worker):
         )
         
         self.listener = KeyboardListener()
-        
         self.log_path = self.cfg.runner.logger.log_path
-        self.success_dir = os.path.join(self.log_path, "success")
-        self.failure_dir = os.path.join(self.log_path, "failure")
         
-        os.makedirs(self.success_dir, exist_ok=True)
-        os.makedirs(self.failure_dir, exist_ok=True)
+        # --- 初始化按键映射和文件夹 ---
+        self.key_mapping = {} # 格式: {'key_char': 'folder_name'}
         
-        self.log_info(f"Snapshot Collector Initialized.")
-        self.log_info(f"Press 's' to save to {self.success_dir}")
-        self.log_info(f"Press 'f' to save to {self.failure_dir}")
+        snapshot_cfg = self.cfg.runner.get("snapshot_config", None)
+        mode = snapshot_cfg.get("mode", "default") if snapshot_cfg else "default"
+        
+        if mode == "custom" and snapshot_cfg and "mappings" in snapshot_cfg:
+            # 使用 YAML 中定义的自定义映射
+            self.log_info("Initializing Custom Snapshot Mode...")
+            for key, folder_name in snapshot_cfg.mappings.items():
+                self.key_mapping[str(key)] = folder_name
+        else:
+            # 默认模式 (兼容旧代码)
+            self.log_info("Initializing Default Snapshot Mode (s=success, f=failure)...")
+            self.key_mapping = {
+                's': 'success',
+                'f': 'failure'
+            }
 
-    def save_frame(self, obs, category):
+        # 创建所有需要的文件夹
+        for folder_name in self.key_mapping.values():
+            full_path = os.path.join(self.log_path, folder_name)
+            os.makedirs(full_path, exist_ok=True)
+            self.log_info(f"Initialized folder: {full_path}")
+            
+        self.log_info(f"Snapshot Collector Initialized.")
+        self.log_info(f"Key Mappings: {self.key_mapping}")
+
+    def save_frame(self, obs, folder_name):
+        """
+        保存帧到指定文件夹名称
+        """
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        save_dir = os.path.join(self.log_path, folder_name)
         
         # 提取 main_images
         if "main_images" in obs:
@@ -51,13 +73,12 @@ class SnapshotCollector(Worker):
             # 环境输出是 RGB，OpenCV 保存需要 BGR
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
             
-            save_dir = self.success_dir if category == 'success' else self.failure_dir
             filename = f"{timestamp}.png"
             filepath = os.path.join(save_dir, filename)
             
             success = cv2.imwrite(filepath, img_bgr)
             if success:
-                self.log_info(f"Saved [{category}] snapshot: {filename}")
+                self.log_info(f"Saved snapshot to [{folder_name}]: {filename}")
             else:
                 self.log_info(f"Failed to save snapshot to {filepath}")
 
@@ -69,7 +90,6 @@ class SnapshotCollector(Worker):
                 # --- 修复颜色问题 ---
                 img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
                 
-                save_dir = self.success_dir if category == 'success' else self.failure_dir
                 filename = f"{timestamp}_view_{i}.png"
                 filepath = os.path.join(save_dir, filename)
                 cv2.imwrite(filepath, img_bgr)
@@ -80,6 +100,7 @@ class SnapshotCollector(Worker):
         
         self.log_info("Start collecting snapshots...")
         self.log_info("Auto-reset is DISABLED. Move freely.")
+        self.log_info(f"Active keys: {list(self.key_mapping.keys())}")
         
         try:
             while True:
@@ -88,14 +109,14 @@ class SnapshotCollector(Worker):
                 # 步进环境
                 next_obs, reward, terminated, truncated, info = self.env.step(action)
                 
+                # 获取按键输入
                 key = self.listener.get_key()
                 
-                if key == 's':
-                    self.save_frame(obs, 'success')
-                    time.sleep(0.2) 
-                elif key == 'f':
-                    self.save_frame(obs, 'failure')
-                    time.sleep(0.2)
+                # --- 动态检查按键 ---
+                if key in self.key_mapping:
+                    target_folder = self.key_mapping[key]
+                    self.save_frame(obs, target_folder)
+                    time.sleep(0.2) # 防止按一次键保存多张
                 
                 # --- 修复 Reset 问题 ---
                 # 无论 terminated 或 truncated 状态如何，永远不调用 reset()
