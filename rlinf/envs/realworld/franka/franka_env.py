@@ -535,10 +535,14 @@ class FrankaEnv(gym.Env):
                 "tcp_pose": self._franka_state.tcp_pose,
                 "tcp_vel": self._franka_state.tcp_vel,
                 "gripper_position": np.array(
-                    [
-                        self._franka_state.gripper_position,
-                    ]
+                    [1.0 if self._franka_state.gripper_open else -1.0], 
+                    dtype=np.float32
                 ),
+                # "gripper_position": np.array(
+                #     [
+                #         self._franka_state.gripper_position,
+                #     ]
+                # ),
                 "tcp_force": self._franka_state.tcp_force,
                 "tcp_torque": self._franka_state.tcp_torque,
             }

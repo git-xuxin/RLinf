@@ -68,6 +68,7 @@ class EmbodiedRunner:
         self.demo_buffer = demo_buffer
         self.critic = critic
         self.reward = reward
+        self.rollout_sync_interval = self.cfg.runner.get("rollout_sync_interval", 1)
 
         # Data channels
         self.env_channel = Channel.create("Env")
@@ -310,7 +311,9 @@ class EmbodiedRunner:
 
             with self.timer("step"):
                 with self.timer("sync_weights"):
-                    self.update_rollout_weights()
+                    # self.update_rollout_weights()
+                    if _step % self.rollout_sync_interval == 0:
+                        self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(
                         input_channel=self.rollout_channel,

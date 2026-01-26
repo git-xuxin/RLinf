@@ -124,8 +124,9 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
 
-            with self.timer("sync_weights"):
-                self.update_rollout_weights(enable_wait=True)
+            if train_step % self.rollout_sync_interval ==0:
+                with self.timer("sync_weights"):
+                    self.update_rollout_weights()
 
             training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
             self.metric_logger.log(training_metrics, train_step)
@@ -145,6 +146,15 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 }
                 self.metric_logger.log(rollout_metrics, train_step)
                 self.metric_logger.log(env_worker_metrics, train_step)
+            
+            # Get reward component statistics from rollout worker
+            try:
+                reward_stats_result = self.rollout.get_reward_stats().wait()
+                if reward_stats_result and reward_stats_result[0]:
+                    reward_stats = reward_stats_result[0]
+                    self.metric_logger.log(reward_stats, train_step)
+            except Exception:
+                pass  # Reward stats not available
 
             _, save_model, _ = check_progress(
                 self.global_step,

@@ -78,9 +78,21 @@ class MultiStepRolloutWorker(Worker):
         self.gripper_action_index = reward_cfg.get("gripper_action_index", 6)
         self.gripper_open_threshold = reward_cfg.get("gripper_open_threshold", 0.04)
         
+        # Time penalty configuration: small penalty per step to encourage faster completion
+        self.time_penalty = reward_cfg.get("time_penalty", -0.01)
+        
         # Track gripper logical state per batch index (like franka_env.py's gripper_open boolean)
         # This ensures penalty is only applied when gripper state actually changes
         self.gripper_is_open: dict[int, bool] = {}
+        
+        # Reward component statistics for TensorBoard logging
+        self._reward_stats = {
+            "rm_reward_sum": 0.0,
+            "gripper_penalty_sum": 0.0,
+            "time_penalty_sum": 0.0,
+            "final_reward_sum": 0.0,
+            "reward_count": 0,
+        }
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -306,83 +318,156 @@ class MultiStepRolloutWorker(Worker):
             rewards: Current rewards tensor, can be None (for first step)
             
         Returns:
-            Modified rewards tensor with gripper penalty applied, or original rewards if penalty not applicable
+            Tuple of (modified_rewards, reward_components_dict) where reward_components_dict
+            contains the breakdown of reward components for logging.
         """
-        if not self.enable_gripper_penalty:
-            return rewards
+        # Initialize reward components for logging
+        reward_components = {
+            "rm_reward": None,
+            "gripper_penalty": None,
+            "time_penalty": None,
+            "final_reward": None,
+        }
         
         if rewards is None:
             # First step has no rewards, skip penalty
             return rewards
         
-        result = self.compute_gripper_penalty(env_output, actions)
-        if result is None:
-            return rewards
+        # Store original reward model output
+        rm_reward = rewards.clone()
+        reward_components["rm_reward"] = rm_reward.mean().item() if rm_reward is not None else 0.0
         
-        penalty, is_effective, is_effective_close, gripper_state, gripper_actions = result
-        
-        # Log for debugging (within Debug: log reward info section)
-        # Note: is_effective is now [B,] shape (one value per batch item), not [B, num_chunks]
-        if is_effective.any():
-            batch_size = gripper_state.shape[0]
-            for i in range(batch_size):
-                if is_effective[i]:
-                    action_type = "CLOSE" if is_effective_close[i] else "OPEN"
-                    # Get the first action value for logging
-                    if gripper_actions.dim() == 1:
-                        action_val = gripper_actions[i].item()
-                        penalty_val = penalty[i].item()
-                    else:
-                        action_val = gripper_actions[i, 0].item()
-                        penalty_val = penalty[i, 0].item()
-                    reward_val = rewards[i, 0].item() if rewards.dim() > 1 else rewards[i].item()
-                    final_reward = reward_val + penalty_val
-                    logger.info(
-                        # f"Debug: log reward info - gripper_pos={gripper_state[i].item():.4f}, "
-                        # f"gripper_is_open={self.gripper_is_open.get(i, 'N/A')}, "
-                        # f"action={action_val:.4f}, type={action_type}, "
-                        f"rm_reward={reward_val:.2f}, gripper_penalty={penalty_val:.2f}, "
-                        f"final_reward={final_reward:.2f}"
-                    )
-        
-        # Apply penalty to rewards
-        # Ensure shapes match
-        if rewards.dim() == 1 and penalty.dim() == 1:
-            # Both are [B,]
-            modified_rewards = rewards + penalty
-        elif rewards.dim() == 2 and penalty.dim() == 1:
-            # rewards is [B, num_chunks], penalty is [B,]
-            # Expand penalty to match
-            modified_rewards = rewards + penalty.unsqueeze(1)
-        elif rewards.dim() == 2 and penalty.dim() == 2:
-            # Both are [B, num_chunks]
-            modified_rewards = rewards + penalty
+        if not self.enable_gripper_penalty:
+            # No gripper penalty, just apply time penalty if configured
+            modified_rewards = rewards.clone()
+            total_gripper_penalty = 0.0
         else:
-            # Shape mismatch, just return original
-            logger.warning(
-                f"[Rollout] Gripper penalty shape mismatch: rewards={rewards.shape}, penalty={penalty.shape}"
-            )
-            return rewards
+            result = self.compute_gripper_penalty(env_output, actions)
+            if result is None:
+                modified_rewards = rewards.clone()
+                total_gripper_penalty = 0.0
+            else:
+                penalty, is_effective, is_effective_close, gripper_state, gripper_actions = result
+                
+                # Log for debugging (within Debug: log reward info section)
+                # Note: is_effective is now [B,] shape (one value per batch item), not [B, num_chunks]
+                if is_effective.any():
+                    batch_size = gripper_state.shape[0]
+                    for i in range(batch_size):
+                        if is_effective[i]:
+                            action_type = "CLOSE" if is_effective_close[i] else "OPEN"
+                            # Get the first action value for logging
+                            if gripper_actions.dim() == 1:
+                                action_val = gripper_actions[i].item()
+                                penalty_val = penalty[i].item()
+                            else:
+                                action_val = gripper_actions[i, 0].item()
+                                penalty_val = penalty[i, 0].item()
+                            reward_val = rewards[i, 0].item() if rewards.dim() > 1 else rewards[i].item()
+                            final_reward = reward_val + penalty_val
+                            logger.info(
+                                f"rm_reward={reward_val:.2f}, gripper_penalty={penalty_val:.2f}, "
+                                f"final_reward={final_reward:.2f}"
+                            )
+                
+                # Apply penalty to rewards
+                # Ensure shapes match
+                if rewards.dim() == 1 and penalty.dim() == 1:
+                    # Both are [B,]
+                    modified_rewards = rewards + penalty
+                elif rewards.dim() == 2 and penalty.dim() == 1:
+                    # rewards is [B, num_chunks], penalty is [B,]
+                    # Expand penalty to match
+                    modified_rewards = rewards + penalty.unsqueeze(1)
+                elif rewards.dim() == 2 and penalty.dim() == 2:
+                    # Both are [B, num_chunks]
+                    modified_rewards = rewards + penalty
+                else:
+                    # Shape mismatch, just return original
+                    logger.warning(
+                        f"[Rollout] Gripper penalty shape mismatch: rewards={rewards.shape}, penalty={penalty.shape}"
+                    )
+                    modified_rewards = rewards.clone()
+                    penalty = torch.zeros_like(rewards)
+                
+                total_gripper_penalty = penalty.mean().item()
+                
+                # Reset gripper tracking state for environments that have terminated/truncated
+                # This ensures the state is re-initialized on the next episode
+                terminations = env_output.get("terminations")
+                truncations = env_output.get("truncations")
+                if terminations is not None or truncations is not None:
+                    batch_size = gripper_state.shape[0]
+                    for i in range(batch_size):
+                        should_reset = False
+                        if terminations is not None:
+                            term_val = terminations[i].item() if hasattr(terminations[i], 'item') else terminations[i]
+                            should_reset = should_reset or bool(term_val)
+                        if truncations is not None:
+                            trunc_val = truncations[i].item() if hasattr(truncations[i], 'item') else truncations[i]
+                            should_reset = should_reset or bool(trunc_val)
+                        if should_reset and i in self.gripper_is_open:
+                            del self.gripper_is_open[i]
+                            logger.debug(f"Reset gripper tracking state for env {i} due to episode end")
         
-        # Reset gripper tracking state for environments that have terminated/truncated
-        # This ensures the state is re-initialized on the next episode
-        terminations = env_output.get("terminations")
-        truncations = env_output.get("truncations")
-        if terminations is not None or truncations is not None:
-            batch_size = gripper_state.shape[0]
-            for i in range(batch_size):
-                should_reset = False
-                if terminations is not None:
-                    term_val = terminations[i].item() if hasattr(terminations[i], 'item') else terminations[i]
-                    should_reset = should_reset or bool(term_val)
-                if truncations is not None:
-                    trunc_val = truncations[i].item() if hasattr(truncations[i], 'item') else truncations[i]
-                    should_reset = should_reset or bool(trunc_val)
-                if should_reset and i in self.gripper_is_open:
-                    del self.gripper_is_open[i]
-                    logger.debug(f"Reset gripper tracking state for env {i} due to episode end")
+        reward_components["gripper_penalty"] = total_gripper_penalty
+        
+        # Apply time penalty: small negative reward per step to encourage faster completion
+        if self.time_penalty != 0:
+            if modified_rewards.dim() == 1:
+                # [B,] -> add time penalty to each step
+                modified_rewards = modified_rewards + self.time_penalty
+            elif modified_rewards.dim() == 2:
+                # [B, num_chunks] -> add time penalty to each chunk
+                modified_rewards = modified_rewards + self.time_penalty
+        
+        reward_components["time_penalty"] = self.time_penalty
+        reward_components["final_reward"] = modified_rewards.mean().item()
+        
+        # Store reward components in env_output for logging by runner
+        env_output["_reward_components"] = reward_components
+        
+        # Accumulate reward statistics for TensorBoard logging
+        batch_size = rewards.shape[0]
+        self._reward_stats["rm_reward_sum"] += reward_components["rm_reward"] * batch_size
+        self._reward_stats["gripper_penalty_sum"] += reward_components["gripper_penalty"] * batch_size
+        self._reward_stats["time_penalty_sum"] += reward_components["time_penalty"] * batch_size
+        self._reward_stats["final_reward_sum"] += reward_components["final_reward"] * batch_size
+        self._reward_stats["reward_count"] += batch_size
         
         return modified_rewards
+    
+    def get_reward_stats(self) -> dict[str, float]:
+        """Get accumulated reward component statistics and reset counters.
+        
+        Returns:
+            Dictionary with mean reward components:
+            - reward/rm_reward: Mean reward from reward model
+            - reward/gripper_penalty: Mean gripper penalty applied
+            - reward/time_penalty: Time penalty per step
+            - reward/final_reward: Mean final reward after all penalties
+        """
+        count = self._reward_stats["reward_count"]
+        if count == 0:
+            return {}
+        
+        stats = {
+            "reward/rm_reward": self._reward_stats["rm_reward_sum"] / count,
+            "reward/gripper_penalty": self._reward_stats["gripper_penalty_sum"] / count,
+            "reward/time_penalty": self._reward_stats["time_penalty_sum"] / count,
+            "reward/final_reward": self._reward_stats["final_reward_sum"] / count,
+        }
+        
+        # Reset counters
+        self._reward_stats = {
+            "rm_reward_sum": 0.0,
+            "gripper_penalty_sum": 0.0,
+            "time_penalty_sum": 0.0,
+            "final_reward_sum": 0.0,
+            "reward_count": 0,
+        }
+        
+        return stats
 
     def get_dones_and_rewards(
         self, env_output: dict[str, torch.Tensor], extracted_obs: dict[str, Any]
@@ -398,17 +483,11 @@ class MultiStepRolloutWorker(Worker):
         """
         # First step: no rewards yet, only dones
         real_extracted_obs = None
-        dones = env_output["dones"].bool().cpu().contiguous()
-
         if env_output["rewards"] is None:
             if hasattr(self.hf_model, "q_head"):
                 real_extracted_obs = init_real_obs(extracted_obs)
-                if dones.any() and hasattr(self.hf_model, "q_head"):
-                    final_obs = env_output["final_obs"]
-                    final_extracted_obs = self.hf_model.preprocess_env_obs(final_obs)
-                    real_extracted_obs = init_real_obs(final_extracted_obs)
             return (
-                dones,
+                env_output["dones"].bool().cpu().contiguous(),
                 None,
                 real_extracted_obs,
             )

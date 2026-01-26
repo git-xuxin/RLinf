@@ -37,17 +37,18 @@ cluster:
         configs:
           - robot_ip: 172.16.0.2
             node_rank: 1
-            camera_serials: ["233622071437", "213622078826"]  # wrist camera, third-person view
+            camera_serials: ["213622078826"]  # third-person view
+            # camera_serials: ["233622071437", "213622078826"]  # wrist camera, third-person view
 
 data:
   type: robot_demo
   channel:
     name: demo_data
   path: 
-    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_1.pkl"
-    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_2.pkl"
-    - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_1.pkl"
-    - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_2.pkl"
+    - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_s_1.pkl"
+    - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_s_2.pkl"
+    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_1.pkl"
+    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_2.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-205709_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-215309_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-220208_2cam.pkl"
@@ -95,7 +96,7 @@ algorithm:
   
   critic_actor_ratio: 4
   # Replay buffer settings
-  replay_buffer_capacity: 20000
+  replay_buffer_capacity: 2000
   demo_buffer_capacity: 6000
   min_buffer_size: 200  # Minimum buffer size before training starts
   min_demo_buffer_size: 200  # Minimum demo buffer size before training starts
@@ -128,7 +129,7 @@ env:
     use_spacemouse: True
     # Optional: camera view used for reward model (do NOT put in override_cfg)
     # Set to wrist_2 for third-person view, or leave null to use main_images.
-    reward_camera_name: wrist_2
+    reward_camera_name: null  # wrist_2
 
     override_cfgs:
       - target_ee_pose: [0.564, 0.045, 0.05, -3.14, 0.0, 0.0]
@@ -167,7 +168,7 @@ actor:
     model_path: "/home/xuxin/Workspace/realwordRL_model/RLinf-Reset10-pretrained/"
     state_dim: 19
     action_dim: 7
-    image_num: 2  # dual camera: wrist + third-person view
+    image_num: 1  # dual camera: wrist + third-person view
     num_q_heads: 10
 
   optim:
@@ -217,11 +218,14 @@ reward:
   # to prevent the policy from excessively opening and closing the gripper.
   # This penalty is applied AFTER reward model output (bypasses env reward since combine_mode="replace").
   enable_gripper_penalty: True       # Enable gripper penalty
-  gripper_penalty: 0.1               # Penalty value for effective gripper actions (default: -0.1)
+  gripper_penalty: 0.2               # Penalty value for effective gripper actions (default: -0.1)
   binary_gripper_threshold: 0.5      # Threshold to determine gripper command (action > threshold = open, < -threshold = close)
   gripper_state_index: 0             # Index of gripper state in sorted observation states (gripper_position is first after sort)
   gripper_action_index: 6            # Index of gripper action in action vector (7th element, index 6)
   gripper_open_threshold: 0.04       # Threshold to determine if gripper is currently open (based on gripper_position value)
+  
+  # Time penalty: small negative reward per step to encourage faster completion
+  time_penalty: -0.05                 # Penalty per step (negative value encourages faster completion)
   
   model:
     model_type: "resnet_stage_classifier"
