@@ -26,7 +26,7 @@ from ..franka_env import FrankaEnv, FrankaRobotConfig
 
 @dataclass
 class BinEnvConfig(FrankaRobotConfig):
-    random_x_range: float = 0.03
+    random_x_range: float = 0.01
     random_y_range: float = 0.13
     random_z_range_high: float = 0.1
     random_z_range_low: float = 0.001

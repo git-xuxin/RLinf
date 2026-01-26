@@ -1208,6 +1208,9 @@ class EnvOutput:
     def prepare_observations(self, obs: dict[str, Any]) -> dict[str, Any]:
         image_tensor = obs["main_images"] if "main_images" in obs else None
         wrist_image_tensor = obs["wrist_images"] if "wrist_images" in obs else None
+        reward_image_tensor = (
+            obs["reward_images"] if "reward_images" in obs else None
+        )
         extra_view_image_tensor = (
             obs["extra_view_images"] if "extra_view_images" in obs else None
         )
@@ -1220,6 +1223,7 @@ class EnvOutput:
             "main_images": image_tensor,  # [N_ENV, H, W, C]
             "wrist_images": wrist_image_tensor,  # [N_ENV, H, W, C] or [N_ENV, N_IMG, H, W, C]
             "extra_view_images": extra_view_image_tensor,  # [N_ENV, N_IMG, H, W, C]
+            "reward_images": reward_image_tensor,  # [N_ENV, H, W, C]
             "states": states,
             "task_descriptions": task_descriptions,
         }

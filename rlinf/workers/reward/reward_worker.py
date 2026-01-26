@@ -23,6 +23,7 @@ import logging
 import os
 import pickle
 import random
+import time
 from glob import glob
 from typing import Optional
 
@@ -30,6 +31,7 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from PIL import Image
 
 from rlinf.algorithms.rewards import get_reward_class
 from rlinf.data.io_struct import RolloutResult
@@ -781,6 +783,10 @@ class ImageRewardWorker(Worker):
         self.terminate_on_success = reward_cfg.get("terminate_on_success", False)
         self.success_reward = reward_cfg.get("success_reward", 1.0)
         self.fail_reward = reward_cfg.get("fail_reward", 0.0)
+        self.stage_rewards = reward_cfg.get("stage_rewards")
+        self.success_stage_index = reward_cfg.get("success_stage_index", 2)
+        self.log_stage_predictions = reward_cfg.get("log_stage_predictions", None)
+        self.debug_save_dir = None
         
         # Gripper penalty configuration (from SERL PR 65)
         # Penalizes effective gripper actions (command close when open, vice versa)
@@ -807,8 +813,24 @@ class ImageRewardWorker(Worker):
         if checkpoint_path is None:
             raise ValueError("checkpoint_path must be specified for ImageRewardWorker")
 
-        # Create model (will auto-load checkpoint if checkpoint_path is in model_cfg)
-        self.model = ResNetRewardModel(model_cfg)
+        model_type = model_cfg.get("model_type", "resnet_reward")
+        self.debug_save_dir = model_cfg.get("debug_save_dir") or reward_cfg.get(
+            "debug_save_dir"
+        )
+        if self.debug_save_dir:
+            os.makedirs(self.debug_save_dir, exist_ok=True)
+        if model_type == "resnet_stage_classifier":
+            from rlinf.models.embodiment.reward.resnet_stage_classifier_model import (
+                ResNetStageClassifierModel,
+            )
+
+            self.model = ResNetStageClassifierModel(model_cfg)
+            if self.log_stage_predictions is None:
+                self.log_stage_predictions = True
+        else:
+            self.model = ResNetRewardModel(model_cfg)
+            if self.log_stage_predictions is None:
+                self.log_stage_predictions = False
 
         # Move to device and set eval mode
         self.model = self.model.to(self.device)
@@ -851,6 +873,7 @@ class ImageRewardWorker(Worker):
                 output_channel.put({"rewards": None}, async_op=True)
                 return
 
+            raw_images = images
             if isinstance(images, np.ndarray):
                 images = torch.from_numpy(images)
 
@@ -860,19 +883,49 @@ class ImageRewardWorker(Worker):
             with torch.no_grad():
                 outputs = self.model(images)
                 probs = outputs["probabilities"]
-                
-                # Determine success/fail based on threshold
-                is_success = probs > self.reward_threshold
-                
-                # Map to binary rewards: success_reward if success, fail_reward otherwise
-                rewards = torch.where(
-                    is_success,
-                    torch.full_like(probs, self.success_reward),
-                    torch.full_like(probs, self.fail_reward),
-                )
-                
-                # Compute termination signal if terminate_on_success is enabled
-                terminations = is_success if self.terminate_on_success else torch.zeros_like(is_success, dtype=torch.bool)
+
+                if probs.dim() == 2:
+                    # Multi-stage classifier: choose max probability, tie -> smaller stage (torch.argmax)
+                    stage_idx = torch.argmax(probs, dim=1)
+                    stage_rewards = self.stage_rewards
+                    if stage_rewards is None:
+                        stage_rewards = [-0.1, 0.0, 1.0]
+                    stage_rewards_tensor = torch.tensor(
+                        stage_rewards, device=probs.device, dtype=probs.dtype
+                    )
+                    rewards = stage_rewards_tensor[stage_idx]
+                    is_success = stage_idx == int(self.success_stage_index)
+                    terminations = (
+                        is_success
+                        if self.terminate_on_success
+                        else torch.zeros_like(is_success, dtype=torch.bool)
+                    )
+                    if self.debug_save_dir:
+                        self._save_stage_debug_images(raw_images, stage_idx)
+                else:
+                    # Binary reward model
+                    is_success = probs > self.reward_threshold
+                    rewards = torch.where(
+                        is_success,
+                        torch.full_like(probs, self.success_reward),
+                        torch.full_like(probs, self.fail_reward),
+                    )
+                    terminations = (
+                        is_success
+                        if self.terminate_on_success
+                        else torch.zeros_like(is_success, dtype=torch.bool)
+                    )
+
+            if self.log_stage_predictions and probs.dim() == 2:
+                probs_cpu = probs.detach().cpu()
+                stage_idx_cpu = stage_idx.detach().cpu()
+                for i in range(len(stage_idx_cpu)):
+                    logger.info(
+                        "[Reward] stage=%d probs=%s reward=%.3f",
+                        int(stage_idx_cpu[i].item()),
+                        probs_cpu[i].tolist(),
+                        float(rewards[i].item()),
+                    )
 
             output_data = {
                 "rewards": rewards.cpu(),
@@ -915,6 +968,41 @@ class ImageRewardWorker(Worker):
             images = images.float()
 
         return images
+
+    def _save_stage_debug_images(
+        self, images: torch.Tensor | np.ndarray, stage_idx: torch.Tensor
+    ) -> None:
+        if not self.debug_save_dir:
+            return
+        if isinstance(stage_idx, torch.Tensor):
+            stage_idx = stage_idx.detach().cpu()
+        if isinstance(images, torch.Tensor):
+            images = images.detach().cpu().numpy()
+
+        # Expect images in [B, H, W, C] or [B, C, H, W]
+        if images.ndim != 4:
+            return
+        if images.shape[-1] in [1, 3, 4]:
+            images_hwc = images
+        else:
+            images_hwc = np.transpose(images, (0, 2, 3, 1))
+
+        for i in range(images_hwc.shape[0]):
+            stage = int(stage_idx[i].item())
+            stage_dir = os.path.join(self.debug_save_dir, f"stage{stage}")
+            os.makedirs(stage_dir, exist_ok=True)
+
+            img = images_hwc[i]
+            if img.shape[-1] == 4:
+                img = img[..., :3]
+            if img.dtype != np.uint8:
+                img_max = float(np.max(img)) if img.size > 0 else 1.0
+                if img_max <= 1.0:
+                    img = img * 255.0
+                img = np.clip(img, 0, 255).astype(np.uint8)
+
+            filename = f"{time.time_ns()}_{i}.png"
+            Image.fromarray(img).save(os.path.join(stage_dir, filename))
 
     # =========================================================================
     # Send/Recv based interface (for env -> reward -> rollout data flow)
@@ -1034,16 +1122,26 @@ class ImageRewardWorker(Worker):
             return output_data
 
         # Try to find images in the batch
-        images = env_batch.get("images")
+        # Priority: reward_images (specific camera for reward) > images > main_images
+        images = None
+        if "obs" in env_batch and isinstance(env_batch["obs"], dict):
+            images = env_batch["obs"].get("reward_images")
+            if images is None:
+                images = env_batch["obs"].get("main_images")
         if images is None:
+            images = env_batch.get("reward_images")
+        if images is None:
+            logger.warning("[Reward] No images found in reward_images")
+            images = env_batch.get("images")
+        if images is None:
+            logger.warning("[Reward] No images found in reward_images and images")
             images = env_batch.get("main_images")
-        if images is None and "obs" in env_batch and isinstance(env_batch["obs"], dict):
-            images = env_batch["obs"].get("main_images")
 
         if images is None:
             logger.warning("[Reward] No images found in env_batch")
             return env_batch
 
+        raw_images = images
         images = self._preprocess_images(images)
         images = images.to(self.device)
         self.model.eval()
@@ -1052,22 +1150,44 @@ class ImageRewardWorker(Worker):
             outputs = self.model(images)
             probs = outputs["probabilities"]
 
-            # Determine success/fail based on threshold
-            is_success = probs > self.reward_threshold
-
-            # Map to binary rewards
-            rewards = torch.where(
-                is_success,
-                torch.full_like(probs, self.success_reward),
-                torch.full_like(probs, self.fail_reward),
-            )
-
-            # Compute termination signal if terminate_on_success is enabled
-            if self.terminate_on_success:
-                # Mark as terminated if success detected
-                reward_terminations = is_success
+            if probs.dim() == 2:
+                # Multi-stage classifier: choose max probability, tie -> smaller stage
+                stage_idx = torch.argmax(probs, dim=1)
+                stage_rewards = self.stage_rewards
+                if stage_rewards is None:
+                    stage_rewards = [-0.1, 0.0, 1.0]
+                stage_rewards_tensor = torch.tensor(
+                    stage_rewards, device=probs.device, dtype=probs.dtype
+                )
+                rewards = stage_rewards_tensor[stage_idx]
+                is_success = stage_idx == int(self.success_stage_index)
+                reward_terminations = (
+                    is_success if self.terminate_on_success else None
+                )
+                if self.debug_save_dir:
+                    self._save_stage_debug_images(raw_images, stage_idx)
             else:
-                reward_terminations = None
+                # Binary reward model
+                is_success = probs > self.reward_threshold
+                rewards = torch.where(
+                    is_success,
+                    torch.full_like(probs, self.success_reward),
+                    torch.full_like(probs, self.fail_reward),
+                )
+                reward_terminations = (
+                    is_success if self.terminate_on_success else None
+                )
+
+        # if self.log_stage_predictions and probs.dim() == 2:
+        #     probs_cpu = probs.detach().cpu()
+        #     stage_idx_cpu = stage_idx.detach().cpu()
+        #     for i in range(len(stage_idx_cpu)):
+        #         logger.info(
+        #             "[Reward] stage=%d probs=%s reward=%.3f",
+        #             int(stage_idx_cpu[i].item()),
+        #             probs_cpu[i].tolist(),
+        #             float(rewards[i].item()),
+        #         )
 
         output_data = env_batch.copy()
         cpu_rewards = rewards.cpu()

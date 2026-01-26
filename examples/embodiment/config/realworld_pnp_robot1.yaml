@@ -37,16 +37,17 @@ cluster:
         configs:
           - robot_ip: 172.16.0.2
             node_rank: 1
+            camera_serials: ["233622071437", "213622078826"]  # wrist camera, third-person view
 
 data:
   type: robot_demo
   channel:
     name: demo_data
   path: 
-    - "/home/xuxin/Workspace/Beijing/data/pnp/data_1.pkl"
-    - "/home/xuxin/Workspace/Beijing/data/pnp/data_2.pkl"
-    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_noforce_1.pkl"
-    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_noforce_2.pkl"
+    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_1.pkl"
+    # - "/home/xuxin/Workspace/Beijing/data/pnp/data_2.pkl"
+    - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_1.pkl"
+    - "/home/xuxin/Workspace/Beijing/data/pnp/data_m_2.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-205709_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-215309_2cam.pkl"
     # - "/home/zanghongzhi/rlinf_ws/0117/RLinf/data/pnp/data_robot1_20260122-220208_2cam.pkl"
@@ -123,8 +124,11 @@ env:
     ignore_terminations: False
     no_gripper: False
     total_num_envs: 1
-    keyboard_reward_wrapper: single_stage
+    keyboard_reward_wrapper: multi_stage
     use_spacemouse: True
+    # Optional: camera view used for reward model (do NOT put in override_cfg)
+    # Set to wrist_2 for third-person view, or leave null to use main_images.
+    reward_camera_name: wrist_2
 
     override_cfgs:
       - target_ee_pose: [0.564, 0.045, 0.05, -3.14, 0.0, 0.0]
@@ -163,7 +167,7 @@ actor:
     model_path: "/home/xuxin/Workspace/realwordRL_model/RLinf-Reset10-pretrained/"
     state_dim: 19
     action_dim: 7
-    image_num: 1
+    image_num: 2  # dual camera: wrist + third-person view
     num_q_heads: 10
 
   optim:
@@ -198,6 +202,10 @@ reward:
   success_reward: 1.0   # Reward for success (prob > threshold)
   fail_reward: 0.0      # Reward for fail (prob < threshold)
   reward_threshold: 0.5 # Probability threshold for success/fail classification
+  # Multi-stage classifier mapping (stage0, stage1, stage2)
+  stage_rewards: [-0.1, 0.0, 1.0]
+  success_stage_index: 2
+  log_stage_predictions: true
   
   # Combine mode: "replace" uses only learned rewards
   combine_mode: "replace"
@@ -216,7 +224,7 @@ reward:
   gripper_open_threshold: 0.04       # Threshold to determine if gripper is currently open (based on gripper_position value)
   
   model:
-    model_type: "resnet_reward"
+    model_type: "resnet_stage_classifier"
     arch: "resnet18"
     hidden_dim: 256
     dropout: 0.0
@@ -225,10 +233,11 @@ reward:
     precision: "bf16"
     
     # Path to trained reward model checkpoint (需要重新训练以匹配 PR #596 格式)
-    checkpoint_path: "/home/xuxin/Workspace/Beijing/RLinf_zhz/resnet_training/reward_model_20260124_151755.pt"  # TODO: 设置为训练好的 reward model 路径
+    # checkpoint_path: "/home/xuxin/Workspace/Beijing/RLinf_zhz/resnet_training/reward_model_20260124_151755.pt"  # TODO: 设置为训练好的 reward model 路径
+    checkpoint_path: "/home/xuxin/Workspace/Beijing/RLinf_zhz/resnet_training/stage_classifier_20260126_042927.pt"  # TODO: 设置为训练好的 reward model 路径
     
     # Debug image save directory (set to path to enable, null to disable)
-    debug_save_dir: "/home/xuxin/Workspace/Beijing/RLinf_zhz/logs/reward_debug_images"
+    debug_save_dir: null # "/home/xuxin/Workspace/Beijing/RLinf_zhz/logs/reward_debug_images"
 
 critic:
   use_critic_model: False

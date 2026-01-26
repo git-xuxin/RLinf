@@ -65,9 +65,19 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
 
 
 class KeyboardRewardDoneMultiStageWrapper(BaseKeyboardRewardDoneWrapper):
+    """Multi-stage reward wrapper for keyboard-based reward labeling.
+
+    Stage rewards (controlled by keyboard):
+        - Press 'a': Stage 0 - Object not grasped (reward = -0.1)
+        - Press 'b': Stage 1 - Object grasped (reward = 0)
+        - Press 'c': Stage 2 - Placement success (reward = 1, episode done)
+        - Press 'q': Abort/Failure (reward = -1, episode done)
+    """
+
     def __init__(self, env):
         super().__init__(env)
-        self.stage_rewards = [0, 1, 2]
+        # Multistage rewards: [not_grasped, grasped, placed_success]
+        self.stage_rewards = [-0.1, 0, 1]
 
     def reset(self, *, seed=None, options=None):
         self.reward_stage = 0
@@ -80,15 +90,15 @@ class KeyboardRewardDoneMultiStageWrapper(BaseKeyboardRewardDoneWrapper):
         key = self.listener.get_key()
         # print(f"Key pressed: {key}")
         if key == "a":
-            self.reward_stage = 0
-        elif key == "b":
-            self.reward_stage = 1
-        elif key == "c":
-            self.reward_stage = 2
+            self.reward_stage = 0  # Not grasped
+        elif key == "s":
+            self.reward_stage = 1  # Grasped
+        elif key == "d":
+            self.reward_stage = 2  # Placement success
             done = True
 
         reward = self.stage_rewards[self.reward_stage]
         if key == "q":
-            reward = -1
+            reward = -1  # Abort/Failure
             done = True
         return last_intervened, done, reward

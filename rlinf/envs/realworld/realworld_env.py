@@ -55,6 +55,11 @@ class RealWorldEnv(gym.Env):
             cfg.get("override_cfg", {}), resolve=True
         )
 
+        # Reward camera configuration for reward model
+        # If specified, this camera's images will be used for reward model computation
+        # NOTE: keep this out of override_cfg to avoid passing it into BinEnvConfig.
+        self.reward_camera_name = cfg.get("reward_camera_name", None)
+
         self.video_cfg = cfg.video_cfg
 
         self.seed = cfg.seed + seed_offset
@@ -232,6 +237,15 @@ class RealWorldEnv(gym.Env):
 
         if raw_images:
             obs["extra_view_images"] = np.stack(list(raw_images.values()), axis=1)
+
+        # Add reward_images if reward_camera_name is specified
+        # This allows using a specific camera (e.g., third-person view) for reward model
+        if self.reward_camera_name is not None:
+            if self.reward_camera_name in raw_obs["frames"]:
+                obs["reward_images"] = raw_obs["frames"][self.reward_camera_name]
+            else:
+                # Fallback to main_images if specified camera not found
+                obs["reward_images"] = obs["main_images"]
 
         obs = to_tensor(obs)
         obs["task_descriptions"] = self.task_descriptions

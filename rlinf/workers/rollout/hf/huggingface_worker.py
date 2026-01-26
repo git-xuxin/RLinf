@@ -77,6 +77,10 @@ class MultiStepRolloutWorker(Worker):
         self.gripper_state_index = reward_cfg.get("gripper_state_index", 0)
         self.gripper_action_index = reward_cfg.get("gripper_action_index", 6)
         self.gripper_open_threshold = reward_cfg.get("gripper_open_threshold", 0.04)
+        
+        # Track gripper logical state per batch index (like franka_env.py's gripper_open boolean)
+        # This ensures penalty is only applied when gripper state actually changes
+        self.gripper_is_open: dict[int, bool] = {}
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -184,6 +188,10 @@ class MultiStepRolloutWorker(Worker):
         
         This penalty prevents the policy from excessively opening and closing the gripper.
         
+        IMPORTANT: This method tracks gripper logical state (like franka_env.py's gripper_open boolean)
+        rather than using physical position. This ensures penalty is only applied when the gripper
+        state actually changes, not when the same command is repeated.
+        
         Args:
             env_output: Environment output containing 'obs' with states
             actions: Predicted actions (tensor or numpy array), shape (B, action_dim) or (B, num_chunks, action_dim)
@@ -209,13 +217,11 @@ class MultiStepRolloutWorker(Worker):
         if isinstance(states, torch.Tensor):
             states = states.cpu()
         
-        # Get gripper state from observation
+        # Get gripper physical position from observation
         # States format after alphabetical sorting: [gripper_position, tcp_force(3), tcp_pose(7), tcp_torque(3), tcp_vel(6)]
         # gripper_position is at index 0
-        gripper_state = states[:, self.gripper_state_index]  # [B,]
-        
-        # Determine if gripper is currently open (higher value = more open)
-        is_gripper_open = gripper_state > self.gripper_open_threshold  # [B,]
+        gripper_position = states[:, self.gripper_state_index]  # [B,]
+        batch_size = gripper_position.shape[0]
         
         # Convert actions to torch tensor if needed
         if isinstance(actions, np.ndarray):
@@ -233,32 +239,58 @@ class MultiStepRolloutWorker(Worker):
         else:
             return None
         
-        # Determine gripper command
+        # Determine gripper command (only use first chunk for state transition)
         # Positive action (> threshold) = open command
         # Negative action (< -threshold) = close command
-        command_open = gripper_actions >= self.binary_gripper_threshold
-        command_close = gripper_actions <= -self.binary_gripper_threshold
-        
-        # Expand gripper state to match actions shape if needed
         if gripper_actions.dim() == 2:
-            # [B,] -> [B, num_chunks]
-            is_gripper_open = is_gripper_open.unsqueeze(1).expand_as(gripper_actions)
+            # Use first chunk to determine command
+            gripper_actions_for_cmd = gripper_actions[:, 0]  # [B,]
+        else:
+            gripper_actions_for_cmd = gripper_actions  # [B,]
+        
+        command_open = gripper_actions_for_cmd >= self.binary_gripper_threshold  # [B,]
+        command_close = gripper_actions_for_cmd <= -self.binary_gripper_threshold  # [B,]
+        
+        # Build is_gripper_open tensor using tracked logical state
+        # Initialize new batch indices based on physical position
+        is_gripper_open_list = []
+        for i in range(batch_size):
+            if i not in self.gripper_is_open:
+                # Initialize based on physical position for new environments
+                self.gripper_is_open[i] = gripper_position[i].item() > self.gripper_open_threshold
+            is_gripper_open_list.append(self.gripper_is_open[i])
+        
+        is_gripper_open = torch.tensor(is_gripper_open_list, dtype=torch.bool)  # [B,]
         
         # Effective action: command that changes gripper state
-        # - Close command when gripper is open
-        # - Open command when gripper is closed
-        is_effective_close = command_close & is_gripper_open
-        is_effective_open = command_open & (~is_gripper_open)
-        is_effective = is_effective_close | is_effective_open
+        # - Close command when gripper is logically open
+        # - Open command when gripper is logically closed
+        is_effective_close = command_close & is_gripper_open  # [B,]
+        is_effective_open = command_open & (~is_gripper_open)  # [B,]
+        is_effective = is_effective_close | is_effective_open  # [B,]
+        
+        # Update tracked gripper state for effective actions
+        for i in range(batch_size):
+            if is_effective_close[i].item():
+                self.gripper_is_open[i] = False
+            elif is_effective_open[i].item():
+                self.gripper_is_open[i] = True
+        
+        # Expand is_effective to match gripper_actions shape if needed
+        if gripper_actions.dim() == 2:
+            # [B,] -> [B, num_chunks]
+            is_effective_expanded = is_effective.unsqueeze(1).expand_as(gripper_actions)
+        else:
+            is_effective_expanded = is_effective
         
         # Compute penalty: -gripper_penalty for effective actions, 0 otherwise
         penalty = torch.where(
-            is_effective,
+            is_effective_expanded,
             torch.full_like(gripper_actions, -self.gripper_penalty, dtype=torch.float32),
             torch.zeros_like(gripper_actions, dtype=torch.float32)
         )
         
-        return penalty, is_effective, is_effective_close, gripper_state, gripper_actions
+        return penalty, is_effective, is_effective_close, gripper_position, gripper_actions
 
     def apply_gripper_penalty_to_rewards(
         self, env_output: dict[str, torch.Tensor], actions, rewards
@@ -290,35 +322,28 @@ class MultiStepRolloutWorker(Worker):
         penalty, is_effective, is_effective_close, gripper_state, gripper_actions = result
         
         # Log for debugging (within Debug: log reward info section)
+        # Note: is_effective is now [B,] shape (one value per batch item), not [B, num_chunks]
         if is_effective.any():
             batch_size = gripper_state.shape[0]
             for i in range(batch_size):
-                if gripper_actions.dim() == 1:
-                    if is_effective[i]:
-                        action_type = "CLOSE" if is_effective_close[i] else "OPEN"
-                        reward_val = rewards[i, 0].item() if rewards.dim() > 1 else rewards[i].item()
+                if is_effective[i]:
+                    action_type = "CLOSE" if is_effective_close[i] else "OPEN"
+                    # Get the first action value for logging
+                    if gripper_actions.dim() == 1:
+                        action_val = gripper_actions[i].item()
                         penalty_val = penalty[i].item()
-                        final_reward = reward_val + penalty_val
-                        logger.info(
-                            f"Debug: log reward info - gripper_state={gripper_state[i].item():.4f}, "
-                            f"action={gripper_actions[i].item():.4f}, type={action_type}, "
-                            f"rm_reward={reward_val:.2f}, gripper_penalty={penalty_val:.2f}, "
-                            f"final_reward={final_reward:.2f}"
-                        )
-                else:
-                    if is_effective[i].any():
-                        for j in range(gripper_actions.shape[1]):
-                            if is_effective[i, j]:
-                                action_type = "CLOSE" if is_effective_close[i, j] else "OPEN"
-                                reward_val = rewards[i, j].item() if rewards.dim() > 1 else rewards[i].item()
-                                penalty_val = penalty[i, j].item()
-                                final_reward = reward_val + penalty_val
-                                logger.info(
-                                    f"Debug: log reward info - gripper_state={gripper_state[i].item():.4f}, "
-                                    f"action[{j}]={gripper_actions[i, j].item():.4f}, type={action_type}, "
-                                    f"rm_reward={reward_val:.2f}, gripper_penalty={penalty_val:.2f}, "
-                                    f"final_reward={final_reward:.2f}"
-                                )
+                    else:
+                        action_val = gripper_actions[i, 0].item()
+                        penalty_val = penalty[i, 0].item()
+                    reward_val = rewards[i, 0].item() if rewards.dim() > 1 else rewards[i].item()
+                    final_reward = reward_val + penalty_val
+                    logger.info(
+                        # f"Debug: log reward info - gripper_pos={gripper_state[i].item():.4f}, "
+                        # f"gripper_is_open={self.gripper_is_open.get(i, 'N/A')}, "
+                        # f"action={action_val:.4f}, type={action_type}, "
+                        f"rm_reward={reward_val:.2f}, gripper_penalty={penalty_val:.2f}, "
+                        f"final_reward={final_reward:.2f}"
+                    )
         
         # Apply penalty to rewards
         # Ensure shapes match
@@ -338,6 +363,24 @@ class MultiStepRolloutWorker(Worker):
                 f"[Rollout] Gripper penalty shape mismatch: rewards={rewards.shape}, penalty={penalty.shape}"
             )
             return rewards
+        
+        # Reset gripper tracking state for environments that have terminated/truncated
+        # This ensures the state is re-initialized on the next episode
+        terminations = env_output.get("terminations")
+        truncations = env_output.get("truncations")
+        if terminations is not None or truncations is not None:
+            batch_size = gripper_state.shape[0]
+            for i in range(batch_size):
+                should_reset = False
+                if terminations is not None:
+                    term_val = terminations[i].item() if hasattr(terminations[i], 'item') else terminations[i]
+                    should_reset = should_reset or bool(term_val)
+                if truncations is not None:
+                    trunc_val = truncations[i].item() if hasattr(truncations[i], 'item') else truncations[i]
+                    should_reset = should_reset or bool(trunc_val)
+                if should_reset and i in self.gripper_is_open:
+                    del self.gripper_is_open[i]
+                    logger.debug(f"Reset gripper tracking state for env {i} due to episode end")
         
         return modified_rewards
 
@@ -614,11 +657,31 @@ class MultiStepRolloutWorker(Worker):
             rewards = batch.get("rewards")
             probs = batch.get("probabilities")
             if rewards is not None and probs is not None:
-                for i in range(len(probs)):
-                    prob_val = probs[i].item()
-                    reward_val = rewards[i, 0].item() if rewards.dim() > 1 else rewards[i].item()
-                    result = "SUCCESS" if reward_val > 0 else "FAIL"
-                    logger.info(f"Debug: log reward info - prob={prob_val:.4f}, rm_reward={reward_val:.1f}, result={result}")
+                for i in range(len(rewards)):
+                    reward_val = (
+                        rewards[i, 0].item()
+                        if rewards.dim() > 1
+                        else rewards[i].item()
+                    )
+                    if probs.dim() > 1:
+                        # prob_list = probs[i].tolist()
+                        prob_list = [round(p, 2) for p in probs[i].tolist()]
+                        stage_idx = int(torch.argmax(probs[i]).item())
+                        logger.info(
+                            "Debug: log reward info - stage=%d probs=%s rm_reward=%.1f",
+                            stage_idx,
+                            prob_list,
+                            reward_val,
+                        )
+                    else:
+                        prob_val = probs[i].item()
+                        result = "SUCCESS" if reward_val > 0 else "FAIL"
+                        logger.info(
+                            "Debug: log reward info - prob=%.4f rm_reward=%.1f result=%s",
+                            prob_val,
+                            reward_val,
+                            result,
+                        )
 
         return batch
 
