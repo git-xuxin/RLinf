@@ -72,14 +72,14 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             )
             return False
         
-        import time
-        import pickle as pkl
-        curr_t = int(time.time())
-        with open(f"replay_buffer_{curr_t}.pkl", "wb") as f:
-            pkl.dump(self.replay_buffer.buffer, f)
-        with open(f"demo_buffer_{curr_t}.pkl", "wb") as f:
-            pkl.dump(self.demo_buffer.buffer, f)
-        raise NotImplementedError
+        # import time
+        # import pickle as pkl
+        # curr_t = int(time.time())
+        # with open(f"replay_buffer_{curr_t}.pkl", "wb") as f:
+        #     pkl.dump(self.replay_buffer.buffer, f)
+        # with open(f"demo_buffer_{curr_t}.pkl", "wb") as f:
+        #     pkl.dump(self.demo_buffer.buffer, f)
+        # raise NotImplementedError
 
         train_actor = await self.replay_buffer.is_ready_async(train_actor_steps)
 
