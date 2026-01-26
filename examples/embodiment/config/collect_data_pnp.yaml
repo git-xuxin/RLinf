@@ -23,7 +23,8 @@ cluster:
         configs:
           - robot_ip: 172.16.0.2
             node_rank: 0
-            camera_serials: ["233622071437", "213622078826"]  # wrist camera, third-person view
+            camera_serials: ["213622078826"]  # third-person view
+            # camera_serials: ["233622071437", "213622078826"]  # wrist camera, third-person view
 
 runner:
   task_type: embodied
@@ -41,7 +42,23 @@ env:
     no_gripper: False
     ignore_terminations: False
     auto_reset: False
-    keyboard_reward_wrapper: "multi_stage" # options: "single_stage", "multi_stage"
+    keyboard_reward_wrapper: "multi_stage"  # 使用键盘给基础 reward
     use_spacemouse: True
     override_cfg:
       target_ee_pose: [0.564, 0.045, 0.05, -3.14, 0.0, 0.0]
+
+# Reward 配置：键盘给基础 reward + 自动 gripper_penalty + time_penalty
+reward:
+  use_reward_model: False  # 不使用 reward model，用键盘
+  
+  # Gripper penalty configuration (from SERL PR 65)
+  # 当 gripper 执行有效动作（状态改变）时施加惩罚
+  enable_gripper_penalty: True
+  gripper_penalty: 0.2
+  binary_gripper_threshold: 0.5
+  gripper_state_index: 0
+  gripper_action_index: 6
+  gripper_open_threshold: 0.04
+  
+  # Time penalty: 每步固定惩罚，鼓励更快完成任务
+  time_penalty: -0.05
