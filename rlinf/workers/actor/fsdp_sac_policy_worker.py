@@ -112,9 +112,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         else:
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
-                    if "q_head" in name or "encoders" in name:
+                    if "q_head" in name:
+                    # if "q_head" in name or "encoders" in name:
+                        print(f"critic: {name}")
                         params_critic.append(param)
                     else:
+                        print(f"actor: {name}")
                         params_actor.append(param)
         assert len(params_critic) > 0
         self.optimizer = torch.optim.Adam(
@@ -194,7 +197,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             else:
                 raise NotImplementedError
         else:
-            alpha = torch.Tensor(self.cfg.algorithm.initial_alpha).to(
+            alpha = torch.Tensor([self.cfg.algorithm.initial_alpha]).to(
                 dtype=self.torch_dtype, device=self.device
             )
         return alpha
@@ -237,19 +240,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         assert self.target_model_initialized
 
         with torch.no_grad():
-            online_params = self.model.named_parameters()
-            target_params = self.target_model.named_parameters()
+            online_sd = self.model.state_dict()
+            target_sd = self.target_model.state_dict()
 
-            for (name1, online_param), (name2, target_param) in zip(
-                online_params, target_params
-            ):
-                assert name1 == name2
-                if "q_head" not in name1:
-                    target_param.data.mul_(0.0)
-                    target_param.data.add_(online_param.data)
-                else:
-                    target_param.data.mul_(1.0 - tau)
-                    target_param.data.add_(online_param.data * tau)
+            for k in target_sd.keys():
+                if k not in online_sd:
+                    raise NotImplementedError(f"{k=} is not found")
+                target_sd[k].lerp_(online_sd[k], tau)
+
+            self.target_model.load_state_dict(target_sd)
+
 
     def recv_rollout_batch(self, input_channel: Channel):
         super().recv_rollout_batch(input_channel)
@@ -299,7 +299,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "sac_q_forward",
                     obs=next_obs,
                     actions=next_state_actions,
-                    shared_feature=shared_feature,
+                    shared_feature=None,
                 )
                 if self.critic_subsample_size > 0:
                     sample_idx = torch.randint(
@@ -313,13 +313,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         dim=-1, index=sample_idx
                     )
 
-                if agg_q == "min":
-                    qf_next_target, _ = torch.min(
-                        all_qf_next_target, dim=1, keepdim=True
-                    )
-                elif agg_q == "mean":
-                    qf_next_target = torch.mean(all_qf_next_target, dim=1, keepdim=True)
-
+                qf_next_target, _ = torch.min(
+                    all_qf_next_target, dim=1, keepdim=True
+                )
                 if self.cfg.algorithm.get("backup_entropy", True):
                     qf_next_target = qf_next_target - self.alpha * next_state_log_pi
                     qf_next_target = qf_next_target.to(dtype=self.torch_dtype)
@@ -358,10 +354,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             )
 
             all_qf_next = all_qf_next.detach()
-            if agg_q == "min":
-                qf_next, _ = torch.min(all_qf_next, dim=1, keepdim=True)
-            elif agg_q == "mean":
-                qf_next = torch.mean(all_qf_next, dim=1, keepdim=True)
+            qf_next, _ = torch.min(all_qf_next, dim=1, keepdim=True)
             if self.cfg.algorithm.get("backup_entropy", True):
                 qf_next = qf_next - self.alpha * next_state_log_pi
                 qf_next = qf_next.to(dtype=self.torch_dtype)
@@ -400,7 +393,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 "sac_q_forward",
                 obs=curr_obs,
                 actions=pi,
-                shared_feature=shared_feature,
+                shared_feature=None,
                 detach_encoder=True,
             )
         else:
@@ -410,10 +403,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 actions=pi,
                 next_obs=None,
                 next_actions=None,
-                shared_feature=shared_feature,
+                shared_feature=None,
                 detach_encoder=True,
             )
 
+        metrics = {
+            f"q_value/{q_id}": all_qf_pi[..., q_id].mean().item() 
+            for q_id in range(self.cfg.actor.model.get("num_q_heads", 2))
+        }
         if agg_q == "min":
             qf_pi, _ = torch.min(all_qf_pi, dim=1, keepdim=True)
         elif agg_q == "mean":
@@ -484,13 +481,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             gbs_entropy = []
+            all_actor_metrics = {}
             for batch in train_micro_batch_list:
                 batch = put_tensor_device(batch, device=self.device)
-                actor_loss, entropy = self.forward_actor(batch)
+                actor_loss, entropy, q_metrics = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 gbs_entropy.append(entropy.item())
+                append_to_dict(all_actor_metrics, q_metrics)
+            all_actor_metrics =  {key: np.mean(value) for key, value in all_actor_metrics.items()}
+
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
             )
@@ -498,6 +499,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.lr_scheduler.step()
 
             # Update temperature parameter if using automatic entropy tuning
+            gbs_alpha_loss = [0]
+            alpha_grad_norm = 0
             if hasattr(self, "base_alpha") and self.base_alpha is not None:
                 self.alpha_optimizer.zero_grad()
                 gbs_alpha_loss = []
