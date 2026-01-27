@@ -70,7 +70,9 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.log_info(
                 f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
             )
-            return False
+            metrics = {}
+            metrics = self.process_train_metrics(metrics)
+            return False, metrics
 
         train_actor = await self.replay_buffer.is_ready_async(train_actor_steps)
 
@@ -100,4 +102,4 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         torch.cuda.synchronize()
         torch.distributed.barrier()
         torch.cuda.empty_cache()
-        return mean_metric_dict
+        return True, mean_metric_dict

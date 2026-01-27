@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
+import time
 
 from rlinf.data.io_struct import EnvOutput
 from rlinf.envs import get_env_cls
@@ -414,6 +415,8 @@ class EnvWorker(Worker):
                     )
                     self.send_env_batch(output_channel, env_output.to_dict())
                     env_output_list[stage_id] = env_output
+
+                    metric_time = int(10 * time.time())
                     for key, value in env_info.items():
                         if (
                             not self.cfg.env.train.auto_reset
@@ -425,6 +428,8 @@ class EnvWorker(Worker):
                                 env_metrics[key].append(value)
                         else:
                             env_metrics[key].append(value)
+                    if len(env_info) > 0:
+                        env_metrics[key]["time"] = metric_time
 
             self.last_obs_list = [env_output.obs for env_output in env_output_list]
             self.last_final_obs_list = [env_output.final_obs for env_output in env_output_list]

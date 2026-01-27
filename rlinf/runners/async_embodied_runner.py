@@ -65,19 +65,23 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         except asyncio.QueueEmpty:
             return None
 
-        all_workers_env_metrics = compute_env_metrics_per_env_worker([result])
-        env_metrics = compute_evaluate_metrics(
-            [
-                result,
-            ]
-        )
-        return all_workers_env_metrics, env_metrics
+        rank_id = result.pop("rank_id")
+        metric_keys = list(result.keys())
+        result_num = len(result[metric_keys[0]])
+        for i in range(result_num):
+            metric_time = result["time"][i] - self.start_time
+            metric = {
+                f"env/worker_{rank_id}/{key}": value[i].item() 
+                for key, value in result.items() if key != "time"
+            }
+            self.metric_logger.log(metric, metric_time)
 
     def run(self):
         start_step = self.global_step
         self.update_rollout_weights()
         self.send_demo_buffer()
 
+        self.start_time = int(10*time.time())
         env_handle: Handle = self.env.interact(
             input_channel=self.rollout_channel,
             output_channel=self.env_channel,
@@ -94,6 +98,8 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
         train_step = start_step
         while train_step < self.max_steps:
+            self.global_step = train_step
+            log_time = int(10*time.time()) - self.start_time
             if (
                 self.cfg.runner.val_check_interval > 0
                 and train_step % self.cfg.runner.val_check_interval == 0
@@ -103,40 +109,30 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                     self.update_rollout_weights()
                     eval_metrics = self.evaluate()
                     eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-                    self.metric_logger.log(data=eval_metrics, step=train_step)
+                    self.metric_logger.log(data=eval_metrics, step=log_time)
 
             with self.timer("actor_training"):
-                actor_result = self.actor.run_training().wait()
-            if not actor_result[0]:
-                time_metrics = self.timer.consume_durations()
-                time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-                self.metric_logger.log(time_metrics, train_step)
-                time.sleep(1.0)
-                continue
-            train_step += 1
+                actor_result = self.actor.run_training().wait()[0]
+                has_trained, train_metrics = actor_result
+            
+            if has_trained:
+                train_step += 1
+                with self.timer("sync_weights"):
+                    self.update_rollout_weights(enable_wait=True)
 
-            with self.timer("sync_weights"):
-                self.update_rollout_weights(enable_wait=True)
-
-            training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
-            self.metric_logger.log(training_metrics, train_step)
+            training_metrics = {f"train/{k}": v for k, v in train_metrics.items()}
+            self.metric_logger.log(training_metrics, log_time)
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-            self.metric_logger.log(time_metrics, train_step)
+            self.metric_logger.log(time_metrics, log_time)
 
-            env_metrics_result = self.get_env_metrics()
-            if env_metrics_result is not None:
-                all_workers_env_metrics, env_metrics = env_metrics_result
-                rollout_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
-                env_worker_metrics = {
-                    f"env/worker_{rank_id}/{k}": v
-                    for rank_id, worker_env_metrics in all_workers_env_metrics.items()
-                    for k, v in worker_env_metrics.items()
-                }
-                self.metric_logger.log(rollout_metrics, train_step)
-                self.metric_logger.log(env_worker_metrics, train_step)
+            self.get_env_metrics()
 
+            if not has_trained:
+                time.sleep(1.0)
+                continue
+            
             _, save_model, _ = check_progress(
                 self.global_step,
                 self.max_steps,

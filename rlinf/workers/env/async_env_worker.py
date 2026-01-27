@@ -21,6 +21,7 @@ import torch
 from rlinf.data.io_struct import EnvOutput
 from rlinf.scheduler import Channel
 from rlinf.workers.env.env_worker import EnvWorker
+import time
 
 
 class AsyncEnvWorker(EnvWorker):
@@ -129,6 +130,8 @@ class AsyncEnvWorker(EnvWorker):
                     )
                     self.send_env_batch(output_channel, env_output.to_dict())
                     env_output_list[stage_id] = env_output
+
+                    metric_time = int(10 * time.time())
                     for key, value in env_info.items():
                         if (
                             not self.cfg.env.train.auto_reset
@@ -140,6 +143,8 @@ class AsyncEnvWorker(EnvWorker):
                                 env_metrics[key].append(value)
                         else:
                             env_metrics[key].append(value)
+                    if len(env_info) > 0:
+                        env_metrics["time"].append(metric_time * torch.ones(value.shape[0], dtype=int))
 
             for key, value in env_metrics.items():
                 env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
