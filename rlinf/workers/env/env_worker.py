@@ -247,28 +247,34 @@ class EnvWorker(Worker):
         Args:
             chunk_actions: Actions to execute
             stage_id: Pipeline stage ID
-            reward_terminations: Optional termination signal from reward model (for early stopping on success)
+            reward_terminations: Optional termination signal from reward model (for early stopping on success).
+                When using reward model, this signals that the episode has ended and env should reset.
+                IMPORTANT: When reward_terminations=True, we skip executing the current action
+                and perform reset immediately to avoid the reward model judging success again on
+                the same state, which would cause duplicate done signals.
         """
-        # Check if we need to reset due to previous reward-based termination
-        if self.pending_reset_list and self.pending_reset_list[stage_id].any():
-            # Reset the env for envs that had reward-based termination
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(f"[Env] Performing pending reset for stage {stage_id} due to reward-based termination")
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Handle reward-based terminations BEFORE executing action
+        # When reward model detected success in the previous frame, it already recorded
+        # dones=True. We need to reset the env NOW rather than executing more actions.
+        if reward_terminations is not None and reward_terminations.any():
+            logger.info(f"[Env] Reward-based termination detected, performing reset for stage {stage_id}")
             extracted_obs, infos = self.env_list[stage_id].reset()
-            # Clear the pending reset flag
-            self.pending_reset_list[stage_id] = torch.zeros_like(self.pending_reset_list[stage_id])
-            # Return reset observation with done=True to signal episode end
-            dones = torch.ones((self.train_num_envs_per_stage,), dtype=bool).unsqueeze(1).repeat(1, self.cfg.actor.model.num_action_chunks)
+            # Return reset observation with dones=False (this is the start of a new episode)
+            # The termination signal was already recorded in the previous frame by rollout worker
+            dones = torch.zeros((self.train_num_envs_per_stage,), dtype=bool).unsqueeze(1).repeat(1, self.cfg.actor.model.num_action_chunks)
             env_output = EnvOutput(
                 obs=extracted_obs,
                 final_obs=None,
-                rewards=None,
+                rewards=None,  # No rewards for reset frame
                 dones=dones,
                 terminations=dones.clone(),
                 truncations=torch.zeros_like(dones),
                 intervene_actions=None,
                 intervene_flags=None,
+                is_reset_frame=True,  # Mark as reset frame so rollout worker skips buffer add
             )
             return env_output, {}
         
@@ -285,18 +291,6 @@ class EnvWorker(Worker):
         extracted_obs, chunk_rewards, chunk_terminations, chunk_truncations, infos = (
             self.env_list[stage_id].chunk_step(chunk_actions)
         )
-        
-        # Check for reward-based terminations and set pending reset for next step
-        if reward_terminations is not None and reward_terminations.any():
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(f"[Env] Reward-based termination detected, setting pending reset for stage {stage_id}")
-            # Set pending reset flag for next step
-            if self.pending_reset_list:
-                self.pending_reset_list[stage_id] = reward_terminations.clone()
-            # Update terminations and dones to reflect reward-based termination
-            reward_term_expanded = reward_terminations.unsqueeze(1).expand_as(chunk_terminations)
-            chunk_terminations = torch.logical_or(chunk_terminations, reward_term_expanded)
             
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         if not self.cfg.env.train.auto_reset:

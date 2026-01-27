@@ -127,6 +127,9 @@ env:
     total_num_envs: 1
     keyboard_reward_wrapper: multi_stage
     use_spacemouse: True
+    # When using reward model, terminations are controlled by the reward model
+    # (keyboard_reward_wrapper will be disabled)
+    use_reward_model: ${reward.use_reward_model}
     # Optional: camera view used for reward model (do NOT put in override_cfg)
     # Set to wrist_2 for third-person view, or leave null to use main_images.
     reward_camera_name: null  # wrist_2

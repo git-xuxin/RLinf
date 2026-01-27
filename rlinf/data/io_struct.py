@@ -1172,6 +1172,10 @@ class EnvOutput:
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
+    
+    # Flag to indicate this is a reset frame (after reward-based termination)
+    # Rollout worker should skip adding this frame to buffer
+    is_reset_frame: bool = False
 
     def __post_init__(self):
         self.obs = put_tensor_device(self.obs, "cpu")
@@ -1243,6 +1247,7 @@ class EnvOutput:
         env_output_dict["rewards"] = self.rewards
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
+        env_output_dict["is_reset_frame"] = self.is_reset_frame
 
         return env_output_dict
 

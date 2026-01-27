@@ -59,6 +59,9 @@ class RealWorldEnv(gym.Env):
         # If specified, this camera's images will be used for reward model computation
         # NOTE: keep this out of override_cfg to avoid passing it into BinEnvConfig.
         self.reward_camera_name = cfg.get("reward_camera_name", None)
+        
+        # Check if reward model is being used (terminations will be controlled by reward model)
+        self.use_reward_model = cfg.get("use_reward_model", False)
 
         self.video_cfg = cfg.video_cfg
 
@@ -99,11 +102,14 @@ class RealWorldEnv(gym.Env):
             env = GripperCloseEnv(env)
         if not env.config.is_dummy and self.cfg.get("use_spacemouse", True):
             env = SpacemouseIntervention(env)
-        if not env.config.is_dummy and self.cfg.get("keyboard_reward_wrapper", None):
-            if self.cfg.keyboard_reward_wrapper == "multi_stage":
-                env = KeyboardRewardDoneMultiStageWrapper(env)
-            elif self.cfg.keyboard_reward_wrapper == "single_stage":
-                env = KeyboardRewardDoneWrapper(env)
+        # Only use keyboard reward wrapper when NOT using reward model
+        # When using reward model, terminations are controlled by the reward model
+        if not self.use_reward_model:
+            if not env.config.is_dummy and self.cfg.get("keyboard_reward_wrapper", None):
+                if self.cfg.keyboard_reward_wrapper == "multi_stage":
+                    env = KeyboardRewardDoneMultiStageWrapper(env)
+                elif self.cfg.keyboard_reward_wrapper == "single_stage":
+                    env = KeyboardRewardDoneWrapper(env)
 
         env = RelativeFrame(env)
         env = Quat2EulerWrapper(env)

@@ -1104,6 +1104,13 @@ class ImageRewardWorker(Worker):
         Returns:
             Processed batch with rewards added
         """
+        # Check if this is a reset frame (explicitly marked by env worker)
+        # Skip reward computation for reset frames
+        if env_batch.get("is_reset_frame", False):
+            output_data = env_batch.copy()
+            output_data["rewards"] = None
+            return output_data
+        
         dones = env_batch.get("dones")
         final_obs = env_batch.get("final_obs")
 
@@ -1177,17 +1184,6 @@ class ImageRewardWorker(Worker):
                 reward_terminations = (
                     is_success if self.terminate_on_success else None
                 )
-
-        # if self.log_stage_predictions and probs.dim() == 2:
-        #     probs_cpu = probs.detach().cpu()
-        #     stage_idx_cpu = stage_idx.detach().cpu()
-        #     for i in range(len(stage_idx_cpu)):
-        #         logger.info(
-        #             "[Reward] stage=%d probs=%s reward=%.3f",
-        #             int(stage_idx_cpu[i].item()),
-        #             probs_cpu[i].tolist(),
-        #             float(rewards[i].item()),
-        #         )
 
         output_data = env_batch.copy()
         cpu_rewards = rewards.cpu()
