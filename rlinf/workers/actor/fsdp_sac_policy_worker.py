@@ -300,7 +300,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             demo_data, seed=self.cfg.actor.seed, capacity=capacity
         )
 
-    def forward_critic(self, batch):
+    def forward_critic(self, batch, return_q: bool = False):
         use_crossq = self.cfg.algorithm.get("q_head_type", "default") == "crossq"
         bootstrap_type = self.cfg.algorithm.get("bootstrap_type", "standard")
         agg_q = self.cfg.algorithm.get("agg_q_critic", self.cfg.algorithm.get("agg_q", "min"))
@@ -412,6 +412,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         critic_loss = F.mse_loss(
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
+        if return_q:
+            return critic_loss, all_data_q_values.detach()
         return critic_loss
 
     def forward_actor(self, batch):
@@ -451,7 +453,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         actor_loss = ((self.alpha * log_pi) - qf_pi).mean()
 
         entropy = -log_pi.mean()
-        return actor_loss, entropy, log_pi.mean(), qf_pi.mean()
+        return actor_loss, entropy
 
     def forward_alpha(self, batch):
         curr_obs = batch["transitions"]["obs"]
@@ -495,12 +497,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
         self.qf_optimizer.zero_grad()
         gbs_critic_loss = []
+        q_head_means = None
         for batch in train_micro_batch_list:
             batch = put_tensor_device(batch, device=self.device)
             if enable_drq:
                 t = batch["transitions"]
                 drq.apply_drq(t["obs"], pad=4)
                 drq.apply_drq(t["next_obs"], pad=4)
+            if q_head_means is None:
+                critic_loss, q_values = self.forward_critic(batch, return_q=True)
+                q_head_means = q_values.mean(dim=0).flatten().cpu().tolist()
+            else:
+                critic_loss = self.forward_critic(batch)
             critic_loss = critic_loss / self.gradient_accumulation
             critic_loss.backward()
             gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
@@ -516,26 +524,25 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": qf_grad_norm,
         }
+        if q_head_means is not None:
+            for q_idx, q_mean in enumerate(q_head_means):
+                metrics_data[f"critic/q_head_{q_idx}"] = q_mean
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
             self.optimizer.zero_grad()
             gbs_actor_loss = []
             gbs_entropy = []
-            gbs_log_pi = []
-            gbs_qf_pi = []
             for batch in train_micro_batch_list:
                 if enable_drq:
                     t = batch["transitions"]
                     drq.apply_drq(t["obs"], pad=4)
                     drq.apply_drq(t["next_obs"], pad=4)
                 batch = put_tensor_device(batch, device=self.device)
-                actor_loss, entropy, log_pi_mean, qf_pi_mean = self.forward_actor(batch)
+                actor_loss, entropy = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
                 gbs_entropy.append(entropy.item())
-                gbs_log_pi.append(log_pi_mean.item())
-                gbs_qf_pi.append(qf_pi_mean.item())
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
             )
@@ -572,8 +579,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "sac/actor_loss": np.mean(gbs_actor_loss),
                     "sac/alpha_loss": np.mean(gbs_alpha_loss),
                     "sac/alpha": self.alpha,
-                    "actor/log_pi": np.mean(gbs_log_pi),
-                    "actor/qf_pi": np.mean(gbs_qf_pi),
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
                     "actor/grad_norm": actor_grad_norm,
                     "actor/entropy": np.mean(gbs_entropy),

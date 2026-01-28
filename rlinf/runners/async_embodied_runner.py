@@ -111,10 +111,35 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
             with self.timer("actor_training"):
                 actor_result = self.actor.run_training().wait()
-            if not actor_result[0]:
+            log_time = int(time.time() * 10)
+            env_metrics_result = self.get_env_metrics()
+            if env_metrics_result is not None:
+                all_workers_env_metrics, env_metrics = env_metrics_result
+                rollout_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+                env_worker_metrics = {
+                    f"env/worker_{rank_id}/{k}": v
+                    for rank_id, worker_env_metrics in all_workers_env_metrics.items()
+                    for k, v in worker_env_metrics.items()
+                }
+                self.metric_logger.log(rollout_metrics, log_time)
+                self.metric_logger.log(env_worker_metrics, log_time)
+
+            training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
+            self.metric_logger.log(training_metrics, log_time)
+
+            # Get reward component statistics from rollout worker
+            try:
+                reward_stats_result = self.rollout.get_reward_stats().wait()
+                if reward_stats_result and reward_stats_result[0]:
+                    reward_stats = reward_stats_result[0]
+                    self.metric_logger.log(reward_stats, log_time)
+            except Exception:
+                pass  # Reward stats not available
+
+            if "loss" not in actor_result[0].keys():
                 time_metrics = self.timer.consume_durations()
                 time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-                self.metric_logger.log(time_metrics, train_step)
+                self.metric_logger.log(time_metrics, log_time)
                 time.sleep(1.0)
                 continue
             train_step += 1
@@ -128,33 +153,9 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 with self.timer("sync_weights"):
                     self.update_rollout_weights()
 
-            training_metrics = {f"train/{k}": v for k, v in actor_result[0].items()}
-            self.metric_logger.log(training_metrics, train_step)
-
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-            self.metric_logger.log(time_metrics, train_step)
-
-            env_metrics_result = self.get_env_metrics()
-            if env_metrics_result is not None:
-                all_workers_env_metrics, env_metrics = env_metrics_result
-                rollout_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
-                env_worker_metrics = {
-                    f"env/worker_{rank_id}/{k}": v
-                    for rank_id, worker_env_metrics in all_workers_env_metrics.items()
-                    for k, v in worker_env_metrics.items()
-                }
-                self.metric_logger.log(rollout_metrics, train_step)
-                self.metric_logger.log(env_worker_metrics, train_step)
-            
-            # Get reward component statistics from rollout worker
-            try:
-                reward_stats_result = self.rollout.get_reward_stats().wait()
-                if reward_stats_result and reward_stats_result[0]:
-                    reward_stats = reward_stats_result[0]
-                    self.metric_logger.log(reward_stats, train_step)
-            except Exception:
-                pass  # Reward stats not available
+            self.metric_logger.log(time_metrics, log_time)
 
             _, save_model, _ = check_progress(
                 self.global_step,

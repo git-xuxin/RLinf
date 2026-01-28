@@ -70,7 +70,12 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.log_info(
                 f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
             )
-            return False
+            replay_buffer_stats = self.replay_buffer.get_stats()
+            replay_buffer_stats = {
+                f"replay_buffer/{key}": value
+                for key, value in replay_buffer_stats.items()
+            }
+            return replay_buffer_stats
         
         # import time
         # import pickle as pkl
