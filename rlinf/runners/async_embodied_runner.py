@@ -67,7 +67,7 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
         rank_id = result.pop("rank_id")
         metric_keys = list(result.keys())
-        if len(metric_keys) > 0:
+        if len(metric_keys) == 0:
             return None
 
         result_num = len(result[metric_keys[0]])
