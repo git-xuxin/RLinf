@@ -482,8 +482,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         if self.demo_buffer is not None and self.demo_buffer.is_ready(
             min_demo_buffer_size
         ):
-            replay_batch = self.replay_buffer.sample(global_batch_size_per_rank // 2)
-            demo_batch = self.demo_buffer.sample(global_batch_size_per_rank // 2)
+            # 使用 1/3 的 batch 来自 replay buffer，其余 2/3 来自 demo buffer
+            replay_batch_size = global_batch_size_per_rank // 3
+            demo_batch_size = global_batch_size_per_rank - replay_batch_size
+            replay_batch = self.replay_buffer.sample(replay_batch_size)
+            demo_batch = self.demo_buffer.sample(demo_batch_size)
             global_batch = concat_batch(replay_batch, demo_batch)
         else:
             # Sample batch from replay buffer
@@ -497,18 +500,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         enable_drq = bool(getattr(self.cfg.actor, "enable_drq", False))
         self.qf_optimizer.zero_grad()
         gbs_critic_loss = []
-        q_head_means = None
         for batch in train_micro_batch_list:
             batch = put_tensor_device(batch, device=self.device)
             if enable_drq:
                 t = batch["transitions"]
                 drq.apply_drq(t["obs"], pad=4)
                 drq.apply_drq(t["next_obs"], pad=4)
-            if q_head_means is None:
-                critic_loss, q_values = self.forward_critic(batch, return_q=True)
-                q_head_means = q_values.mean(dim=0).flatten().cpu().tolist()
-            else:
-                critic_loss = self.forward_critic(batch)
+            critic_loss = self.forward_critic(batch)
             critic_loss = critic_loss / self.gradient_accumulation
             critic_loss.backward()
             gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
@@ -524,9 +522,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": qf_grad_norm,
         }
-        if q_head_means is not None:
-            for q_idx, q_mean in enumerate(q_head_means):
-                metrics_data[f"critic/q_head_{q_idx}"] = q_mean
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
             self.optimizer.zero_grad()
