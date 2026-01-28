@@ -70,6 +70,8 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         # and avoid index mismatch between dones and transitions
         last_extracted_obs = [None for _ in range(self.num_pipeline_stages)]
         last_results = [None for _ in range(self.num_pipeline_stages)]
+        # Track previous observation states for gripper penalty calculation
+        last_obs_states = [None for _ in range(self.num_pipeline_stages)]
         
         while not self.should_stop:
 
@@ -91,8 +93,18 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
 
                     actions, result = self.predict(extracted_obs)
                     
-                    # Apply gripper penalty to rewards (bypasses env reward since combine_mode="replace")
-                    rewards = self.apply_gripper_penalty_to_rewards(env_output, actions, rewards)
+                    # Apply gripper penalty to rewards using correct time alignment:
+                    # - prev_obs_states: observation states before action (obs_{t-1})
+                    # - curr_obs_states: observation states after action (obs_t)
+                    # - last_actions: the actions that were executed (actions_{t-1})
+                    # - rewards: reward received after executing actions (r_t)
+                    curr_obs_states = env_output["obs"].get("states")
+                    last_actions = self._get_actions_from_forward_inputs(
+                        last_results[stage_id]["forward_inputs"]
+                    ) if last_results[stage_id] is not None else None
+                    rewards = self.apply_gripper_penalty_to_rewards(
+                        last_obs_states[stage_id], curr_obs_states, last_actions, rewards
+                    )
 
                     # Check if this is a reset frame (marked by env worker when using reward model)
                     is_reset_frame = env_output.get("is_reset_frame", False)
@@ -161,6 +173,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
 
                     last_extracted_obs[stage_id] = extracted_obs
                     last_results[stage_id] = result
+                    last_obs_states[stage_id] = curr_obs_states
 
                     self.send_chunk_actions(output_channel, actions, reward_terminations=reward_terminations)
 
@@ -182,8 +195,14 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 with self.worker_timer():
                     actions, result = self.predict(extracted_obs)
                 
-                # Apply gripper penalty to rewards
-                rewards = self.apply_gripper_penalty_to_rewards(env_output, actions, rewards)
+                # Apply gripper penalty to rewards using correct time alignment
+                curr_obs_states = env_output["obs"].get("states")
+                last_actions = self._get_actions_from_forward_inputs(
+                    last_results[i]["forward_inputs"]
+                ) if last_results[i] is not None else None
+                rewards = self.apply_gripper_penalty_to_rewards(
+                    last_obs_states[i], curr_obs_states, last_actions, rewards
+                )
                 
                 is_reset_frame = env_output.get("is_reset_frame", False)
                 
