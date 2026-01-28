@@ -203,9 +203,6 @@ class FrankaBinRelocationEnv(FrankaEnv):
                 elif camera.name == "wrist_1":
                     display_images[camera.name + "_full"] = cropped_rgb
             except queue.Empty:
-                input(
-                    f"{camera.name} camera frozen. Check connect, then press enter to relaunch..."
-                )
                 time.sleep(5)
                 camera.close()
                 self._open_cameras()

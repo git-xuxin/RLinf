@@ -247,6 +247,7 @@ class SACReplayBuffer:
             insert_nested_batch(buffer, instance.buffer, torch.arange(size))
             instance.capacity = max(capacity, size)
             instance.size = size
+        instance.buffer["grasp_penalty"] = torch.zeros_like(instance.buffer["rewards"])
         instance.pos = size % instance.capacity
         return instance
 

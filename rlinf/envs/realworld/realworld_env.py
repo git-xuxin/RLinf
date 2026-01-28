@@ -281,7 +281,7 @@ class RealWorldEnv(gym.Env):
 
         if "grasp_penalty" not in infos:
             infos["grasp_penalty"] = np.zeros(self.num_envs)
-        infos["grasp_penalty"] = torch.from_numpy(infos["grasp_penalty"])
+        infos["grasp_penalty"] = torch.from_numpy(infos["grasp_penalty"]).float()
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset

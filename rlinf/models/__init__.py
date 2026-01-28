@@ -330,6 +330,28 @@ def get_model(cfg: DictConfig, override_config_kwargs=None):
         model_config = CNNConfig()
         model_config.update_from_dict(OmegaConf.to_container(cfg, resolve=True))
         model = CNNPolicy(model_config)
+    elif model_type == SupportedModel.FLOW_POLICY:
+        from .embodiment.flow_policy import FlowPolicy
+        if cfg.input_type == "state":
+            from rlinf.models.embodiment.flow_policy import (
+                FlowStateConfig,
+                FlowStatePolicy,
+            )
+
+            model_config = FlowStateConfig()
+            model_config.update_from_dict(OmegaConf.to_container(cfg, resolve=True))
+            model = FlowStatePolicy(model_config)
+        elif cfg.input_type == "mixed":
+            from rlinf.models.embodiment.flow_policy import (
+                FlowConfig,
+                FlowPolicy,
+            )
+
+            model_config = FlowConfig()
+            model_config.update_from_dict(OmegaConf.to_container(cfg, resolve=True))
+            model = FlowPolicy(model_config)
+        else:
+            raise NotImplementedError(f"{cfg.input_type=}")
     else:
         return None
     if torch.cuda.is_available():

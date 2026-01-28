@@ -67,6 +67,9 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
 
         rank_id = result.pop("rank_id")
         metric_keys = list(result.keys())
+        if len(metric_keys) > 0:
+            return None
+
         result_num = len(result[metric_keys[0]])
         for i in range(result_num):
             metric_time = result["time"][i] - self.start_time

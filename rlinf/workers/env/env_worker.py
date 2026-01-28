@@ -429,7 +429,7 @@ class EnvWorker(Worker):
                         else:
                             env_metrics[key].append(value)
                     if len(env_info) > 0:
-                        env_metrics[key]["time"] = metric_time
+                        env_metrics["time"].append(metric_time * torch.ones(value.shape[0], dtype=int))
 
             self.last_obs_list = [env_output.obs for env_output in env_output_list]
             self.last_final_obs_list = [env_output.final_obs for env_output in env_output_list]

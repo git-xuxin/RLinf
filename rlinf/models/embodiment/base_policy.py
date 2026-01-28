@@ -13,6 +13,16 @@
 # limitations under the License.
 
 import torch.nn as nn
+from enum import Enum
+
+
+class ForwardType(Enum):
+    DEFAULT = "default"
+    SFT = "sft"
+    SAC = "sac"
+    SAC_Q = "sac_q"
+    CROSSQ = "crossq"
+    CROSSQ_Q = "crossq_q"
 
 
 class BasePolicy(nn.Module):

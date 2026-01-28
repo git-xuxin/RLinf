@@ -1328,7 +1328,7 @@ class EmbodiedRolloutResult:
             self.rewards.append(result.rewards)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
-        if result.grasp_penalty:
+        if result.grasp_penalty is not None:
             self.grasp_penalty.append(result.grasp_penalty)
 
     def add_transition(self, obs, next_obs):
@@ -1491,9 +1491,9 @@ class AsyncEmbodiedRolloutBuffer:
         await self.prev_logprobs.put(
             result["prev_logprobs"].cpu().contiguous()
         )  # if "prev_logprobs" in result else None
-        await self.prev_values.put(
-            result["prev_values"].cpu().contiguous()
-        )  # if "prev_values" in result else None
+        # await self.prev_values.put(
+        #     result["prev_values"].cpu().contiguous()
+        # )  # if "prev_values" in result else None
 
         if "intervene_flags" in result["forward_inputs"]:
             intervene_flags = result["forward_inputs"].pop("intervene_flags")
@@ -1508,6 +1508,8 @@ class AsyncEmbodiedRolloutBuffer:
         )
 
     async def add_transition(self, obs, next_obs):
+        # with open(f"test_replay_buffer.txt", "a") as f:
+        #     f.write(f"add transition!\n")
         await self.transitions.put(
             {
                 "obs": put_tensor_device(obs, "cpu"),
@@ -1521,12 +1523,15 @@ class AsyncEmbodiedRolloutBuffer:
         elif key == "grasp_penalty":
             await self.grasp_penalty.put(items)
         elif key == "dones":
+            # with open(f"test_replay_buffer.txt", "a") as f:
+            #     f.write(f"add dones! {items=} \n")
             await self.dones.put(items)
         elif key == "terminations":
             await self.terminations.put(items)
         elif key == "truncations":
             await self.truncations.put(items)
         elif key == "prev_values":
+            raise NotImplementedError
             await self.prev_values.put(items)
         else:
             raise NotImplementedError

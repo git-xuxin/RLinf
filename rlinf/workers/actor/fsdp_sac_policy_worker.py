@@ -418,8 +418,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         actor_loss = ((self.alpha * log_pi) - qf_pi).mean()
 
         entropy = -log_pi.mean()
-        return actor_loss, entropy
-
+        return actor_loss, entropy, metrics
+    
     def forward_alpha(self, batch):
         curr_obs = batch["transitions"]["obs"]
         with torch.no_grad():
@@ -530,6 +530,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "actor/grad_norm": actor_grad_norm,
                     "actor/entropy": np.mean(gbs_entropy),
                     "alpha/grad_norm": alpha_grad_norm,
+                    **all_actor_metrics, 
                 }
             )
         # Soft update target network
