@@ -55,6 +55,8 @@ class KeyboardRewardDoneWrapper(BaseKeyboardRewardDoneWrapper):
         print(f"Key pressed: {key}")
         if key not in ["a", "b", "c"]:
             return last_intervened, done, reward
+        
+        last_intervened = True
         if key == "a":
             reward = -1
             done = True
