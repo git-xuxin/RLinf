@@ -63,9 +63,11 @@ runner:
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
-  update_epoch: 8
+  update_epoch: 32
   group_size: 1
-  agg_q: mean
+  agg_q: mean  # Default fallback value
+  agg_q_actor: mean  # Use mean for actor
+  agg_q_critic: min  # Use min for critic
 
   backup_entropy: False
   critic_subsample_size: 2
@@ -88,7 +90,9 @@ algorithm:
   critic_actor_ratio: 4
   # Replay buffer settings
   replay_buffer_capacity: 20000
+  demo_buffer_capacity: 6000
   min_buffer_size: 200  # Minimum buffer size before training starts
+  min_demo_buffer_size: 200  # Minimum demo buffer size before training starts
   target_update_freq: 1  # Frequency of target network updates
 
   # params for rollout
@@ -116,7 +120,7 @@ env:
     override_cfg:
       is_dummy: False
       use_dense_reward: False
-      target_ee_pose: [0.51573866, 0.02374934, 0.07331224, -3.13803461, 0.03418677, -0.01341346] # Replace with your target end-effector pose
+      target_ee_pose: [0.53061183, 0.08715289, 0.08807074, 3.12400009, -0.01096163, 0.00950574] # Replace with your target end-effector pose
 
 rollout:
   group_name: "RolloutGroup"
@@ -141,7 +145,6 @@ actor:
 
   model:
     model_path: "/home/xuxin/Workspace/realwordRL_model/RLinf-Reset10-pretrained/"
-    num_q_heads: 10
     state_dim: 19
     action_dim: 6
     num_q_heads: 10 # number of Q heads for critic, passed to policy module
@@ -158,6 +161,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
+    use_orig_params: true
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
