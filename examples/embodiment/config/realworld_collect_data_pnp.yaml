@@ -33,6 +33,7 @@ runner:
     logger_backends: ["tensorboard"] # wandb, swanlab
   num_data_episodes: 20
   record_task_description: False
+  task_description: ""  # Custom task description e.g. "Pick up the red pepper doll from the table and place it on the blue plate" (optional, will use env default if not set)
 
 env:
   group_name: "EnvGroup"
