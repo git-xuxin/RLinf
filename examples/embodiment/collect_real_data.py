@@ -82,6 +82,8 @@ class DataCollector(Worker):
     def run(self):
         obs, _ = self.env.reset()
         success_cnt = 0
+        # Get action_space from the underlying vectorized environment
+        action_dim = int(self.env.env.single_action_space.shape[0])
         progress_bar = tqdm(
             range(self.num_data_episodes), desc="Collecting Data Episodes:"
         )
@@ -94,7 +96,7 @@ class DataCollector(Worker):
         current_obs_processed = self._process_obs(obs)
 
         while success_cnt < self.num_data_episodes:
-            action = np.zeros((1, 6))
+            action = np.zeros((1, action_dim), dtype=np.float32)
             next_obs, reward, done, _, info = self.env.step(action)
 
             if "intervene_action" in info:
@@ -103,7 +105,7 @@ class DataCollector(Worker):
             next_obs_processed = self._process_obs(next_obs)
 
             # --- Construct ChunkStepResult ---
-            # Prepare action tensor [1, 6]
+            # Prepare action tensor [1, action_dim]
             if isinstance(action, torch.Tensor):
                 action_tensor = action.float().cpu()
             else:
