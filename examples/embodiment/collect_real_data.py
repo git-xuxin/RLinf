@@ -62,21 +62,31 @@ class DataCollector(Worker):
         self.task_description = None
         if self.cfg.runner.get("record_task_description", False):
             task_desc = self.cfg.runner.get("task_description", None)
-            if task_desc is not None and isinstance(task_desc, str) and task_desc.strip():
+            if (
+                task_desc is not None
+                and isinstance(task_desc, str)
+                and task_desc.strip()
+            ):
                 # Override the environment's task_description
                 self.task_description = task_desc.strip()
                 self.env.task_descriptions = [self.task_description]
-                self.log_info(f"Using task_description from config: {self.task_description}")
+                self.log_info(
+                    f"Using task_description from config: {self.task_description}"
+                )
             elif hasattr(self.env, "task_descriptions") and self.env.task_descriptions:
                 self.task_description = str(self.env.task_descriptions[0])
-                self.log_info(f"Using task_description from env: {self.task_description}")
+                self.log_info(
+                    f"Using task_description from env: {self.task_description}"
+                )
             else:
-                self.log_info("Warning: record_task_description=True but no task_description found")
+                self.log_info(
+                    "Warning: record_task_description=True but no task_description found"
+                )
 
     def _process_obs(self, obs):
         """
         Process observations to match the format expected by EmbodiedRolloutResult.
-        
+
         Note: task_descriptions (string list) is removed from obs to avoid errors during
         tensor stacking. It will be saved separately in trajectory metadata if needed.
         """
@@ -106,13 +116,15 @@ class DataCollector(Worker):
         """Save task_description to a JSON file alongside the trajectory file."""
         buffer_path = os.path.join(self.cfg.runner.logger.log_path, "demos")
         os.makedirs(buffer_path, exist_ok=True)
-        
+
         # Save as JSON file with same naming pattern as trajectory
         task_desc_path = os.path.join(
             buffer_path, f"trajectory_{trajectory_id}_task_description.json"
         )
         with open(task_desc_path, "w", encoding="utf-8") as f:
-            json.dump({"task_description": task_description}, f, indent=2, ensure_ascii=False)
+            json.dump(
+                {"task_description": task_description}, f, indent=2, ensure_ascii=False
+            )
 
     def run(self):
         obs, _ = self.env.reset()
@@ -200,7 +212,7 @@ class DataCollector(Worker):
                 trajectory = current_rollout.to_trajectory()
                 trajectory.intervene_flags = torch.ones_like(trajectory.intervene_flags)
                 self.buffer.add_trajectories([trajectory])
-                
+
                 # Save task_description separately if record_task_description is True
                 if self.cfg.runner.record_task_description and self.task_description:
                     # Get the trajectory_id that was just saved
