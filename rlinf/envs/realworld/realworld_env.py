@@ -59,6 +59,8 @@ class RealWorldEnv(gym.Env):
         self.use_fixed_reset_state_ids = cfg.use_fixed_reset_state_ids
         self.auto_reset = cfg.auto_reset
         self.ignore_terminations = cfg.ignore_terminations
+        self.use_step_penalty = cfg.get("use_step_penalty", False)
+        self.reward_coef = cfg.get("reward_coef", 1.0)
         self.num_group = num_envs // cfg.group_size
         self.group_size = cfg.group_size
         self.main_image_key = cfg.main_image_key
@@ -375,7 +377,14 @@ class RealWorldEnv(gym.Env):
         return obs, infos
 
     def _calc_step_reward(self, reward: np.ndarray):
-        return reward.astype(np.float32)
+        """Compute step reward. When use_step_penalty is True, applies -1 per step and 0 on success."""
+        reward = np.asarray(reward, dtype=np.float32)
+        if not self.use_step_penalty:
+            return reward
+        step_penalty = -1.0
+        # Success is indicated by raw reward == 1; give bonus so final step reward is 0.
+        termination_bonus = (reward == 1.0).astype(np.float32) * self.reward_coef
+        return (step_penalty + termination_bonus).astype(np.float32)
 
     def _get_random_reset_state_ids(self, num_reset_states):
         reset_state_ids = self._generator.integers(
