@@ -319,7 +319,8 @@ class MultiStepRolloutWorker(Worker):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
 
-                if env_output["intervene_actions"] is not None:
+                use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+                if env_output["intervene_actions"] is not None and not use_dsrl:
                     self.rollout_results[stage_id].update_last_actions(
                         env_output["intervene_actions"],
                         env_output["intervene_flags"],
@@ -373,7 +374,8 @@ class MultiStepRolloutWorker(Worker):
         for stage_id in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
 
-            if env_output["intervene_actions"] is not None:
+            use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+            if env_output["intervene_actions"] is not None and not use_dsrl:
                 self.rollout_results[stage_id].update_last_actions(
                     env_output["intervene_actions"], env_output["intervene_flags"]
                 )
