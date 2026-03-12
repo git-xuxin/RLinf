@@ -76,11 +76,34 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.target_model = torch.compile(self.target_model, mode="default")
 
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
-        """Setup model, lr_scheduler, optimizer and grad_scaler."""
-        """Add initializing target model logic."""
+        """Setup model, lr_scheduler, optimizer and grad_scaler.
+
+        Add initializing target model logic and cache trainable parameter
+        names (for DSRL train_expert_only) BEFORE FSDP wrapping. This
+        allows target shadow buffers and sync_model_to_rollout to operate
+        only on the small DSRL head subset instead of the full backbone.
+        """
         module = self.model_provider_func()
         if initialize_target:
             target_module = self.model_provider_func()
+
+        # Cache trainable parameter names BEFORE FSDP wrapping.
+        # After wrap_model(), calling model.named_parameters() may disturb
+        # FSDP's internal flat-parameter state.  We store a frozenset here
+        # so that _init_target_shadow (and optionally sync_model_to_rollout)
+        # can filter to only the DSRL head parameters when
+        # openpi.train_expert_only=True.
+        train_expert_only = self.cfg.actor.model.get("openpi", {}).get(
+            "train_expert_only", False
+        )
+        if train_expert_only:
+            self._trainable_param_names = frozenset(
+                name for name, p in module.named_parameters() if p.requires_grad
+            )
+            self.log_info(
+                f"[setup_model_and_optimizer] train_expert_only=True; "
+                f"cached {len(self._trainable_param_names)} trainable param names"
+            )
 
         # Enable gradient checkpointing if configured
         if self.cfg.actor.model.get("gradient_checkpointing", False):
@@ -253,10 +276,23 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         storing back to bf16 each step rounds away the update. The shadow
         keeps the accumulated EMA state in float32 (ULP ~3.6e-8) across
         steps, preventing precision loss.
+
+        When train_expert_only=True (Pi0 backbone frozen, only DSRL heads
+        trained), shadows are only created for the trainable parameters
+        (~1 MB instead of ~10+ GB for the full backbone). The frozen
+        backbone parameters satisfy target == online at all times, so
+        no shadow is needed for them.
         """
         self._target_shadow_f32 = {}
+        trainable_names = getattr(self, "_trainable_param_names", None)
         for name, param in self.target_model.named_parameters():
-            self._target_shadow_f32[name] = param.data.float().clone()
+            if trainable_names is None or name in trainable_names:
+                self._target_shadow_f32[name] = param.data.float().clone()
+        self.log_info(
+            f"[_init_target_shadow] created {len(self._target_shadow_f32)} "
+            f"fp32 shadow entries"
+            + (" (trainable only)" if trainable_names is not None else "")
+        )
 
     def soft_update_target_model(self, tau: Optional[float] = None):
         """Soft update target model parameters.
@@ -289,18 +325,25 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         target_param.data.mul_(1.0 - tau)
                         target_param.data.add_(online_param.data * tau)
             else:
-                # DSRL path: float32 shadow buffer for bf16 precision
+                # DSRL path: float32 shadow buffer for bf16 precision.
+                # When train_expert_only=True, the shadow only covers trainable
+                # (DSRL head) parameters; frozen backbone params have no shadow
+                # entry and are skipped (target == online for them always).
                 for (name1, online_param), (name2, target_param) in zip(
                     self.model.named_parameters(),
                     self.target_model.named_parameters(),
                 ):
                     assert name1 == name2
                     if "q_head" not in name1 and self.target_update_type != "all":
-                        shadow = self._target_shadow_f32[name1]
+                        shadow = self._target_shadow_f32.get(name1, None)
+                        if shadow is None:
+                            continue
                         shadow.copy_(online_param.data.float())
                         target_param.data.copy_(shadow.to(target_param.data.dtype))
                     else:
-                        shadow = self._target_shadow_f32[name1]
+                        shadow = self._target_shadow_f32.get(name1, None)
+                        if shadow is None:
+                            continue
                         shadow.mul_(1.0 - tau).add_(
                             online_param.data.float(), alpha=tau
                         )
