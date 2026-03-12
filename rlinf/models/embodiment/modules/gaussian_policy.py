@@ -162,8 +162,16 @@ class GaussianPolicy(nn.Module):
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.action_horizon = action_horizon
-        self.low = low
-        self.high = high
+        if low is not None and high is not None:
+            self.register_buffer(
+                "low", torch.as_tensor(low, dtype=torch.float32)
+            )
+            self.register_buffer(
+                "high", torch.as_tensor(high, dtype=torch.float32)
+            )
+        else:
+            self.low = None
+            self.high = None
 
         # Build shared MLP hidden layers
         layers = []
