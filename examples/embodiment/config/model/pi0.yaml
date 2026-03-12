@@ -35,6 +35,7 @@ openpi:
   use_dsrl: False
   dsrl_state_dim: 8
   dsrl_action_noise_dim: 32
+  dsrl_action_magnitude: 1.0
   dsrl_num_q_heads: 10
   dsrl_agg_q: "mean"
   dsrl_image_latent_dim: 64
