@@ -86,7 +86,7 @@ algorithm:
   replay_buffer:
     enable_cache: True
     cache_size: 200 # number of trajectories cached in memory, set big to avoid actor training
-    min_buffer_size: 2  # Minimum buffer size before training starts (in number of trajectories). If set too large, it will take a long time to start real-world training 
+    min_buffer_size: 10  # Minimum buffer size before training starts (in number of trajectories). If set too large, it will take a long time to start real-world training 
     sample_window_size: 200 # number of latest trajectories to sample from for replay buffer
     auto_save: False
 
@@ -171,11 +171,11 @@ actor:
 
   model:
     model_path: "/path/to/model"
-    num_action_chunks: 4
+    num_action_chunks: 10
     state_dim: 19
     action_dim: 7
     image_num: 2
-    add_value_head: True
+    add_value_head: False
     add_q_head: True
     q_head_type: "default"
     
