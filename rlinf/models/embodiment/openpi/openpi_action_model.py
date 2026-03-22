@@ -132,6 +132,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.sample_actions = sample_actions_func
         self.logger = get_logger()
         self.global_step = 0
+        # DSRL noise mode: "gaussian" | "repeat_gaussian" | "sac"
+        self._noise_mode = "gaussian"
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
@@ -427,6 +429,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values=True,
         **kwargs,
     ) -> tuple[np.ndarray, dict[str, Any]]:
+        count_update = kwargs.pop("count_update", 0)
+
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -438,38 +442,64 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         is_dsrl_train = self.config.use_dsrl and mode == "train"
         if is_dsrl_train:
-            # DSRL mode and train mode
+            # Determine noise mode based on training stage
+            if count_update > 1:
+                self._noise_mode = "sac"
+            else:
+                self._noise_mode = "repeat_gaussian"
 
-            # Step 1: SAC agent outputs noise
-            # No data augmentation during rollout, train=False
-
-            # Convert env_obs to the format expected by sac_forward
-            # env_obs has: main_images, wrist_images, states
-            # sac_forward expects: images (list), states
-            dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
-
-            noise_actions, noise_logprob, _ = self.sac_forward(
-                dsrl_obs, train=False, mode=mode
+            self.logger.info(
+                "[DSRL] Noise mode: %s (count_update=%d)",
+                self._noise_mode,
+                count_update,
             )
 
-            # Step 2: Use noise to sample actual actions from diffusion model
-            outputs = self.sample_actions(
-                observation,
-                noise=noise_actions,
-                mode="eval",
-                compute_values=compute_values,
-            )
+            if self._noise_mode == "sac":
+                # DSRL train mode: use SAC policy to generate noise
+                # Step 1: SAC agent outputs noise
+                # No data augmentation during rollout, train=False
+                # Convert env_obs to the format expected by sac_forward
+                # env_obs has: main_images, wrist_images, states
+                # sac_forward expects: images (list), states
+                dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
 
-            # Step 3: Extract actual actions for environment interaction
-            real_actions = self.output_transform(
-                {"actions": outputs["actions"], "state": observation.state}
-            )["actions"].numpy()
+                noise_actions, noise_logprob, _ = self.sac_forward(
+                    dsrl_obs, train=False, mode=mode
+                )
+                
+                # Step 2: Use noise to sample actual actions from diffusion model
+                outputs = self.sample_actions(
+                    observation,
+                    noise=noise_actions,
+                    mode="eval",
+                    compute_values=compute_values,
+                )
 
-            # Return actual actions to environment, but forward_inputs stores noise.
-            actions = real_actions
-            prev_logprobs = noise_logprob  # SAC noise logprob
-            prev_values = outputs.get("prev_values")
-            forward_action = noise_actions  # Used for SAC training
+                # Step 3: Extract actual actions for environment interaction
+                real_actions = self.output_transform(
+                    {"actions": outputs["actions"], "state": observation.state}
+                )["actions"].numpy()
+
+                # Return actual actions to environment, but forward_inputs stores noise.
+                actions = real_actions
+                prev_logprobs = noise_logprob  # SAC noise logprob
+                prev_values = outputs.get("prev_values")
+                forward_action = noise_actions  # Used for SAC training
+            else:
+                # DSRL warmup: use repeat gaussian noise (sample_noise handles the repetition)
+                noise_actions = self.sample_noise(
+                    (observation.state.shape[0], self.config.action_horizon, self.config.action_dim),
+                    device=observation.state.device,
+                )
+                outputs = self.sample_actions(
+                    observation, noise=noise_actions, mode=mode, compute_values=compute_values
+                )
+                actions = self.output_transform(
+                    {"actions": outputs["actions"], "state": observation.state}
+                )["actions"].numpy()
+                prev_logprobs = outputs["prev_logprobs"]
+                prev_values = outputs["prev_values"]
+                forward_action = noise_actions
 
         else:
             # Non-DSRL or eval mode
@@ -504,6 +534,28 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "forward_inputs": forward_inputs,
         }
         return actions, result
+
+    def sample_noise(self, shape, device):
+        bsize, action_horizon, action_dim = shape
+        if self.config.use_dsrl and self._noise_mode == "repeat_gaussian":
+            noise_small = torch.normal(
+                mean=0.0,
+                std=1.0,
+                size=(bsize, action_dim),
+                dtype=torch.float32,
+                device=device,
+            )
+            # Repeat across action_horizon: [B, action_dim] -> [B, action_horizon, action_dim]
+            noise = noise_small.unsqueeze(1).repeat(1, action_horizon, 1)
+            return noise
+        else:
+            return torch.normal(
+                mean=0.0,
+                std=1.0,
+                size=shape,
+                dtype=torch.float32,
+                device=device,
+            )
 
     @torch.no_grad()
     def sample_actions(

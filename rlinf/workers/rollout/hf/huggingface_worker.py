@@ -229,6 +229,8 @@ class MultiStepRolloutWorker(Worker):
         ]:
             kwargs["return_obs"] = not hasattr(self.hf_model, "q_head")
 
+        kwargs["count_update"] = self.count_update
+
         with torch.no_grad():
             actions, result = self.hf_model.predict_action_batch(
                 env_obs=env_obs,
