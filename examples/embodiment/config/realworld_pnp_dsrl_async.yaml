@@ -54,7 +54,7 @@ runner:
   ckpt_path: "/path/to/full_weights.pt"  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
-  update_epoch: 32
+  update_epoch: 200
   group_size: 1
   agg_q: min # or mean
   actor_agg_q: mean
@@ -125,6 +125,7 @@ env:
     total_num_envs: 1
     keyboard_reward_wrapper: single_stage
     use_spacemouse: False
+    use_step_penalty: True
 
     max_steps_per_rollout_epoch: 160
     max_episode_steps: 160
