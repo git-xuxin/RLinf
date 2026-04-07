@@ -193,6 +193,7 @@ actor:
       dsrl_action_noise_dim: 32
       dsrl_action_magnitude: 2.5
       dsrl_num_q_heads: 10
+      dsrl_num_images: 2
       dsrl_image_latent_dim: 64
       dsrl_state_latent_dim: 64
       dsrl_hidden_dims: [128, 128, 128]

@@ -73,6 +73,7 @@ class OpenPi0Config(Pi0Config):
     dsrl_action_magnitude: float = 1.0  # Tanh output scale [-mag, mag], 1.0 for sim, 2.5 for real-world (align with dsrl_pi0 action_magnitude)
     dsrl_num_q_heads: int = 10  # Number of Q-networks
     dsrl_agg_q: str = "mean"  # Q aggregation method: 'mean' | 'min'
+    dsrl_num_images: int = 1  # Number of images for DSRL image_encoder
     dsrl_image_latent_dim: int = 64  # Latent dim for lightweight image encoder
     dsrl_state_latent_dim: int = 64  # Hidden dim for state encoder
     dsrl_hidden_dims: tuple = field(
@@ -205,7 +206,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             ).to(dtype=_dsrl_dtype)
 
             self.actor_image_encoder = LightweightImageEncoder64(
-                num_images=1,
+                self.config.dsrl_num_images,
                 latent_dim=self.config.dsrl_image_latent_dim,
                 image_size=64,
             ).to(dtype=_dsrl_dtype)
@@ -214,7 +215,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 hidden_dim=self.config.dsrl_state_latent_dim,
             ).to(dtype=_dsrl_dtype)
             self.critic_image_encoder = LightweightImageEncoder64(
-                num_images=1,
+                self.config.dsrl_num_images,
                 latent_dim=self.config.dsrl_image_latent_dim,
                 image_size=64,
             ).to(dtype=_dsrl_dtype)
@@ -448,20 +449,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 self._noise_mode = "repeat_gaussian"
 
-            # self.logger.info(
-            #     "[DSRL] Noise mode: %s (count_update=%d)",
-            #     self._noise_mode,
-            #     count_update,
-            # )
-
             if self._noise_mode == "sac":
                 # DSRL train mode: use SAC policy to generate noise
+
+                # Prepare images list for sac_forward:
+                # - For 1 image: [main_image]
+                # - For 2 images: [main_image, extra_view_image (wrist)]
+                if self.config.dsrl_num_images == 1:
+                    dsrl_images = [to_process_obs["observation/image"]]
+                elif self.config.dsrl_num_images == 2:
+                    dsrl_images = [
+                        to_process_obs["observation/image"],
+                        to_process_obs["observation/extra_view_images"],
+                    ]
+                else:
+                    raise ValueError(f"Invalid dsrl_num_images: {self.config.dsrl_num_images}")
+                
                 # Step 1: SAC agent outputs noise
                 # No data augmentation during rollout, train=False
                 # Convert env_obs to the format expected by sac_forward
-                # env_obs has: main_images, wrist_images, states
-                # sac_forward expects: images (list), states
-                dsrl_obs = {"images": [to_process_obs["observation/image"]], "states": env_obs["states"]}
+                dsrl_obs = {"images": dsrl_images, "states": env_obs["states"]}
 
                 noise_actions, noise_logprob, _ = self.sac_forward(
                     dsrl_obs, train=False, mode=mode
@@ -1051,18 +1058,37 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Handle two obs formats:
         # Format 1 (internal): {"images": [...], "states": ...}
-        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
+        # Format 2 (env): {"main_images": ..., "extra_view_images": ..., "states": ...}
         if "images" not in obs:
             # Convert env format to internal format
             if "main_images" in obs:
-                obs = {"images": [obs["main_images"]], "states": obs["states"]}
+                if self.config.dsrl_num_images == 1:
+                    dsrl_images = [obs["main_images"]]
+                elif self.config.dsrl_num_images == 2:
+                    if "extra_view_images" not in obs:
+                        raise ValueError(
+                            f"dsrl_num_images={self.config.dsrl_num_images} but "
+                            f"'extra_view_images' not found in obs keys: {list(obs.keys())}. "
+                        )
+                    extra_img = obs["extra_view_images"]
+                    # extra_view_images may be [B, N, H, W, C] from replay buffer (5D)
+                    # Need to squeeze to [B, H, W, C] (4D) before passing to _preprocess_dsrl_images
+                    if extra_img.dim() == 5:
+                        extra_img = extra_img.squeeze(1)
+                    elif extra_img.dim() != 4:
+                        raise ValueError(
+                            f"extra_view_images has unexpected shape {extra_img.shape}, "
+                            f"expected 4D [B,H,W,C] or 5D [B,N,H,W,C]"
+                        )
+                    dsrl_images = [obs["main_images"], extra_img]
+                obs = {"images": dsrl_images, "states": obs["states"]}
             else:
                 raise ValueError(
                     f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
                 )
 
-        # Preprocess images: resize to 64x64, use only agentview camera
-        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
+        # Preprocess images: resize to 64x64, support multi-image input
+        # Returns [B, num_images, C, 64, 64] in [-1, 1] range (bfloat16)
         images = self._preprocess_dsrl_images(obs["images"], train=train)
         states = self._preprocess_states(obs["states"])
 
@@ -1127,18 +1153,37 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Handle two obs formats:
         # Format 1 (internal): {"images": [...], "states": ...}
-        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
+        # Format 2 (env): {"main_images": ..., "extra_view_images": ..., "states": ...}
         if "images" not in obs:
             # Convert env format to internal format
             if "main_images" in obs:
-                obs = {"images": [obs["main_images"]], "states": obs["states"]}
+                if self.config.dsrl_num_images == 1:
+                    dsrl_images = [obs["main_images"]]
+                elif self.config.dsrl_num_images == 2:
+                    if "extra_view_images" not in obs:
+                        raise ValueError(
+                            f"dsrl_num_images={self.config.dsrl_num_images} but "
+                            f"'extra_view_images' not found in obs keys: {list(obs.keys())}. "
+                        )
+                    extra_img = obs["extra_view_images"]
+                    # extra_view_images may be [B, N, H, W, C] from replay buffer (5D)
+                    # Need to squeeze to [B, H, W, C] (4D) before passing to _preprocess_dsrl_images
+                    if extra_img.dim() == 5:
+                        extra_img = extra_img.squeeze(1)
+                    elif extra_img.dim() != 4:
+                        raise ValueError(
+                            f"extra_view_images has unexpected shape {extra_img.shape}, "
+                            f"expected 4D [B,H,W,C] or 5D [B,N,H,W,C]"
+                        )
+                    dsrl_images = [obs["main_images"], extra_img]
+                obs = {"images": dsrl_images, "states": obs["states"]}
             else:
                 raise ValueError(
                     f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
                 )
 
-        # Preprocess images: resize to 64x64, use only agentview camera
-        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
+        # Preprocess images: resize to 64x64, support multi-image input
+        # Returns [B, num_images, C, 64, 64] in [-1, 1] range (bfloat16)
         images = self._preprocess_dsrl_images(obs["images"], train=train)
         states = self._preprocess_states(obs["states"])
 
@@ -1167,68 +1212,87 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return q_values
 
     def _preprocess_dsrl_images(self, images, train=False):
-        """Preprocess images for DSRL: resize to 64x64, use only agentview camera.
+        """Preprocess images for DSRL: resize to 64x64, support multi-image concatenation.
 
         Args:
-            images: List of tensors.
-                Can be [B, H, W, C] (NHWC) from environment or
-                [B, C, H, W] (NCHW) from processed data.
-                For Libero: images[0] is agentview, images[1] is wrist.
+            images: List of tensors or single tensor.
+                - For 2 images: [img1, img2] where img1=third-person, img2=wrist.
+                - Each image can be [B, H, W, C] (NHWC) from environment or
+                  [B, C, H, W] (NCHW) from processed data.
             train: Whether to use data augmentation (placeholder for now).
 
         Returns:
-            Tensor of shape [B, 1, C, 64, 64] - only agentview, resized, in [-1, 1].
+            Tensor of shape [B, num_images, C, 64, 64] - resized, in [-1, 1].
         """
         import torch.nn.functional as F
 
-        # Extract only agentview camera (first image in the list)
+        num_images = self.config.dsrl_num_images
+
+        # Handle different input formats
         if isinstance(images, list):
-            agentview_img = images[0]
+            if len(images) < num_images:
+                raise ValueError(
+                    f"Expected at least {num_images} images, but got {len(images)}"
+                )
+            # Take first num_images images (third-person + wrist)
+            selected_images = images[:num_images]
+        elif isinstance(images, torch.Tensor):
+            # Assume single image tensor, repeat for testing or use as-is
+            if num_images == 1:
+                selected_images = [images]
+            elif num_images == 2:
+                # Replicate if only one image provided (fallback)
+                selected_images = [images, images]
+            else:
+                raise ValueError(f"num_images={num_images} not supported for single image")
         else:
-            # Assume it's already a tensor
-            agentview_img = images
+            raise TypeError(f"images must be list or tensor, got {type(images)}")
 
-        # Detect and convert NHWC -> NCHW (environment outputs NHWC)
-        if agentview_img.shape[-1] == 3:
-            # NHWC format: [B, H, W, C] -> [B, C, H, W]
-            agentview_img = agentview_img.permute(0, 3, 1, 2)
+        processed_images = []
+        for agentview_img in selected_images:
+            # Detect and convert NHWC -> NCHW (environment outputs NHWC)
+            if agentview_img.shape[-1] == 3:
+                # NHWC format: [B, H, W, C] -> [B, C, H, W]
+                agentview_img = agentview_img.permute(0, 3, 1, 2)
 
-        B, C, H, W = agentview_img.shape
-        target_size = 64
+            B, C, H, W = agentview_img.shape
+            target_size = 64
 
-        # ===== UNIFIED VALUE RANGE HANDLING =====
-        # Convert to float32 and normalize to [0, 1] for PyTorch resize
-        if agentview_img.dtype == torch.uint8:
-            # [0, 255] -> [0, 1]
-            agentview_img = agentview_img.float() / 255.0
-        else:
-            # Check if in [-1, 1] range
-            if agentview_img.min() < 0:
-                # [-1, 1] -> [0, 1]
-                agentview_img = (agentview_img + 1.0) / 2.0
-            # else: already in [0, 1] range, assume correctly normalized
-        # ===========================================
+            # ===== UNIFIED VALUE RANGE HANDLING =====
+            # Convert to float32 and normalize to [0, 1] for PyTorch resize
+            if agentview_img.dtype == torch.uint8:
+                # [0, 255] -> [0, 1]
+                agentview_img = agentview_img.float() / 255.0
+            else:
+                # Check if in [-1, 1] range
+                if agentview_img.min() < 0:
+                    # [-1, 1] -> [0, 1]
+                    agentview_img = (agentview_img + 1.0) / 2.0
+                # else: already in [0, 1] range, assume correctly normalized
+            # ===========================================
 
-        # Clamp to ensure valid range
-        agentview_img = agentview_img.clamp(0.0, 1.0)
+            # Clamp to ensure valid range
+            agentview_img = agentview_img.clamp(0.0, 1.0)
 
-        # ===== GPU-ACCELERATED RESIZE (aligned with PIL behavior) =====
-        # PyTorch bilinear with align_corners=False approximates PIL's behavior
-        resized_img = F.interpolate(
-            agentview_img,
-            size=(target_size, target_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-        # =============================================================
+            # ===== GPU-ACCELERATED RESIZE (aligned with PIL behavior) =====
+            # PyTorch bilinear with align_corners=False approximates PIL's behavior
+            resized_img = F.interpolate(
+                agentview_img,
+                size=(target_size, target_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            # =============================================================
 
-        # Convert back to [-1, 1] range (to match PIL-based pipeline)
-        resized_img = resized_img * 2.0 - 1.0  # [0, 1] -> [-1, 1]
+            # Convert back to [-1, 1] range (to match PIL-based pipeline)
+            resized_img = resized_img * 2.0 - 1.0  # [0, 1] -> [-1, 1]
 
-        # Add num_images dimension: [B, C, 64, 64] -> [B, 1, C, 64, 64]
-        resized_img = resized_img.unsqueeze(1)
+            processed_images.append(resized_img)
 
-        return resized_img
+        # Stack images along dim 1: [B, num_images, C, 64, 64]
+        stacked_images = torch.stack(processed_images, dim=1)
+
+        return stacked_images
 
     def _preprocess_states(self, states):
         """
