@@ -130,6 +130,7 @@ env:
 
     max_steps_per_rollout_epoch: 160
     max_episode_steps: 160
+    rollout_state_dim: 7  # Reduce raw 19-dim state to 7-dim (tcp_pose+gripper) for replay buffer
 
     override_cfg:
       target_ee_pose: TARGET_EE_POSE # Replace with your target end-effector pose
@@ -188,7 +189,7 @@ actor:
       action_chunk: ${actor.model.num_action_chunks}
       
       use_dsrl: True
-      dsrl_state_dim: 19
+      dsrl_state_dim: 7
       dsrl_action_noise_dim: 32
       dsrl_action_magnitude: 2.5
       dsrl_num_q_heads: 10

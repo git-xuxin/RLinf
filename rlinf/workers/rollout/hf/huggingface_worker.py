@@ -91,6 +91,39 @@ class MultiStepRolloutWorker(Worker):
         self.version = 0
         self.finished_episodes = None
 
+        # rollout_state_dim: dimension to reduce env state to before storing in replay buffer.
+        # Real-world env: set to 7 to reduce [gripper+tcp_force+tcp_pose+tcp_torque+tcp_vel](19)
+        #                 to [tcp_pose+gripper](7) for DSRL.
+        self._rollout_state_dim = self.cfg.env.train.get("rollout_state_dim", 19)
+        if self._rollout_state_dim == 7:
+            # Real-world 19-dim -> 7-dim: extract tcp_pose(6) + gripper(1)
+            _TCP_POSE_START, _TCP_POSE_END = 4, 10
+            _GRIPPER_IDX = 0
+            self._STATE_REDUCE_INDICES = list(range(_TCP_POSE_START, _TCP_POSE_END)) + [
+                _GRIPPER_IDX
+            ]
+
+    def _reduce_state_in_env_output(self, env_output: dict[str, Any]) -> None:
+        """Reduce env state to rollout_state_dim in-place in env_output.
+
+        Operates on both env_output["obs"] and env_output["final_obs"].
+        Only active when rollout_state_dim < raw state dim (default 19).
+
+        Real-world state order: [gripper_pos(1), tcp_force(3), tcp_pose(6), tcp_torque(3), tcp_vel(6)]
+        rollout_state_dim=7 extracts: tcp_pose(6) + gripper(1).
+        """
+        if self._rollout_state_dim != 7:
+            return
+        for obs in [env_output.get("obs"), env_output.get("final_obs")]:
+            if obs is None:
+                continue
+            states = obs.get("states")
+            if states is None:
+                continue
+            if isinstance(states, torch.Tensor) and states.shape[-1] != self._rollout_state_dim:
+                obs["states"] = states[..., self._STATE_REDUCE_INDICES]
+                self.log_info(f"env_output_states: {obs['states'].shape}")
+
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
         with open_dict(rollout_model_config):
@@ -320,6 +353,7 @@ class MultiStepRolloutWorker(Worker):
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_env_output(input_channel)
+                self._reduce_state_in_env_output(env_output)
 
                 use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
                 if env_output["intervene_actions"] is not None and not use_dsrl:
@@ -375,6 +409,7 @@ class MultiStepRolloutWorker(Worker):
 
         for stage_id in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
+            self._reduce_state_in_env_output(env_output)
 
             use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
             if env_output["intervene_actions"] is not None and not use_dsrl:
