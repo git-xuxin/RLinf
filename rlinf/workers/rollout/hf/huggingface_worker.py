@@ -122,7 +122,6 @@ class MultiStepRolloutWorker(Worker):
                 continue
             if isinstance(states, torch.Tensor) and states.shape[-1] != self._rollout_state_dim:
                 obs["states"] = states[..., self._STATE_REDUCE_INDICES]
-                self.log_info(f"env_output_states: {obs['states'].shape}")
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)

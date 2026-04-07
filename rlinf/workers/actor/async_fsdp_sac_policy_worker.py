@@ -122,14 +122,11 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         if self.update_step == 0 and init_update_epoch is not None:
             update_epoch = init_update_epoch
 
-        for epoch_idx in range(update_epoch):
+        for _ in range(update_epoch):
             await asyncio.sleep(0)
             metrics_data = self.update_one_epoch()
             append_to_dict(metrics, metrics_data)
             self.update_step += 1
-
-            if epoch_idx % max(1, update_epoch // 20) == 0 or epoch_idx == update_epoch - 1:
-                self._logger.info(f"[Training] update_epoch progress: {epoch_idx + 1}/{update_epoch}")
 
         mean_metric_dict = self.process_train_metrics(metrics)
 

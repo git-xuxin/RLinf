@@ -448,11 +448,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 self._noise_mode = "repeat_gaussian"
 
-            self.logger.info(
-                "[DSRL] Noise mode: %s (count_update=%d)",
-                self._noise_mode,
-                count_update,
-            )
+            # self.logger.info(
+            #     "[DSRL] Noise mode: %s (count_update=%d)",
+            #     self._noise_mode,
+            #     count_update,
+            # )
 
             if self._noise_mode == "sac":
                 # DSRL train mode: use SAC policy to generate noise
@@ -461,7 +461,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 # Convert env_obs to the format expected by sac_forward
                 # env_obs has: main_images, wrist_images, states
                 # sac_forward expects: images (list), states
-                dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
+                dsrl_obs = {"images": [to_process_obs["observation/image"]], "states": env_obs["states"]}
 
                 noise_actions, noise_logprob, _ = self.sac_forward(
                     dsrl_obs, train=False, mode=mode
