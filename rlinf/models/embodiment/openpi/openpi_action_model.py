@@ -1099,7 +1099,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Extract features (using actor's independent encoder)
         image_features = self.actor_image_encoder(images)  # [B, 64]
-        state_features = self.actor_state_encoder(states)  # [B, 64]
+        # state_features = self.actor_state_encoder(states)  # [B, 64]
+        state_features = states  # [B, 7]
         features = torch.cat([state_features, image_features], dim=-1)  # [B, 128]
 
         # Sample from GaussianPolicy
@@ -1195,7 +1196,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Extract features (using critic's independent encoder)
         image_features = self.critic_image_encoder(images)
-        state_features = self.critic_state_encoder(states)
+        # state_features = self.critic_state_encoder(states)
+        state_features = states
 
         # Optionally detach encoder
         if detach_encoder:
