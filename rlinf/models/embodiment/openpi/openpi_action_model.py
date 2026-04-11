@@ -300,31 +300,82 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         Extract VLM hidden-state representations from images + language prompt.
 
         Mirrors the JAX implementation in dsrl_pi0/openpi/src/openpi/models/pi0.py:get_prefix_rep.
+        Uses the PyTorch VLM backbone (paligemma_with_expert) for inference.
 
         Args:
             request_data: Dict containing:
-                - "observation/image": [N, H, W, C] third-person view image (uint8)
-                - "observation/extra_view_images": [N, H, W, C] wrist view image
-                - "observation/state": [N, 7] raw state (tcp_pose + gripper)
+                - "observation/image": [N, H, W, C] third-person view image (uint8, 0-255)
+                - "observation/extra_view_images": [N, H, W, C] wrist view image (uint8, 0-255)
+                - "observation/state": [N, 7] raw state (tcp_pose + gripper) - used for VLM input
                 - "prompt": task description string or list of strings
 
         Returns:
-            img_rep_pi0: [N, seq_len, 2048] tensor with VLM hidden-state representations.
-            Currently uses dummy zeros to simulate VLM backbone output.
+            img_rep_pi0: [N, seq_len, hidden_dim] tensor with VLM hidden-state representations.
+            The output tensor will be on the same device as the input tensors in request_data.
+            hidden_dim is typically 2048 (gemma_2b) or 1024 (gemma_300m) depending on config.
         """
-        # Infer batch size from image
-        batch_size = 1
-        if "observation/image" in request_data:
-            img = request_data["observation/image"]
-            if isinstance(img, np.ndarray):
-                batch_size = img.shape[0]
-            elif isinstance(img, torch.Tensor):
-                batch_size = img.shape[0]
+        # Detect input device from request_data to ensure output is on the same device
+        # This is important for huggingface_worker.py where raw_states may be on CPU
+        # while the model is on GPU
+        input_device = None
+        for key in ["observation/image", "observation/extra_view_images", "observation/state"]:
+            if key in request_data and torch.is_tensor(request_data[key]):
+                input_device = request_data[key].device
+                break
 
-        # Dummy VLM representation: [batch_size, seq_len, 2048]
-        # seq_len=10 is arbitrary for prefix representation context
-        img_rep_pi0 = torch.zeros(batch_size, 10, 2048, dtype=torch.float32)
-        return img_rep_pi0
+        # Step 1: Use input_transform to preprocess (resize images, tokenize prompt, etc.)
+        # input_transform handles: image transpose, resize, tokenization, etc.
+        processed_inputs = self.input_transform(request_data, transpose=False)
+
+        # Step 2: Move processed inputs to the same device as the model for inference
+        model_device = next(self.parameters()).device
+        target_device = input_device if input_device is not None else model_device
+        for key in processed_inputs:
+            if torch.is_tensor(processed_inputs[key]):
+                processed_inputs[key] = processed_inputs[key].to(model_device)
+
+        # Step 3: Build Observation object from processed inputs
+        observation = _model.Observation.from_dict(processed_inputs)
+
+        # Step 4: Preprocess observation (extract images, masks, tokens, state)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        # Move to model device
+        images = [img.to(model_device) for img in images]
+        img_masks = [img_mask.to(model_device) for img_mask in img_masks]
+        state = state.to(model_device)
+
+        # Step 5: Embed prefix (images + language tokens)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+
+        # Step 6: Prepare attention masks
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        # Step 7: Forward through PaliGemma to get hidden states
+        # Use eager attention to avoid FlashAttention issues in inference
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+
+        (prefix_output, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+        )
+
+        # Move output to the same device as input (for huggingface_worker compatibility)
+        # This ensures torch.cat([raw_states, img_rep_pi0_last]) works when raw_states is on CPU
+        prefix_output = prefix_output.to(target_device)
+
+        # prefix_output shape: [batch_size, seq_len, hidden_dim]
+        # hidden_dim is 2048 for gemma_2b or 1024 for gemma_300m
+        return prefix_output
 
     def output_transform(self, outputs):
         # split & transform
