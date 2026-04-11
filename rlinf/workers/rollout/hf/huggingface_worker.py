@@ -32,6 +32,7 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
+from rlinf.utils.image_tools import resize_with_pad
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.utils.utils import get_model_weights_id
@@ -122,6 +123,44 @@ class MultiStepRolloutWorker(Worker):
                 continue
             if isinstance(states, torch.Tensor) and states.shape[-1] != self._rollout_state_dim:
                 obs["states"] = states[..., self._STATE_REDUCE_INDICES]
+
+    def _add_vlm_rep_state_to_obs(self, obs: dict[str, Any]) -> None:
+        """
+        Compute and inject vlm_rep_state into obs dict in-place.
+
+        Args:
+            obs: env obs containing:
+                - main_images: [N_ENV, H, W, C] third-person view image
+                - extra_view_images: [N_ENV, N_IMG, H, W, C] wrist view image
+                - states: [N_ENV, 7] raw state (tcp_pose + gripper)
+                - task_descriptions: list of task description strings
+
+        Output:
+            obs["vlm_rep_state"]: [N_ENV, 2055] = concat([N_ENV, 7] + [N_ENV, 2048])
+                - 7-dim raw state + 2048-dim VLM representation
+        """
+        # Extract inputs from obs
+        main_images = obs["main_images"]  # [N_ENV, H, W, C]
+        extra_images = obs["extra_view_images"][:, 0]  # [N_ENV, N_IMG, H, W, C] -> [N_ENV, H, W, C]
+        raw_states = obs["states"]  # [N_ENV, 7]
+        task_descriptions = obs["task_descriptions"]
+
+        # Prepare request_data for VLM backbone (resize images to 224x224)
+        request_data = {
+            "observation/image": resize_with_pad(main_images, 224, 224),  # [N_ENV, 224, 224, C]
+            "observation/extra_view_images": resize_with_pad(extra_images, 224, 224),  # [N_ENV, 224, 224, C]
+            "observation/state": raw_states,  # [N_ENV, 7]
+            "prompt": task_descriptions,
+        }
+
+        # Call VLM backbone to get representations (currently dummy zeros)
+        # Returns: [N_ENV, seq_len, 2048]
+        img_rep_pi0 = self.hf_model.get_prefix_rep(request_data)
+        img_rep_pi0_last = img_rep_pi0[:, -1, :]  # [N_ENV, 2048] - take last token
+
+        # Concatenate: [N_ENV, 7] + [N_ENV, 2048] = [N_ENV, 2055]
+        vlm_rep_state = torch.cat([raw_states, img_rep_pi0_last], dim=-1)
+        obs["vlm_rep_state"] = vlm_rep_state
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -360,6 +399,12 @@ class MultiStepRolloutWorker(Worker):
                         env_output["intervene_actions"],
                         env_output["intervene_flags"],
                     )
+                
+                use_vlm_rep_state = self.cfg.actor.model.get("openpi", {}).get("use_vlm_rep_state", False)
+                if use_vlm_rep_state:
+                    self._add_vlm_rep_state_to_obs(env_output["obs"])
+                    if env_output["final_obs"] is not None:
+                        self._add_vlm_rep_state_to_obs(env_output["final_obs"])
 
                 dones, rewards = self.get_dones_and_rewards(env_output)
 
@@ -415,6 +460,12 @@ class MultiStepRolloutWorker(Worker):
                 self.rollout_results[stage_id].update_last_actions(
                     env_output["intervene_actions"], env_output["intervene_flags"]
                 )
+
+            use_vlm_rep_state = self.cfg.actor.model.get("openpi", {}).get("use_vlm_rep_state", False)
+            if use_vlm_rep_state:
+                self._add_vlm_rep_state_to_obs(env_output["obs"])
+                if env_output["final_obs"] is not None:
+                    self._add_vlm_rep_state_to_obs(env_output["final_obs"])
 
             dones, rewards = self.get_dones_and_rewards(env_output)
 

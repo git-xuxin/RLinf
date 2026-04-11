@@ -79,6 +79,8 @@ class OpenPi0Config(Pi0Config):
     dsrl_hidden_dims: tuple = field(
         default_factory=lambda: (128, 128, 128)
     )  # Hidden dims for Q-head and GaussianPolicy
+    # ===== VLM representation for state (dsrl_pi0-style) =====
+    use_vlm_rep_state: bool = False  # When True: bypass CompactStateEncoder, concat 7dim state + 2048dim VLM rep directly as 2055dim state
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -193,7 +195,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
             dsrl_input_dim = (
                 self.config.dsrl_state_latent_dim + self.config.dsrl_image_latent_dim
-            )  # e.g. 64 + 64 = 128
+            )  # e.g. 64 + 64 = 128 or 2055 + 64 = 2119
 
             _mag = self.config.dsrl_action_magnitude
             self.dsrl_action_noise_net = GaussianPolicy(
@@ -292,6 +294,37 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             inputs["tokenized_prompt"] = obs["tokenized_prompt"]
             inputs["tokenized_prompt_mask"] = obs["tokenized_prompt_mask"]
         return inputs
+
+    def get_prefix_rep(self, request_data: dict) -> torch.Tensor:
+        """
+        Extract VLM hidden-state representations from images + language prompt.
+
+        Mirrors the JAX implementation in dsrl_pi0/openpi/src/openpi/models/pi0.py:get_prefix_rep.
+
+        Args:
+            request_data: Dict containing:
+                - "observation/image": [N, H, W, C] third-person view image (uint8)
+                - "observation/extra_view_images": [N, H, W, C] wrist view image
+                - "observation/state": [N, 7] raw state (tcp_pose + gripper)
+                - "prompt": task description string or list of strings
+
+        Returns:
+            img_rep_pi0: [N, seq_len, 2048] tensor with VLM hidden-state representations.
+            Currently uses dummy zeros to simulate VLM backbone output.
+        """
+        # Infer batch size from image
+        batch_size = 1
+        if "observation/image" in request_data:
+            img = request_data["observation/image"]
+            if isinstance(img, np.ndarray):
+                batch_size = img.shape[0]
+            elif isinstance(img, torch.Tensor):
+                batch_size = img.shape[0]
+
+        # Dummy VLM representation: [batch_size, seq_len, 2048]
+        # seq_len=10 is arbitrary for prefix representation context
+        img_rep_pi0 = torch.zeros(batch_size, 10, 2048, dtype=torch.float32)
+        return img_rep_pi0
 
     def output_transform(self, outputs):
         # split & transform
@@ -401,6 +434,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 processed_obs["observation/extra_view_images"] = extra
 
+        # vlm_rep_state: preserve vlm_rep_state in processed_obs for SAC training
+        # When use_vlm_rep_state=True, this 2055-dim state will bypass CompactStateEncoder
+        if self.config.use_vlm_rep_state and "vlm_rep_state" in env_obs:
+            processed_obs["vlm_rep_state"] = env_obs["vlm_rep_state"]  # [N, 2055]
+
         # store used keys
         return processed_obs
 
@@ -468,7 +506,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 # Step 1: SAC agent outputs noise
                 # No data augmentation during rollout, train=False
                 # Convert env_obs to the format expected by sac_forward
-                dsrl_obs = {"images": dsrl_images, "states": env_obs["states"]}
+                if self.config.use_vlm_rep_state and "vlm_rep_state" in env_obs:
+                    dsrl_obs = {
+                        "images": dsrl_images,
+                        "states": env_obs["states"],
+                        "vlm_rep_state": env_obs["vlm_rep_state"],
+                    }
+                else:
+                    dsrl_obs = {"images": dsrl_images, "states": env_obs["states"]}
 
                 noise_actions, noise_logprob, _ = self.sac_forward(
                     dsrl_obs, train=False, mode=mode
@@ -1081,7 +1126,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                             f"expected 4D [B,H,W,C] or 5D [B,N,H,W,C]"
                         )
                     dsrl_images = [obs["main_images"], extra_img]
-                obs = {"images": dsrl_images, "states": obs["states"]}
+
+                # Preserve vlm_rep_state for use_vlm_rep_state mode
+                if self.config.use_vlm_rep_state:
+                    obs = {"images": dsrl_images, "states": obs["states"], "vlm_rep_state": obs.get("vlm_rep_state")}
+                else:
+                    obs = {"images": dsrl_images, "states": obs["states"]}
             else:
                 raise ValueError(
                     f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
@@ -1090,7 +1140,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # Preprocess images: resize to 64x64, support multi-image input
         # Returns [B, num_images, C, 64, 64] in [-1, 1] range (bfloat16)
         images = self._preprocess_dsrl_images(obs["images"], train=train)
-        states = self._preprocess_states(obs["states"])
+
+        # Handle vlm_rep_state: use directly if available, otherwise preprocess raw state
+        if self.config.use_vlm_rep_state:
+            states = obs.get("vlm_rep_state")  # [B, 2055] - bypass state encoder
+        else:
+            states = self._preprocess_states(obs.get("states"))  # [B, state_dim] -> encoded to 64-dim
 
         # Move to the same device as actor encoders, convert to bfloat16
         device = next(self.actor_image_encoder.parameters()).device
@@ -1099,8 +1154,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Extract features (using actor's independent encoder)
         image_features = self.actor_image_encoder(images)  # [B, 64]
-        state_features = self.actor_state_encoder(states)  # [B, 64]
-        features = torch.cat([state_features, image_features], dim=-1)  # [B, 128]
+        if self.config.use_vlm_rep_state:
+            state_features = states  # [B, 2055] - directly use VLM rep
+        else:
+            state_features = self.actor_state_encoder(states)  # [B, 64]
+        features = torch.cat([state_features, image_features], dim=-1)  # [B, 128] or [B, 2119]
 
         # Sample from GaussianPolicy
         mode = kwargs.get("mode", "train")
@@ -1167,7 +1225,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         )
                     extra_img = obs["extra_view_images"]
                     # extra_view_images may be [B, N, H, W, C] from replay buffer (5D)
-                    # Need to squeeze to [B, H, W, C] (4D) before passing to _preprocess_dsrl_images
                     if extra_img.dim() == 5:
                         extra_img = extra_img.squeeze(1)
                     elif extra_img.dim() != 4:
@@ -1176,7 +1233,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                             f"expected 4D [B,H,W,C] or 5D [B,N,H,W,C]"
                         )
                     dsrl_images = [obs["main_images"], extra_img]
-                obs = {"images": dsrl_images, "states": obs["states"]}
+
+                # Preserve vlm_rep_state for use_vlm_rep_state mode
+                if self.config.use_vlm_rep_state:
+                    obs = {"images": dsrl_images, "states": obs["states"], "vlm_rep_state": obs.get("vlm_rep_state")}
+                else:
+                    obs = {"images": dsrl_images, "states": obs["states"]}
             else:
                 raise ValueError(
                     f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
@@ -1185,7 +1247,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # Preprocess images: resize to 64x64, support multi-image input
         # Returns [B, num_images, C, 64, 64] in [-1, 1] range (bfloat16)
         images = self._preprocess_dsrl_images(obs["images"], train=train)
-        states = self._preprocess_states(obs["states"])
+
+        # Handle vlm_rep_state: use directly if available, otherwise preprocess raw state
+        if self.config.use_vlm_rep_state:
+            states = obs.get("vlm_rep_state")  # [B, 2055] - bypass state encoder
+        else:
+            states = self._preprocess_states(obs.get("states"))  # [B, state_dim] -> encoded to 64-dim
 
         # Move to the same device as critic encoders, convert to bfloat16
         device = next(self.critic_image_encoder.parameters()).device
@@ -1193,9 +1260,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         states = states.to(device=device, dtype=torch.bfloat16)
         actions = actions.to(device=device, dtype=torch.bfloat16)
 
-        # Extract features (using critic's independent encoder)
-        image_features = self.critic_image_encoder(images)
-        state_features = self.critic_state_encoder(states)
+        # Extract features
+        image_features = self.critic_image_encoder(images)  # [B, 64]
+        if self.config.use_vlm_rep_state:
+            state_features = states  # [B, 2055] - directly use VLM rep
+        else:
+            state_features = self.critic_state_encoder(states)  # [B, 64]
 
         # Optionally detach encoder
         if detach_encoder:

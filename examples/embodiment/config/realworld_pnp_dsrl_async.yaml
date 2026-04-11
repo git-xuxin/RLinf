@@ -54,7 +54,7 @@ runner:
   ckpt_path: "/path/to/full_weights.pt"  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
-  update_epoch: 400
+  update_epoch: 600
   init_update_epoch: 2000  # Number of update epochs for the first training step. Falls back to update_epoch if not set.
   group_size: 1
   agg_q: min # or mean
@@ -75,10 +75,10 @@ algorithm:
 
   entropy_tuning:
     alpha_type: softplus # choose from ["softplus", "exp", "fixed_alpha"], set to "softplus" or "exp" to enable automatic entropy tuning
-    initial_alpha: 0.1  # Initial temperature value
+    initial_alpha: 1.0  # Initial temperature value
     target_entropy: 0.0
     optim:
-      lr: 5.0e-4  # Learning rate for temperature parameter
+      lr: 3.0e-4  # Learning rate for temperature parameter
       lr_scheduler: torch_constant
       clip_grad: 10.0
   
@@ -189,17 +189,18 @@ actor:
       action_chunk: ${actor.model.num_action_chunks}
       
       use_dsrl: True
-      dsrl_state_dim: 7
+      use_vlm_rep_state: True
+      dsrl_state_dim: 7  # Raw state dimension: tcp_pose(6) + gripper(1)
       dsrl_action_noise_dim: 32
       dsrl_action_magnitude: 2.5
       dsrl_num_q_heads: 10
       dsrl_num_images: 2
       dsrl_image_latent_dim: 64
-      dsrl_state_latent_dim: 64
-      dsrl_hidden_dims: [128, 128, 128]
+      dsrl_state_latent_dim: 2055  # 7 (raw state) + 2048 (vlm_rep); effective state dim for SAC
+      dsrl_hidden_dims: [1024, 1024, 1024]
 
   optim:
-    lr: 5.0e-5
+    lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.96
     adam_eps: 1.0e-08
