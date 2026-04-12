@@ -32,7 +32,7 @@ cluster:
       hardware:
         type: Franka
         configs:
-          - robot_ip: ROBOT_IP # Replace with your robot's IP address
+          - robot_ip: 172.16.0.2 # Replace with your robot's IP address
             node_rank: 1
 
 runner:
@@ -51,7 +51,7 @@ runner:
   save_interval: -1
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: "/path/to/full_weights.pt"  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+  ckpt_path: "/home/xuxin/workspace/dsrl/model/pi0_base_sft/pi0_base_full_weights_1800.pt"  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   update_epoch: 600
@@ -133,8 +133,8 @@ env:
     rollout_state_dim: 7  # Reduce raw 19-dim state to 7-dim (tcp_pose+gripper) for replay buffer
 
     override_cfg:
-      target_ee_pose: TARGET_EE_POSE # Replace with your target end-effector pose
-      camera_serials: ["CAMERA_SERIAL1", "CAMERA_SERIAL2"]
+      target_ee_pose: [0.5644504, 0.02972274, 0.03116764, 3.09281972, 0.01023041, -0.01136223] # Replace with your target end-effector pose
+      camera_serials: ["213622078826", "233622071437"]
       use_dense_reward: False
       is_dummy: false
       max_num_steps: 160
@@ -157,7 +157,7 @@ rollout:
   sync_weight_nccl_max_ctas: 32 # Max CTAs (Compute Thread Array, the compute resource of GPUs) for sync weight communication. Higher values consume more GPU resources, and thus sync weight is faster but could affect rollout speed in async mode. Positive integer 1 to 32. Default 32.
 
   model:
-    model_path: "/path/to/model"
+    model_path: "/home/xuxin/workspace/dsrl/model/pi0_base_pytorch"
     precision: ${actor.model.precision}
   
   enable_torch_compile: False
@@ -173,7 +173,7 @@ actor:
   enable_offload: False
 
   model:
-    model_path: "/path/to/model"
+    model_path: "/home/xuxin/workspace/dsrl/model/pi0_base_pytorch"
     num_action_chunks: 10
     state_dim: 19
     action_dim: 7
