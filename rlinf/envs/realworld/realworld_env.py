@@ -55,6 +55,10 @@ class RealWorldEnv(gym.Env):
         self.group_size = cfg.group_size
         self.main_image_key = cfg.main_image_key
 
+        self.use_rel_reward = getattr(cfg, "use_rel_reward", False)
+        self.use_step_penalty = getattr(cfg, "use_step_penalty", False)
+        self.reward_coef = getattr(cfg, "reward_coef", 1.0)
+
         self._init_env()
 
         self._is_start = True
@@ -240,7 +244,7 @@ class RealWorldEnv(gym.Env):
 
         obs = self._wrap_obs(raw_obs)
         step_reward = self._calc_step_reward(_reward)
-        success_current_step = np.isclose(step_reward, 1.0)
+        success_current_step = np.isclose(_reward, 1.0)
         intervene_flag = np.zeros(self.num_envs, dtype=bool)
         if "intervene_action" in infos:
             for env_id in range(self.num_envs):
@@ -367,8 +371,26 @@ class RealWorldEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return obs, infos
 
-    def _calc_step_reward(self, reward: np.ndarray):
-        return reward.astype(np.float32)
+    def _calc_step_reward(self, reward):
+        """Compute reward with optional reward_coef scaling, step penalty, and relative reward.
+
+        Args:
+            reward: Raw reward array from the underlying FrankaEnv, typically 0 or 1
+                (or dense reward when use_dense_reward=True).
+
+        Returns:
+            Reward array of shape (num_envs,) with reward_coef scaling and/or step penalty
+            applied, and optionally converted to relative rewards.
+        """
+        step_penalty = -1 if self.use_step_penalty else 0
+        reward = reward * self.reward_coef + step_penalty
+
+        if self.use_rel_reward:
+            reward_diff = reward - self.prev_step_reward
+            self.prev_step_reward = reward
+            return reward_diff.astype(np.float32)
+        else:
+            return np.full(self.num_envs, reward, dtype=np.float32)
 
     def _get_random_reset_state_ids(self, num_reset_states):
         reset_state_ids = self._generator.integers(
