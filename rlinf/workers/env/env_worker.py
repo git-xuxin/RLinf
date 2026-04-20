@@ -939,7 +939,8 @@ class EnvWorker(Worker):
 
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
-                    if env_output.intervene_actions is not None:
+                    use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+                    if env_output.intervene_actions is not None and not use_dsrl:
                         self.rollout_results[stage_id].update_last_actions(
                             env_output.intervene_actions,
                             env_output.intervene_flags,
@@ -1010,7 +1011,8 @@ class EnvWorker(Worker):
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
-                if env_output.intervene_actions is not None:
+                use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+                if env_output.intervene_actions is not None and not use_dsrl:
                     self.rollout_results[stage_id].update_last_actions(
                         env_output.intervene_actions,
                         env_output.intervene_flags,

@@ -245,11 +245,19 @@ class RealWorldEnv(gym.Env):
         obs = self._wrap_obs(raw_obs)
         step_reward = self._calc_step_reward(_reward)
         success_current_step = np.isclose(_reward, 1.0)
+        intervene_action = None
         intervene_flag = np.zeros(self.num_envs, dtype=bool)
         if "intervene_action" in infos:
             for env_id in range(self.num_envs):
                 if infos["intervene_action"][env_id] is not None:
                     intervene_flag[env_id] = True
+            intervene_action = np.zeros_like(actions)
+            for env_id in range(self.num_envs):
+                env_intervene_action = infos["intervene_action"][env_id]
+                if env_intervene_action is not None:
+                    intervene_action[env_id] = env_intervene_action.copy()
+            infos["intervene_action"] = to_tensor(intervene_action)
+            infos["intervene_flag"] = to_tensor(intervene_flag)
 
         infos = self._record_metrics(
             step_reward,
@@ -261,15 +269,6 @@ class RealWorldEnv(gym.Env):
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
-
-        intervene_action = np.zeros_like(actions)
-        if "intervene_action" in infos:
-            for env_id in range(self.num_envs):
-                env_intervene_action = infos["intervene_action"][env_id]
-                if env_intervene_action is not None:
-                    intervene_action[env_id] = env_intervene_action.copy()
-        infos["intervene_action"] = to_tensor(intervene_action)
-        infos["intervene_flag"] = to_tensor(intervene_flag)
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
