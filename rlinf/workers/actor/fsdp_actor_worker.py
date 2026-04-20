@@ -1034,7 +1034,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
-            model.load_state_dict(model_dict)
+            use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+            model.load_state_dict(model_dict, strict=not use_dsrl)
 
         return model
 

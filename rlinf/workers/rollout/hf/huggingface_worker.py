@@ -97,7 +97,8 @@ class MultiStepRolloutWorker(Worker):
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
-            self.hf_model.load_state_dict(model_dict)
+            use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+            self.hf_model.load_state_dict(model_dict, strict=not use_dsrl)
 
         if self.cfg.rollout.get("expert_model", None):
             expert_model_config = copy.deepcopy(self.cfg.actor.model)
