@@ -254,9 +254,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         storing back to bf16 each step rounds away the update. The shadow
         keeps the accumulated EMA state in float32 (ULP ~3.6e-8) across
         steps, preventing precision loss.
+
+        When train_expert_only=True, only the DSRL head (q_head) needs EMA
+        updates; VLM and projection layers are frozen and do not need shadows.
         """
+        train_expert_only = self.cfg.actor.model.get("openpi", {}).get(
+            "train_expert_only", False
+        )
         self._target_shadow_f32 = {}
         for name, param in self.target_model.named_parameters():
+            if train_expert_only and self.use_dsrl:
+                # Only q_head parameters need EMA updates and shadow buffers.
+                if "q_head" not in name:
+                    continue
             self._target_shadow_f32[name] = param.data.float().clone()
 
     def soft_update_target_model(self, tau: Optional[float] = None):
@@ -296,12 +306,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     self.target_model.named_parameters(),
                 ):
                     assert name1 == name2
+                    # When train_expert_only=True, only q_head has a shadow
+                    # (other params are frozen and skipped in _init_target_shadow).
+                    if name1 not in self._target_shadow_f32:
+                        continue
+                    shadow = self._target_shadow_f32[name1]
                     if "q_head" not in name1 and self.target_update_type != "all":
-                        shadow = self._target_shadow_f32[name1]
                         shadow.copy_(online_param.data.float())
                         target_param.data.copy_(shadow.to(target_param.data.dtype))
                     else:
-                        shadow = self._target_shadow_f32[name1]
                         shadow.mul_(1.0 - tau).add_(
                             online_param.data.float(), alpha=tau
                         )
