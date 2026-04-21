@@ -84,6 +84,7 @@ class MultiStepRolloutWorker(Worker):
             // cfg.actor.model.num_action_chunks
         )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
+        self.count_update = 0
         self.version = 0
         self.finished_episodes = None
 
@@ -274,6 +275,8 @@ class MultiStepRolloutWorker(Worker):
             SupportedModel.MLP_POLICY,
         ]:
             kwargs["return_obs"] = not hasattr(self.hf_model, "q_head")
+        
+        kwargs["count_update"] = self.count_update
 
         only_save_expert = self.cfg.algorithm.get("dagger", {}).get(
             "only_save_expert", True
@@ -386,6 +389,7 @@ class MultiStepRolloutWorker(Worker):
             self.hf_model.load_state_dict(cpu_buffer, strict=True)
             del cpu_buffer
 
+        self.count_update += 1
         gc.collect()
         self.torch_platform.empty_cache()
 

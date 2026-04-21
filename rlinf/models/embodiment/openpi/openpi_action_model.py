@@ -537,12 +537,33 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if is_dsrl_active:
             # DSRL mode (both train and eval)
 
-            # Step 1: SAC agent outputs noise
-            dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
+            # Step 1: Determine noise mode based on training stage
+            count_update = kwargs.pop("count_update", 0)
+            if count_update <= 1:
+                # Actor Worker hasn't synced trained weights with Rollout Worker yet.
+                # Use repeat-gaussian noise: sample one Gaussian vector (dsrl_action_noise_dim)
+                # and repeat it across action_horizon, so the flow model only denoises a
+                # low-dim signal instead of the full high-dim action.
+                bsize = observation.state.shape[0]
+                device = observation.state.device
+                actions_shape_single = (bsize, 1, self.config.dsrl_action_noise_dim)
+                noise_actions_single = self.sample_noise(actions_shape_single, device)
+                noise_actions = noise_actions_single.repeat(
+                    1, self.config.action_horizon, 1
+                ).to(dtype=torch.bfloat16)  # [1, 10, 32]
 
-            noise_actions, noise_logprob, _ = self.sac_forward(
-                dsrl_obs, train=False, mode=mode
-            )
+                prev_logprobs = torch.zeros(bsize, dtype=torch.float32, device=device)
+                forward_action = noise_actions
+            else:
+                # Actor has synced trained weights. Use SAC policy to produce noise.
+                dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
+
+                noise_actions, noise_logprob, _ = self.sac_forward(
+                    dsrl_obs, train=False, mode=mode
+                )
+
+                prev_logprobs = noise_logprob  # SAC noise logprob
+                forward_action = noise_actions  # Used for SAC training
 
             # Step 2: Use noise to sample actual actions from diffusion model
             outputs = self.sample_actions(
@@ -559,9 +580,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
             # Return actual actions to environment, but forward_inputs stores noise.
             actions = real_actions
-            prev_logprobs = noise_logprob  # SAC noise logprob
             prev_values = outputs.get("prev_values")
-            forward_action = noise_actions  # Used for SAC training
 
         else:
             # Non-DSRL or eval mode
