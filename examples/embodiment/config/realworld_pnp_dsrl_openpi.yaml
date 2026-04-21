@@ -53,7 +53,8 @@ runner:
   ckpt_path: "/path/to/ckpt.pt"
 
 algorithm:
-  update_epoch: 32
+  init_update_epoch: 2000
+  update_epoch: 600
   group_size: 1
   agg_q: min
   actor_agg_q: mean

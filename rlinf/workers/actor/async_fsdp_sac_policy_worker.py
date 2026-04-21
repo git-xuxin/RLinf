@@ -117,6 +117,12 @@ class AsyncEmbodiedSACFSDPPolicy(EmbodiedSACFSDPPolicy):
         metrics = {}
 
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        init_update_epoch = self.cfg.algorithm.get("init_update_epoch", None)
+
+        if self.update_step == 0 and init_update_epoch is not None:
+            self.logger.info(f"Initial update epoch: {init_update_epoch}")
+            update_epoch = init_update_epoch
+
         for _ in range(update_epoch):
             await asyncio.sleep(0)
             metrics_data = self.update_one_epoch()
