@@ -277,7 +277,7 @@ class GaussianPolicy(nn.Module):
                 action = y_t * scale_factor + shift
                 # Subtract log(scale_factor) from log_prob
                 log_prob -= torch.sum(
-                    torch.log(torch.abs(scale_factor) * torch.ones_like(y_t)), dim=-1
+                    torch.log(abs(scale_factor) * torch.ones_like(y_t)), dim=-1
                 )
             else:
                 action = y_t

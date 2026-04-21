@@ -70,6 +70,7 @@ class OpenPi0Config(Pi0Config):
     use_dsrl: bool = False  # Enable DSRL algorithm
     dsrl_state_dim: int = 8  # Raw state dimension for DSRL encoders
     dsrl_action_noise_dim: int = 32  # Noise dimension output by GaussianPolicy
+    dsrl_action_magnitude: float = 1.0  # Tanh output scale [-mag, mag], 1.0 for sim, 2.5 for real-world
     dsrl_num_q_heads: int = 10  # Number of Q-networks
     dsrl_agg_q: str = "mean"  # Q aggregation method: 'mean' | 'min'
     dsrl_image_latent_dim: int = 64  # Latent dim for lightweight image encoder
@@ -194,12 +195,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 self.config.dsrl_state_latent_dim + self.config.dsrl_image_latent_dim
             )  # e.g. 64 + 64 = 128
 
+            _mag = self.config.dsrl_action_magnitude
             self.dsrl_action_noise_net = GaussianPolicy(
                 input_dim=dsrl_input_dim,
                 output_dim=self.config.dsrl_action_noise_dim,
                 hidden_dims=self.config.dsrl_hidden_dims,
-                low=None,
-                high=None,
+                low=-_mag,
+                high=_mag,
                 action_horizon=self.config.action_horizon,
             ).to(dtype=_dsrl_dtype)
 
