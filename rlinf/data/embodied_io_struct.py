@@ -613,12 +613,35 @@ class EmbodiedRolloutResult:
                     )
                 last_fi.pop("model_action", None)
 
-    def append_transitions(self, curr_obs=None, next_obs=None):
+    def append_transitions(
+        self,
+        curr_obs: dict[str, Any] | None = None,
+        next_obs: dict[str, Any] | None = None,
+        extra_curr_obs: dict[str, Any] | None = None,
+        extra_next_obs: dict[str, Any] | None = None,
+    ):
+        """Append curr_obs/next_obs transitions.
+
+        Args:
+            curr_obs: Current observation dict from env output.
+            next_obs: Next observation dict (from env output or final_obs).
+            extra_curr_obs: Optional extra fields to inject into curr_obs (e.g.
+                vlm_rep_state computed by the rollout model and stored in
+                rollout_result.forward_inputs).
+            extra_next_obs: Optional extra fields to inject into next_obs.
+        """
         assert curr_obs is not None and next_obs is not None
+        # Shallow-copy to avoid mutating shared state.
+        curr_obs = dict(curr_obs)
+        next_obs = dict(next_obs)
         if "task_descriptions" in curr_obs:
             curr_obs.pop("task_descriptions")
         if "task_descriptions" in next_obs:
             next_obs.pop("task_descriptions")
+        if extra_curr_obs:
+            curr_obs.update(extra_curr_obs)
+        if extra_next_obs:
+            next_obs.update(extra_next_obs)
         self.curr_obs.append(curr_obs)
         self.next_obs.append(next_obs)
 

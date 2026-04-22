@@ -170,14 +170,15 @@ actor:
       action_chunk: ${actor.model.num_action_chunks}
 
       use_dsrl: True
+      use_vlm_rep_state: True
       dsrl_state_dim: 19
       dsrl_action_noise_dim: 32
       dsrl_action_magnitude: 2.5
       dsrl_num_q_heads: 10
       dsrl_num_images: 2
       dsrl_image_latent_dim: 64
-      dsrl_state_latent_dim: 64
-      dsrl_hidden_dims: [128, 128, 128]
+      dsrl_state_latent_dim: 2067  # 19 (raw state) + 2048 (vlm_rep); effective state dim for SAC
+      dsrl_hidden_dims: [1024, 1024, 1024]
       noise_method: "reinflow"
 
   optim:

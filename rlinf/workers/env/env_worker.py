@@ -1002,8 +1002,21 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
+                        extra_curr_obs = {}
+                        extra_next_obs = {}
+                        if self.cfg.actor.model.get("openpi", {}).get("use_vlm_rep_state", False):
+                            vlm_rep_state = rollout_result.forward_inputs.get("observation/state", None)  # already replaced by vlm_rep_state in openpi_action_model
+                            if vlm_rep_state is not None:
+                                extra_curr_obs["states"] = vlm_rep_state
+                                extra_next_obs["states"] = vlm_rep_state
+                            else:
+                                raise ValueError(
+                                    "vlm_rep_state (observation/state) is not found in rollout_result.forward_inputs"
+                                )
                         self.rollout_results[stage_id].append_transitions(
-                            curr_obs, next_obs
+                            curr_obs, next_obs,
+                            extra_curr_obs=extra_curr_obs or None,
+                            extra_next_obs=extra_next_obs or None,
                         )
 
                     env_outputs[stage_id] = env_output

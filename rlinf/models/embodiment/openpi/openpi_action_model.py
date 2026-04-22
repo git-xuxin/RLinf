@@ -68,6 +68,7 @@ class OpenPi0Config(Pi0Config):
 
     # ===== DSRL-specific parameters =====
     use_dsrl: bool = False  # Enable DSRL algorithm
+    use_vlm_rep_state: bool = False  # When True: bypass CompactStateEncoder, concat 19dim raw state + 2048dim VLM rep directly as 2067dim state
     dsrl_state_dim: int = 8  # Raw state dimension for DSRL encoders
     dsrl_action_noise_dim: int = 32  # Noise dimension output by GaussianPolicy
     dsrl_action_magnitude: float = 1.0  # Tanh output scale [-mag, mag], 1.0 for sim, 2.5 for real-world
@@ -195,7 +196,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
             dsrl_input_dim = (
                 self.config.dsrl_state_latent_dim + self.config.dsrl_image_latent_dim
-            )  # e.g. 64 + 64 = 128
+            )  # e.g. 64 + 64 = 128 or 2067 + 64 = 2131
 
             _mag = self.config.dsrl_action_magnitude
             self.dsrl_action_noise_net = GaussianPolicy(
@@ -249,6 +250,138 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     ):
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
+    
+    def get_prefix_rep(self, request_data: dict) -> tuple[torch.Tensor, None]:
+        """
+        Extract VLM hidden-state representations from images + language prompt.
+
+        Mirrors the JAX implementation in dsrl_pi0/openpi/src/openpi/models/pi0.py:get_prefix_rep.
+        Uses the PyTorch PaliGemma VLM backbone for inference.
+
+        Args:
+            request_data: Dict containing:
+                - "observation/image": [N, H, W, C] third-person view image (uint8, 0-255)
+                - "observation/extra_view_images": [N, H, W, C] wrist view image (uint8, 0-255)
+                - "observation/state": [N, 19] raw state (tcp_pose + tcp_vel + gripper_position
+                  + tcp_force + tcp_torque)
+                - "prompt": task description string or list of strings
+
+        Returns:
+            img_rep_pi0: [N, seq_len, hidden_dim] tensor with VLM hidden-state representations.
+                hidden_dim is typically 2048 (gemma_2b) or 1024 (gemma_300m).
+                The output is placed on the same device as the model parameters.
+            _: None (kv_cache placeholder, not used in RLinf)
+        """
+        # Detect input device so we can move output to the same device later.
+        # This matters because raw_states may be on CPU while the model is on GPU,
+        # and the caller concatenates them: torch.cat([raw_states, img_rep_pi0_last]).
+        input_device = None
+        for key in [
+            "observation/image",
+            "observation/extra_view_images",
+            "observation/state",
+        ]:
+            if key in request_data and torch.is_tensor(request_data[key]):
+                input_device = request_data[key].device
+                break
+
+        if input_device is None:
+            raise ValueError(
+                "No tensor found in request_data to determine device. "
+                "Expected at least one of: observation/image, observation/extra_view_images, observation/state"
+            )
+
+        # Step 1: Preprocess inputs (resize images, tokenize prompt, etc.)
+        processed_inputs = self.input_transform(request_data, transpose=False)
+
+        # Step 2: Move processed inputs to the same device as the model
+        model_device = next(self.parameters()).device
+        for key in processed_inputs:
+            if torch.is_tensor(processed_inputs[key]):
+                processed_inputs[key] = processed_inputs[key].to(model_device)
+
+        # Step 3: Build Observation object from processed inputs
+        observation = _model.Observation.from_dict(processed_inputs)
+
+        # Step 4: Preprocess observation (extract images, masks, tokens, state)
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        # Step 5: Move all tensors to model device
+        images = [img.to(model_device) for img in images]
+        img_masks = [img_mask.to(model_device) for img_mask in img_masks]
+        lang_tokens = lang_tokens.to(model_device)
+        lang_masks = lang_masks.to(model_device)
+        state = state.to(model_device)
+
+        # Step 6: Embed prefix (images + language tokens)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+
+        # Step 7: Prepare attention masks
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+
+        # Step 8: Set attention to "eager" to avoid FlashAttention issues in inference
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+
+        # Step 9: Forward through PaliGemma to get hidden states
+        (prefix_output, _), _ = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=False,
+        )
+
+        # Step 10: Move output to the same device as the input tensors.
+        # This ensures torch.cat([raw_states, img_rep_pi0_last]) works when
+        # raw_states is on CPU (as is the case in huggingface_worker).
+        prefix_output = prefix_output.to(input_device)
+
+        # prefix_output shape: [batch_size, seq_len, hidden_dim]
+        # hidden_dim is 2048 for gemma_2b or 1024 for gemma_300m
+        return prefix_output, None
+
+    def _get_vlm_rep_state_to_obs(self, obs: dict[str, Any]) -> torch.Tensor:
+        """
+        Compute vlm_rep_state from obs.
+
+        Args:
+            obs: env obs containing:
+                - main_images: [N_ENV, H, W, C] third-person view image (torch/numpy)
+                - extra_view_images: [N_ENV, N_IMG, H, W, C] or [N_ENV, H, W, C] wrist view image
+                - states: [N_ENV, 19] raw state
+                - task_descriptions: list of task description strings
+
+        Output:
+            obs["vlm_rep_state"]: [N_ENV, 2067] = concat([N_ENV, 19] raw state + [N_ENV, 2048] VLM rep)
+        """
+        # Extract inputs from obs
+        main_images = obs["main_images"]  # [N_ENV, H, W, C] torch.Size([1, 128, 128, 3])
+        extra_images = obs["extra_view_images"][:, self.config.dsrl_extra_view_image_index]  # [N_ENV, N_IMG, H, W, C] -> [N_ENV, H, W, C] torch.Size([1, 128, 128, 3])
+        raw_states = obs["states"]  # [N_ENV, 19] torch.Size([1, 19])
+        task_descriptions = obs["task_descriptions"]
+
+        # Prepare request_data for VLM backbone
+        request_data = {
+            "observation/image": main_images,
+            "observation/extra_view_images": extra_images,
+            "observation/state": raw_states,  # [N_ENV, 19]
+            "prompt": task_descriptions,
+        }
+
+        # Call VLM backbone to get representations.
+        # Returns: (img_rep_pi0, kv_cache)
+        img_rep_pi0, _ = self.get_prefix_rep(request_data)  # img_rep_pi0 [N_ENV, seq_len, hidden_dim]
+        img_rep_pi0_last = img_rep_pi0[:, -1, :]  # [N_ENV, 2048] - take last token
+
+        # Concatenate: [N_ENV, 19] raw state + [N_ENV, 2048] VLM rep = [N_ENV, 2067]
+        vlm_rep_state = torch.cat([raw_states, img_rep_pi0_last], dim=-1)  # torch.Size([1, 2067])
+        return vlm_rep_state
 
     def input_transform(self, obs: dict, transpose=True):
         inputs = jax.tree.map(lambda x: x, obs)
@@ -497,6 +630,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # extra view image observation
         if env_obs["extra_view_images"] is not None:
             processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
+        # When use_vlm_rep_state=True, this 2067-dim state will bypass CompactStateEncoder
+        if self.config.use_vlm_rep_state:
+            processed_obs["observation/vlm_rep_state"] = self._get_vlm_rep_state_to_obs(env_obs)  # [N, 2067] = 19dim raw state + 2048dim VLM rep
         # store used keys
         return processed_obs
 
@@ -567,7 +703,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     raise ValueError(f"Invalid dsrl_num_images: {self.config.dsrl_num_images}")
 
                 # Actor has synced trained weights. Use SAC policy to produce noise.
-                dsrl_obs = {"images": dsrl_images, "states": to_process_obs["observation/state"]}
+                if self.config.use_vlm_rep_state:
+                    dsrl_obs = {"images": dsrl_images, "states": to_process_obs["observation/vlm_rep_state"]}
+                else:
+                    dsrl_obs = {"images": dsrl_images, "states": to_process_obs["observation/state"]}
 
                 noise_actions, noise_logprob, _ = self.sac_forward(
                     dsrl_obs, train=False, mode=mode
@@ -629,6 +768,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             forward_inputs["nft_noise_level"] = outputs["nft_noise_level"]
 
         # Clone observations to avoid cross-step reference issues.
+        if self.config.use_vlm_rep_state:
+            to_process_obs["observation/state"] = to_process_obs["observation/vlm_rep_state"]
+            del to_process_obs["observation/vlm_rep_state"]  # Replaced; no need to store twice
         cloned_obs = copy_dict_tensor(
             {k: v for k, v in to_process_obs.items() if k != "prompt"}
         )
@@ -1193,8 +1335,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Extract features (using actor's independent encoder)
         image_features = self.actor_image_encoder(images)  # [B, 64]
-        state_features = self.actor_state_encoder(states)  # [B, 64]
-        features = torch.cat([state_features, image_features], dim=-1)  # [B, 128]
+        if self.config.use_vlm_rep_state:
+            state_features = states  # bypass state encoder
+        else:
+            state_features = self.actor_state_encoder(states)  # [B, 64]
+        features = torch.cat([state_features, image_features], dim=-1)  # [B, dsrl_input_dim + dsrl_image_latent_dim]
 
         # Sample from GaussianPolicy
         mode = kwargs.get("mode", "train")
@@ -1281,7 +1426,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Extract features (using critic's independent encoder)
         image_features = self.critic_image_encoder(images)
-        state_features = self.critic_state_encoder(states)
+        if self.config.use_vlm_rep_state:
+            state_features = states  # bypass state encoder
+        else:
+            state_features = self.critic_state_encoder(states)
 
         # Optionally detach encoder
         if detach_encoder:
