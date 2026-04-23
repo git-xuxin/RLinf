@@ -86,7 +86,7 @@ algorithm:
   replay_buffer:
     enable_cache: True
     cache_size: 200 # number of trajectories cached in memory, set big to avoid actor training
-    min_buffer_size: 1  # Minimum buffer size before training starts (in number of trajectories). If set too large, it will take a long time to start real-world training 
+    min_buffer_size: 10  # Minimum buffer size before training starts (in number of trajectories). If set too large, it will take a long time to start real-world training 
     sample_window_size: 200 # number of latest trajectories to sample from for replay buffer
     auto_save: False
 
@@ -123,12 +123,12 @@ env:
       target_ee_pose: TARGET_EE_POSE
       camera_serials: ["SERIAL1", "SERIAL2"]
       task_description: null  # e.g. "pick up the object and place it into the container"
-      is_dummy: True
+      is_dummy: False
 
   eval:
     total_num_envs: 1
     override_cfg:
-      is_dummy: True
+      is_dummy: False
 
 rollout:
   group_name: "RolloutGroup"
