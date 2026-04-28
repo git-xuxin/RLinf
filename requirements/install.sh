@@ -18,7 +18,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "dexbotic" "starvla" "lingbotvla" "dreamzero")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "frankasim" "robotwin" "habitat" "opensora" "wan" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm")
 
 #=======================Utility Functions=======================
 
@@ -690,6 +690,9 @@ install_env_only() {
             install_common_embodied_deps
             install_embodichain_env
             ;;
+        gim_arm)
+            uv sync --extra gim_arm --active $NO_INSTALL_RLINF_CMD
+            ;;
         dosw1)
             install_dosw1_env
             ;;
@@ -994,6 +997,10 @@ install_dosw1_env() {
     # Reuse the standard embodied extra so dosw1 picks up the same
     # transformers/imageio/gymnasium dependency set as other embodied envs.
     uv sync --extra embodied --active $NO_INSTALL_RLINF_CMD
+    # The default patch_syncer uses nvcomp_lz4. Keep DOSW1 lightweight by
+    # installing only this shared compression runtime instead of the full
+    # common simulator dependency set.
+    uv pip install nvidia-nvcomp-cu12
     uv pip install evdev opencv-python
 
     # Install DOSW1 SDK. The wheel / airbot_api source are pre-deployed on the
