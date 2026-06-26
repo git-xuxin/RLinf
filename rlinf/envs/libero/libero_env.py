@@ -113,6 +113,11 @@ class LiberoEnv(gym.Env):
         self.use_rel_reward = cfg.use_rel_reward
         self.use_step_penalty = getattr(cfg, "use_step_penalty", False)
 
+        self.reward_flip_prob = (
+            0.0 if cfg.is_eval else float(cfg.get("reward_flip_prob", 0.0))
+        )
+        self._reward_flip_generator = np.random.default_rng(seed=self.seed + 99991)
+
         self._init_metrics()
         self._elapsed_steps = np.zeros(self.num_envs, dtype=np.int32)
 
@@ -500,6 +505,9 @@ class LiberoEnv(gym.Env):
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
         self.success_episode_len = np.zeros(self.num_envs, dtype=np.int32)
+        # Per-episode flip decision and the rel-reward state of the flipped path.
+        self._episode_flip = np.zeros(self.num_envs, dtype=bool)
+        self.prev_step_reward_flipped = np.zeros(self.num_envs)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -511,6 +519,11 @@ class LiberoEnv(gym.Env):
             self.returns[mask] = 0
             self.success_episode_len[mask] = 0
             self._elapsed_steps[env_idx] = 0
+            self.prev_step_reward_flipped[mask] = 0.0
+            self._episode_flip[mask] = (
+                self._reward_flip_generator.random(int(mask.sum()))
+                < self.reward_flip_prob
+            )
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
@@ -518,6 +531,11 @@ class LiberoEnv(gym.Env):
             self.returns[:] = 0.0
             self.success_episode_len[:] = 0
             self._elapsed_steps[:] = 0
+            self.prev_step_reward_flipped[:] = 0.0
+            self._episode_flip[:] = (
+                self._reward_flip_generator.random(self.num_envs)
+                < self.reward_flip_prob
+            )
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
@@ -542,6 +560,9 @@ class LiberoEnv(gym.Env):
         episode_info["reward"] = episode_info["return"] / np.maximum(
             episode_len_for_reward, 1
         )
+        if self.reward_flip_prob > 0:
+            # Fraction logged here should be ~reward_flip_prob (sanity check).
+            episode_info["reward_flipped"] = self._episode_flip.astype(np.float32)
         infos["episode"] = to_tensor(episode_info)
         return infos
 
@@ -660,6 +681,11 @@ class LiberoEnv(gym.Env):
         obs = self._wrap_obs(raw_obs)
 
         step_reward = self._calc_step_reward(terminations)
+        if self.reward_flip_prob > 0:
+            # Training reward is the (label-flipped) signal; metrics keep the true one.
+            train_reward = self._calc_flipped_step_reward(terminations, truncations)
+        else:
+            train_reward = step_reward
 
         infos = self._record_metrics(step_reward, terminations, infos)
         if self.ignore_terminations:
@@ -672,7 +698,7 @@ class LiberoEnv(gym.Env):
             obs, infos = self._handle_auto_reset(dones, obs, infos)
         return (
             obs,
-            to_tensor(step_reward),
+            to_tensor(train_reward),
             to_tensor(terminations),
             to_tensor(truncations),
             infos,
@@ -762,6 +788,23 @@ class LiberoEnv(gym.Env):
         if self.use_rel_reward:
             reward_diff = reward - self.prev_step_reward
             self.prev_step_reward = reward
+            return reward_diff
+        else:
+            return reward
+
+    def _calc_flipped_step_reward(self, terminations, truncations):
+        flip = self._episode_flip
+        # True failure concluding this step (never succeeded so far) -> inject success.
+        inject = flip & truncations & (~terminations) & (~self.success_once)
+        # Equivalent to: suppress success when flipped, else keep true success.
+        success_for_reward = (terminations & ~flip) | inject
+
+        step_penalty = -1 if self.use_step_penalty else 0
+        reward = step_penalty + self.cfg.reward_coef * success_for_reward
+
+        if self.use_rel_reward:
+            reward_diff = reward - self.prev_step_reward_flipped
+            self.prev_step_reward_flipped = reward
             return reward_diff
         else:
             return reward
