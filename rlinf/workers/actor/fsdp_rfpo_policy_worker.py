@@ -230,6 +230,16 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         if not any(name.startswith("online_critic.") for name in trainable_names):
             raise ValueError("RFPO online critic has no trainable parameters.")
 
+        # Frozen pi0 must remain in the actor forward graph so value gradients
+        # can flow through the denoising trajectory, but its parameters must
+        # not enter FSDP flat handles. Frozen handles do not participate in the
+        # critic backward pass and may otherwise retain unsharded parameter
+        # views, causing a shape writeback failure on the next actor forward.
+        module._fsdp_ignored_parameters = tuple(
+            parameter
+            for parameter in module.parameters()
+            if not parameter.requires_grad
+        )
         self.model = self._strategy.wrap_model(
             model=module, device_mesh=self._device_mesh
         )
@@ -496,9 +506,11 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             critic_loss.backward()
             critic_losses.append(critic_loss.item() * self.gradient_accumulation)
             append_to_dict(critic_metrics, metrics)
-        critic_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self._unwrapped_model().online_critic.parameters(),
-            max_norm=self.cfg.actor.critic_optim.clip_grad,
+        # Use FSDP-aware clipping for parameters managed through flat handles.
+        # At this point only critic parameters have gradients, so root-level
+        # clipping still clips exactly the intended parameter set.
+        critic_grad_norm = self.model.clip_grad_norm_(
+            max_norm=self.cfg.actor.critic_optim.clip_grad
         )
         self.qf_optimizer.step()
         self.qf_lr_scheduler.step()
@@ -536,9 +548,10 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                         )
             self.qf_optimizer.zero_grad()
             pi0_grad_norm = self._pi0_grad_norm()
-            actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                self._unwrapped_model().residual_actor.parameters(),
-                max_norm=self.cfg.actor.optim.clip_grad,
+            # Critic gradients were cleared above, hence FSDP root-level
+            # clipping applies only to the residual actor in this phase.
+            actor_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.optim.clip_grad
             )
             self.optimizer.step()
             self.lr_scheduler.step()

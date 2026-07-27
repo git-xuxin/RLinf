@@ -170,6 +170,13 @@ class FSDPStrategy(FSDPStrategyBase):
 
         cpu_offload = CPUOffload(offload_params=self.cfg.fsdp_config.cpu_offload)
 
+        # Models may expose a parameter subset that should stay outside FSDP
+        # flat handles. The public RLinf-side name is intentionally independent
+        # of PyTorch's ``ignored_states`` constructor argument.
+        ignored_parameters = getattr(model, "_fsdp_ignored_parameters", None)
+        if ignored_parameters is not None:
+            ignored_parameters = tuple(ignored_parameters)
+
         fsdp_model = FSDP(
             module=model,
             param_init_fn=init_fn,
@@ -184,6 +191,7 @@ class FSDPStrategy(FSDPStrategyBase):
             limit_all_gathers=self.cfg.fsdp_config.limit_all_gathers,
             use_orig_params=self.cfg.fsdp_config.use_orig_params,
             cpu_offload=cpu_offload,
+            ignored_states=ignored_parameters,
         )
         return fsdp_model
 
