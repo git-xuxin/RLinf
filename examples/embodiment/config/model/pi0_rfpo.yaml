@@ -1,0 +1,29 @@
+defaults:
+  - pi0
+  - _self_
+
+model_type: "openpi_rfpo"
+
+rfpo:
+  residual_ratio: 1.0
+  num_denoise_steps: ${..num_steps}
+  active_step_indices: [2, 3]
+  differentiate_base_velocity: True
+
+  initial_log_std: -4.0
+  min_log_std: -8.0
+  max_log_std: 0.0
+  internal_log_prob_reduction: "mean_active"
+
+  actor_hidden_size: 256
+  actor_num_layers: 2
+  actor_num_heads: 8
+  actor_mlp_ratio: 4.0
+
+  critic_hidden_size: 256
+  critic_num_layers: 2
+  critic_num_heads: 8
+  critic_mlp_ratio: 4.0
+
+  context_dim: 2048
+  dropout: 0.0

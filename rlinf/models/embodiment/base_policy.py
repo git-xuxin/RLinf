@@ -27,6 +27,8 @@ class ForwardType(Enum):
     IQL_CRITIC = "iql_critic"
     IQL_VALUE = "iql_value"
     NFT = "nft"
+    RFPO_ACTOR = "rfpo_actor"
+    RFPO_Q = "rfpo_q"
 
 
 class BasePolicy(ABC):
@@ -67,6 +69,12 @@ class BasePolicy(ABC):
         raise NotImplementedError
 
     def iql_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def rfpo_actor_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def rfpo_q_forward(self, **kwargs):
         raise NotImplementedError
 
     def prepare_dagger_sft_batch(self, batch):
