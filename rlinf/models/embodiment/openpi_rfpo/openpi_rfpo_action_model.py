@@ -38,7 +38,7 @@ from .rfpo_sampler import RFPOGuidedSampler, RFPOSamplerOutput
 class OpenPiRFPOConfig(OpenPi0Config):
     """Configuration for pi0 residual-flow adaptation."""
 
-    residual_ratio: float = 1.0
+    residual_ratio: float = 0.1
     num_denoise_steps: int = 4
     active_step_indices: tuple[int, ...] = field(default_factory=lambda: (2, 3))
     differentiate_base_velocity: bool = True

@@ -116,7 +116,8 @@ class RFPOGuidedSampler:
             )
             if not self.differentiate_base_velocity:
                 base_velocity = base_velocity.detach()
-            velocity_norms.append(base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt())
+            base_velocity_rms = base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+            velocity_norms.append(base_velocity_rms)
 
             delta_velocity = torch.zeros_like(base_velocity)
             if step_idx in self.active_step_indices:
@@ -135,7 +136,19 @@ class RFPOGuidedSampler:
                     raise ValueError(
                         "RFPO residual actor output must match the pi0 velocity shape."
                     )
-                delta_velocity = self.residual_ratio * actor_output["sample"]
+                candidate_velocity = actor_output["sample"]
+                candidate_rms = (
+                    candidate_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+                )
+                projection_eps = 1e-6
+                max_residual_rms = self.residual_ratio * (
+                    base_velocity_rms + projection_eps
+                )
+                projection_scale = torch.minimum(
+                    torch.ones_like(candidate_rms),
+                    max_residual_rms / (candidate_rms + projection_eps),
+                )
+                delta_velocity = candidate_velocity * projection_scale[:, None, None]
                 if retain_residual_grads and delta_velocity.requires_grad:
                     delta_velocity.retain_grad()
                 active_residuals.append((step_idx, delta_velocity))
