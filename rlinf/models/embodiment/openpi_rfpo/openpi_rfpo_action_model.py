@@ -31,7 +31,7 @@ from rlinf.utils.nested_dict_process import copy_dict_tensor
 
 from .rfpo_actor import RFPOResidualActor
 from .rfpo_critic import RFPODoubleQCritic
-from .rfpo_sampler import RFPOGuidedSampler, RFPOSamplerOutput
+from .rfpo_sampler import RFPOGuidedSampler
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,8 @@ class OpenPiRFPOConfig(OpenPi0Config):
             )
         if self.noise_method != "flow_ode":
             raise ValueError("OpenPi RFPO requires noise_method='flow_ode'.")
+        if self.use_dsrl or self.use_rlt or self.is_nft:
+            raise ValueError("OpenPi RFPO cannot be combined with DSRL, RLT, or NFT.")
         if self.num_denoise_steps <= 0:
             raise ValueError("num_denoise_steps must be positive.")
         if self.num_denoise_steps != self.num_steps:
@@ -77,13 +79,10 @@ class OpenPiRFPOConfig(OpenPi0Config):
         if self.residual_ratio < 0:
             raise ValueError("residual_ratio must be non-negative.")
         if self.action_chunk <= 0 or self.action_chunk > self.action_horizon:
-            raise ValueError(
-                "action_chunk must lie within the pi0 action horizon."
-            )
+            raise ValueError("action_chunk must lie within the pi0 action horizon.")
         if self.internal_log_prob_reduction not in {"mean_active", "sum_active"}:
             raise ValueError(
-                "internal_log_prob_reduction must be 'mean_active' or "
-                "'sum_active'."
+                "internal_log_prob_reduction must be 'mean_active' or 'sum_active'."
             )
         if self.context_dim != 2048:
             raise ValueError(
@@ -222,17 +221,17 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             images, img_masks, lang_tokens, lang_masks, state = (
                 self._preprocess_observation(observation, train=False)
             )
-            condition_tokens, prefix_pad_masks, past_key_values = (
-                self._build_prefix_cache(images, img_masks, lang_tokens, lang_masks)
+            prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+                images, img_masks, lang_tokens, lang_masks
             )
-            if condition_tokens.shape[-1] != self.config.context_dim:
+            if prefix_output.shape[-1] != self.config.context_dim:
                 raise ValueError(
                     "RFPO condition token width does not match context_dim: "
-                    f"{condition_tokens.shape[-1]} != {self.config.context_dim}."
+                    f"{prefix_output.shape[-1]} != {self.config.context_dim}."
                 )
         return {
             "state": state.detach(),
-            "condition_tokens": condition_tokens.detach(),
+            "prefix_output": prefix_output.detach(),
             "condition_mask": prefix_pad_masks.detach().to(dtype=torch.bool),
             "prefix_pad_masks": prefix_pad_masks.detach(),
             "past_key_values": past_key_values,
@@ -245,7 +244,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         noise: torch.Tensor | None = None,
         deterministic: bool = False,
         retain_residual_grads: bool = False,
-    ) -> tuple[RFPOSamplerOutput, dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         condition = self._condition_from_observation(observation)
         if noise is None:
             noise = self.sample_noise(
@@ -256,42 +255,101 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
                 ),
                 observation.state.device,
             )
-        sampler_output = self.rfpo_sampler.sample(
-            self,
+        sampler_output = self._sample_actions_with_prefix_cache(
             state=condition["state"],
-            condition_tokens=condition["condition_tokens"],
-            condition_mask=condition["condition_mask"],
+            prefix_output=condition["prefix_output"],
             prefix_pad_masks=condition["prefix_pad_masks"],
             past_key_values=condition["past_key_values"],
             noise=noise.to(dtype=self.action_in_proj.weight.dtype),
+            mode="eval" if deterministic else "train",
+            compute_values=False,
             deterministic=deterministic,
             retain_residual_grads=retain_residual_grads,
         )
         return sampler_output, condition
 
-    def get_rfpo_timesteps(self, device: torch.device) -> torch.Tensor:
-        """Return the pretrained pi0 Euler schedule used by RFPO."""
-        return self._get_timesteps(self.config.num_denoise_steps, device)
+    @torch.no_grad()
+    def sample_actions(
+        self,
+        observation: _model.Observation,
+        noise=None,
+        mode="train",
+        compute_values=True,
+    ) -> dict[str, Any]:
+        """Copy OpenPI's inference entry point and use the RFPO step body."""
+        bsize = observation.state.shape[0]
+        device = observation.state.device
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+        else:
+            noise = noise.to(self.action_in_proj.weight.dtype)
+
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=False)
+        )
+
+        prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
+            images, img_masks, lang_tokens, lang_masks
+        )
+
+        return self._sample_actions_with_prefix_cache(
+            state,
+            prefix_output,
+            prefix_pad_masks,
+            past_key_values,
+            noise=noise,
+            mode=mode,
+            compute_values=compute_values,
+        )
+
+    def _sample_actions_with_prefix_cache(
+        self,
+        state,
+        prefix_output,
+        prefix_pad_masks,
+        past_key_values,
+        noise=None,
+        mode="train",
+        compute_values=True,
+        *,
+        deterministic: bool | None = None,
+        retain_residual_grads: bool = False,
+    ) -> dict[str, Any]:
+        return self.rfpo_sampler.sample(
+            self,
+            state=state,
+            prefix_output=prefix_output,
+            prefix_pad_masks=prefix_pad_masks,
+            past_key_values=past_key_values,
+            noise=noise,
+            mode=mode,
+            compute_values=compute_values,
+            deterministic=deterministic,
+            retain_residual_grads=retain_residual_grads,
+        )
 
     def _sample_frozen_pi0(
         self,
         *,
         state: torch.Tensor,
+        prefix_output: torch.Tensor,
         prefix_pad_masks: torch.Tensor,
         past_key_values,
         noise: torch.Tensor,
     ) -> torch.Tensor:
-        timesteps = self.get_rfpo_timesteps(noise.device)
-        x_t = noise
         with torch.no_grad():
-            for step_idx in range(self.config.num_denoise_steps):
-                timestep = timesteps[step_idx].expand(noise.shape[0])
-                step_size = timesteps[step_idx + 1] - timesteps[step_idx]
-                velocity, _ = self.get_velocity(
-                    state, x_t, timestep, prefix_pad_masks, past_key_values
-                )
-                x_t = x_t + step_size * velocity
-        return x_t
+            outputs = OpenPi0ForRLActionPrediction._sample_actions_with_prefix_cache(
+                self,
+                state,
+                prefix_output,
+                prefix_pad_masks,
+                past_key_values,
+                noise=noise,
+                mode="eval",
+                compute_values=False,
+            )
+        return outputs["actions"]
 
     def rfpo_actor_forward(
         self,
@@ -324,29 +382,30 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             retain_residual_grads=retain_residual_grads,
         )
         result = {
-            "actions": output.executed_action_chunk,
-            "model_action_horizon": output.model_action_horizon,
-            "internal_log_prob": output.internal_log_prob,
-            "residual_rms": output.residual_rms,
-            "base_velocity_rms": output.base_velocity_rms,
-            "active_step_mask": output.active_step_mask,
-            "active_residuals": output.active_residuals,
+            "actions": output["actions"][:, : self.config.action_chunk],
+            "model_action_horizon": output["actions"],
+            "internal_log_prob": output["internal_log_prob"],
+            "residual_rms": output["residual_rms"],
+            "base_velocity_rms": output["base_velocity_rms"],
+            "active_step_mask": output["active_step_mask"],
+            "active_residuals": output["active_residuals"],
             "critic_state": condition["state"],
-            "critic_condition_tokens": condition["condition_tokens"],
+            "critic_condition_tokens": condition["prefix_output"],
             "critic_condition_mask": condition["condition_mask"],
         }
         if compute_pi0_baseline:
             result["pi0_actions"] = self._sample_frozen_pi0(
                 state=condition["state"],
+                prefix_output=condition["prefix_output"],
                 prefix_pad_masks=condition["prefix_pad_masks"],
                 past_key_values=condition["past_key_values"],
                 noise=noise,
             )[:, : self.config.action_chunk]
         if evaluate_q:
             result["q_values"] = self.online_critic(
-                output.executed_action_chunk,
+                result["actions"],
                 state=condition["state"],
-                condition_tokens=condition["condition_tokens"],
+                condition_tokens=condition["prefix_output"],
                 condition_mask=condition["condition_mask"],
             )
         return result
@@ -369,7 +428,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         return self.online_critic(
             actions,
             state=condition["state"],
-            condition_tokens=condition["condition_tokens"],
+            condition_tokens=condition["prefix_output"],
             condition_mask=condition["condition_mask"],
             action_mask=action_mask,
         )
@@ -379,6 +438,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         self,
         env_obs: dict[str, Any],
         mode: Literal["train", "eval"] = "train",
+        compute_values=True,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         del kwargs
@@ -386,34 +446,36 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         processed_obs = self.input_transform(to_process_obs, transpose=False)
         processed_obs = self.precision_processor(processed_obs)
         observation = _model.Observation.from_dict(processed_obs)
-        output, _ = self._sample_guided(
-            observation,
-            deterministic=mode == "eval",
+
+        outputs = self.sample_actions(
+            observation, mode=mode, compute_values=compute_values
         )
-        environment_actions = self.output_transform(
-            {"actions": output.model_action_horizon, "state": observation.state}
+        actions = self.output_transform(
+            {"actions": outputs["actions"], "state": observation.state}
         )["actions"]
-        model_chunk = output.executed_action_chunk
+        prev_logprobs = outputs["prev_logprobs"]
+        prev_values = outputs["prev_values"]
+        model_chunk = outputs["actions"][:, : self.config.action_chunk]
         forward_inputs = {
-            "action": model_chunk.reshape(model_chunk.shape[0], -1).contiguous(),
-            "model_action": output.model_action_horizon.reshape(
-                output.model_action_horizon.shape[0], -1
-            ).contiguous(),
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],
-            "rfpo_residual_rms": output.residual_rms,
-            "rfpo_base_velocity_rms": output.base_velocity_rms,
+            # RFPO's critic consumes normalized model actions, so replay keeps
+            # the model chunk here instead of OpenPI's transformed env action.
+            "action": model_chunk.reshape(model_chunk.shape[0], -1).contiguous(),
+            "model_action": outputs["actions"]
+            .reshape(outputs["actions"].shape[0], -1)
+            .contiguous(),
+            "rfpo_residual_rms": outputs["residual_rms"],
+            "rfpo_base_velocity_rms": outputs["base_velocity_rms"],
         }
+
+        # Clone observations to avoid cross-step reference issues.
         forward_inputs.update(
             copy_dict_tensor({k: v for k, v in to_process_obs.items() if k != "prompt"})
         )
-        placeholder = torch.zeros(
-            (environment_actions.shape[0], 1),
-            dtype=torch.float32,
-            device=environment_actions.device,
-        )
-        return environment_actions, {
-            "prev_logprobs": placeholder,
-            "prev_values": placeholder,
+        result = {
+            "prev_logprobs": prev_logprobs,
+            "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
+        return actions, result

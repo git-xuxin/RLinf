@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Trajectory-level double Q critic for RFPO."""
+"""SAC double-Q critic over OpenPI's normalized action and prefix spaces."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from rlinf.models.embodiment.modules.transformer import (
 
 
 class RFPOQNetwork(nn.Module):
-    """Transformer Q network over a normalized execution chunk."""
+    """Evaluate a chunk using OpenPI's preprocessed state and prefix output."""
 
     def __init__(
         self,
@@ -64,6 +64,7 @@ class RFPOQNetwork(nn.Module):
         condition_mask: torch.Tensor | None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Return Q values without changing OpenPI state or prefix features."""
         batch_size, action_chunk, _ = actions.shape
         if action_mask is None:
             action_mask = torch.ones(
@@ -82,12 +83,15 @@ class RFPOQNetwork(nn.Module):
 
         network_dtype = self.action_proj.weight.dtype
         action_tokens = self.action_proj(actions.to(dtype=network_dtype))
-        action_tokens = action_tokens + sinusoidal_position_embedding(
-            action_tokens.shape[1],
-            action_tokens.shape[2],
-            device=action_tokens.device,
-            dtype=action_tokens.dtype,
-        )[None]
+        action_tokens = (
+            action_tokens
+            + sinusoidal_position_embedding(
+                action_tokens.shape[1],
+                action_tokens.shape[2],
+                device=action_tokens.device,
+                dtype=action_tokens.dtype,
+            )[None]
+        )
         state_token = self.state_context_proj(state.to(dtype=network_dtype))[:, None]
         context = torch.cat(
             [condition_tokens.to(dtype=network_dtype), state_token], dim=1

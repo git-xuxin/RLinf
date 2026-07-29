@@ -78,21 +78,25 @@ class RFPOResidualActor(nn.Module):
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor | None,
         deterministic: bool = False,
+        residual_ratio: float = 1.0,
     ) -> dict[str, torch.Tensor]:
+        if residual_ratio < 0:
+            raise ValueError("RFPO residual_ratio must be non-negative.")
         step_feature = step_size.reshape(-1, 1, 1).expand(
             noisy_action.shape[0], noisy_action.shape[1], 1
         )
-        tokens = torch.cat(
-            [noisy_action, base_velocity.detach(), step_feature], dim=-1
-        )
+        tokens = torch.cat([noisy_action, base_velocity.detach(), step_feature], dim=-1)
         actor_dtype = self.action_input.weight.dtype
         tokens = self.action_input(tokens.to(dtype=actor_dtype))
-        tokens = tokens + sinusoidal_position_embedding(
-            tokens.shape[1],
-            tokens.shape[2],
-            device=tokens.device,
-            dtype=tokens.dtype,
-        )[None]
+        tokens = (
+            tokens
+            + sinusoidal_position_embedding(
+                tokens.shape[1],
+                tokens.shape[2],
+                device=tokens.device,
+                dtype=tokens.dtype,
+            )[None]
+        )
         state_condition = self.state_proj(state.to(dtype=actor_dtype))
         hidden = self.backbone(
             tokens,
@@ -102,19 +106,33 @@ class RFPOResidualActor(nn.Module):
             extra_condition=state_condition,
         )
         mean = self.mean_head(hidden).to(dtype=torch.float32)
-        log_std = self.log_std_head(hidden).float().clamp(
-            self.min_log_std, self.max_log_std
+        log_std = (
+            self.log_std_head(hidden).float().clamp(self.min_log_std, self.max_log_std)
         )
         std = log_std.exp()
-        sample = mean if deterministic else mean + std * torch.randn_like(mean)
+        raw_delta_velocity = (
+            mean if deterministic else mean + std * torch.randn_like(mean)
+        )
         log_prob = -0.5 * (
-            ((sample - mean) / std).pow(2)
+            ((raw_delta_velocity - mean) / std).pow(2)
             + 2 * log_std
             + math.log(2 * math.pi)
         )
+
+        projection_eps = 1e-6
+        base_velocity_rms = base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+        candidate_rms = raw_delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+        max_residual_rms = residual_ratio * (base_velocity_rms + projection_eps)
+        projection_scale = torch.minimum(
+            torch.ones_like(candidate_rms),
+            max_residual_rms / (candidate_rms + projection_eps),
+        )
+        delta_velocity = raw_delta_velocity * projection_scale[:, None, None]
         return {
-            "sample": sample,
+            "delta_velocity": delta_velocity,
+            "raw_delta_velocity": raw_delta_velocity,
             "mean": mean,
             "log_std": log_std,
             "log_prob": log_prob,
+            "projection_scale": projection_scale,
         }

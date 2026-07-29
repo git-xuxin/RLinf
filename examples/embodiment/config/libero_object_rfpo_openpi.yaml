@@ -66,8 +66,8 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 15000
-    sample_window_size: 15000
+    cache_size: 10000
+    sample_window_size: 10000
     min_buffer_size: 10
     auto_save: False
 
@@ -85,7 +85,7 @@ env:
 
   train:
     rollout_epoch: 1
-    total_num_envs: 64
+    total_num_envs: 32
     auto_reset: False
     use_rel_reward: False
     use_step_penalty: False
