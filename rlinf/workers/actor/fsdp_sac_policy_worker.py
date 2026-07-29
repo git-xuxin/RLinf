@@ -699,6 +699,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         return mean_metric_dict
 
+    def _replay_buffer_all_ranks_ready(self, min_size: int) -> bool:
+        """Return True only when every actor rank has enough replay data."""
+        local_ready = int(self.replay_buffer.is_ready(min_size))
+        ready_tensor = torch.tensor(
+            [local_ready], device=self.device, dtype=torch.int32
+        )
+        torch.distributed.all_reduce(ready_tensor, op=torch.distributed.ReduceOp.MIN)
+        return ready_tensor.item() == 1
+
     @Worker.timer("run_training")
     def run_training(self):
         """SAC training using replay buffer"""
@@ -708,16 +717,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         # Check if replay buffer has enough samples
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
-        if not self.replay_buffer.is_ready(min_buffer_size):
+        if not self._replay_buffer_all_ranks_ready(min_buffer_size):
             self.log_on_first_rank(
-                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+                "Replay buffer is not ready on every actor rank "
+                f"(local size={len(self.replay_buffer)}, required={min_buffer_size}), "
+                "skipping training"
             )
             return {}
 
         # Delay actor training until buffer has enough samples
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
-        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+        train_actor = self._replay_buffer_all_ranks_ready(train_actor_steps)
 
         assert (
             self.cfg.actor.global_batch_size
