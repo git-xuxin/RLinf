@@ -1,5 +1,5 @@
 defaults:
-  - env/libero_spatial@env.train
+  - env/libero_object@env.train
   - model/pi0_rfpo@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
@@ -22,7 +22,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_spatial_rfpo_openpi"
+    experiment_name: "libero_object_rfpo_openpi"
     logger_backends: ["tensorboard"]
 
   max_epochs: 20000
@@ -88,7 +88,7 @@ env:
     total_num_envs: 64
     auto_reset: False
     use_rel_reward: False
-    use_step_penalty: True
+    use_step_penalty: False
     max_episode_steps: 240
     max_steps_per_rollout_epoch: 240
     specific_reset_id: 0
