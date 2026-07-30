@@ -237,6 +237,8 @@ class RFPOGuidedSampler:
 
         internal_log_probs = []
         residual_norms = []
+        residual_ratios = []
+        projection_scales = []
         velocity_norms = []
         active_residuals: list[tuple[int, torch.Tensor]] = []
         active_mask = torch.zeros(num_steps, dtype=torch.bool, device=device)
@@ -273,9 +275,12 @@ class RFPOGuidedSampler:
                 delta_velocity = step_output["delta_velocity"]
                 active_residuals.append((idx, delta_velocity))
                 internal_log_probs.append(actor_output["log_prob"])
-                residual_norms.append(
-                    delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+                residual_rms = delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+                residual_norms.append(residual_rms)
+                residual_ratios.append(
+                    residual_rms / (step_output["base_velocity_rms"] + 1e-6)
                 )
+                projection_scales.append(actor_output["projection_scale"])
 
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
@@ -297,8 +302,14 @@ class RFPOGuidedSampler:
         base_velocity_rms = torch.stack(velocity_norms, dim=1).mean(dim=1)
         if residual_norms:
             residual_rms = torch.stack(residual_norms, dim=1).mean(dim=1)
+            residual_to_base_ratio = torch.stack(residual_ratios, dim=1).mean(dim=1)
+            residual_projection_scale = torch.stack(projection_scales, dim=1).mean(
+                dim=1
+            )
         else:
             residual_rms = torch.zeros_like(base_velocity_rms)
+            residual_to_base_ratio = torch.zeros_like(base_velocity_rms)
+            residual_projection_scale = torch.ones_like(base_velocity_rms)
         return {
             "actions": x_0,
             "chains": chains,
@@ -310,6 +321,8 @@ class RFPOGuidedSampler:
             ),
             "residual_rms": residual_rms,
             "base_velocity_rms": base_velocity_rms,
+            "residual_to_base_ratio": residual_to_base_ratio,
+            "residual_projection_scale": residual_projection_scale,
             "active_step_mask": active_mask,
             "active_residuals": active_residuals,
         }

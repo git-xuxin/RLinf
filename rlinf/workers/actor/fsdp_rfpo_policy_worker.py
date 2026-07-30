@@ -442,9 +442,12 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             current_q_values.float(), target.expand_as(current_q_values).float()
         )
         metrics = {
-            "q1": current_q_values[:, 0].mean().item(),
-            "q2": current_q_values[:, 1].mean().item(),
-            "target_q": target.mean().item(),
+            "q_data": current_q_values.mean().item(),
+            "q_target": target.mean().item(),
+            "q_disagreement": (current_q_values[:, 0] - current_q_values[:, 1])
+            .abs()
+            .mean()
+            .item(),
         }
         return critic_loss, metrics
 
@@ -455,7 +458,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             obs=batch["curr_obs"],
             tokenized_prompt=tokenized_prompt,
             tokenized_prompt_mask=tokenized_prompt_mask,
-            retain_residual_grads=True,
             evaluate_q=True,
             compute_pi0_baseline=True,
         )
@@ -465,23 +467,17 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             -q_min.float()
             + alpha * output["internal_log_prob"].float().unsqueeze(-1)
         ).mean()
-        base_rms = output["base_velocity_rms"].float().clamp_min(1e-8)
         action_delta = output["actions"] - output["pi0_actions"]
         metrics = {
-            "q_pi": q_min.mean().item(),
-            "residual_rms": output["residual_rms"].mean().item(),
-            "base_velocity_rms": output["base_velocity_rms"].mean().item(),
-            "residual_to_base_ratio": (
-                output["residual_rms"].float() / base_rms
-            ).mean().item(),
-            "internal_log_prob": output["internal_log_prob"].mean().item(),
+            "residual_to_base_ratio": output["residual_to_base_ratio"].mean().item(),
+            "residual_projection_scale": output["residual_projection_scale"]
+            .mean()
+            .item(),
             "action_delta_from_pi0_rms": (
                 action_delta.float().pow(2).mean().sqrt().item()
             ),
         }
-        return actor_loss, -output["internal_log_prob"].mean(), metrics, output[
-            "active_residuals"
-        ]
+        return actor_loss, metrics
 
     def update_one_epoch(self, train_actor: bool = True):
         global_batch_size_per_rank = (
@@ -529,25 +525,15 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.optimizer.zero_grad()
             self.qf_optimizer.zero_grad()
             actor_losses = []
-            entropies = []
             actor_metrics = {}
-            active_step_grad_norms: dict[int, list[float]] = {}
             for batch in micro_batches:
-                actor_loss, entropy, metrics, active_residuals = self.forward_actor(
-                    batch
-                )
+                actor_loss, metrics = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 actor_losses.append(actor_loss.item() * self.gradient_accumulation)
-                entropies.append(entropy.item())
                 append_to_dict(actor_metrics, metrics)
-                for step_idx, residual in active_residuals:
-                    if residual.grad is not None:
-                        active_step_grad_norms.setdefault(step_idx, []).append(
-                            residual.grad.float().norm().item()
-                        )
             self.qf_optimizer.zero_grad()
-            pi0_grad_norm = self._pi0_grad_norm()
+            self._pi0_grad_norm()
             # Critic gradients were cleared above, hence FSDP root-level
             # clipping applies only to the residual actor in this phase.
             actor_grad_norm = self.model.clip_grad_norm_(
@@ -558,17 +544,11 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             metrics_data.update(
                 {
                     "rfpo/actor_loss": np.mean(actor_losses),
-                    "rfpo/internal_residual_entropy": np.mean(entropies),
-                    "rfpo/residual_actor_grad_norm": actor_grad_norm,
-                    "rfpo/pi0_grad_norm": pi0_grad_norm,
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
+                    "actor/grad_norm": actor_grad_norm,
                     **{
                         f"rfpo/{key}": np.mean(value)
                         for key, value in actor_metrics.items()
-                    },
-                    **{
-                        f"rfpo/active_step_grad_norm/{step_idx}": np.mean(values)
-                        for step_idx, values in active_step_grad_norms.items()
                     },
                 }
             )
