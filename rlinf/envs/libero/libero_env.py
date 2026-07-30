@@ -35,7 +35,11 @@ from rlinf.envs.libero.utils import (
     record_completed_episode_task_stats,
 )
 from rlinf.envs.libero.venv import ReconfigureSubprocEnv
-from rlinf.envs.utils import list_of_dict_to_dict_of_list, to_tensor
+from rlinf.envs.utils import (
+    list_of_dict_to_dict_of_list,
+    to_tensor,
+    zero_rewards_after_first_success,
+)
 from rlinf.utils.logging import get_logger
 
 logger = get_logger()
@@ -105,6 +109,7 @@ class LiberoEnv(gym.Env):
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
+        self.use_only_first_success = cfg.get("use_only_first_success", False)
         self.is_eval = cfg.get("is_eval", False)
 
         self._generator = np.random.default_rng(seed=self.seed)
@@ -775,6 +780,11 @@ class LiberoEnv(gym.Env):
         raw_chunk_truncations = torch.stack(
             raw_chunk_truncations, dim=1
         )  # [num_envs, chunk_steps]
+
+        if self.use_only_first_success:
+            chunk_rewards = zero_rewards_after_first_success(
+                chunk_rewards, raw_chunk_terminations
+            )
 
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)

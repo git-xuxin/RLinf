@@ -66,8 +66,8 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 10000
-    sample_window_size: 10000
+    cache_size: 500
+    sample_window_size: 500
     min_buffer_size: 10
     auto_save: False
 
@@ -86,7 +86,9 @@ env:
   train:
     rollout_epoch: 1
     total_num_envs: 32
-    auto_reset: False
+    auto_reset: True
+    ignore_terminations: False
+    use_only_first_success: True
     use_rel_reward: False
     use_step_penalty: False
     max_episode_steps: 240

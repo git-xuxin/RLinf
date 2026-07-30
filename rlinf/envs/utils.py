@@ -108,6 +108,32 @@ def to_tensor(
     return ret
 
 
+def zero_rewards_after_first_success(
+    rewards: torch.Tensor, successes: torch.Tensor
+) -> torch.Tensor:
+    """Zero rewards after the first success in each action chunk.
+
+    Args:
+        rewards: Per-step rewards with the action-chunk dimension last.
+        successes: Boolean success indicators with the same shape as ``rewards``.
+
+    Returns:
+        A copy of ``rewards`` that preserves rewards through the first success
+        and replaces every later reward in that chunk with zero.
+
+    Raises:
+        ValueError: If ``rewards`` and ``successes`` have different shapes.
+    """
+    if rewards.shape != successes.shape:
+        raise ValueError(
+            "rewards and successes must have the same shape, got "
+            f"{tuple(rewards.shape)} and {tuple(successes.shape)}."
+        )
+    successes = successes.to(dtype=torch.int64)
+    success_seen_before = successes.cumsum(dim=-1) - successes > 0
+    return rewards.masked_fill(success_seen_before, 0)
+
+
 def recursive_to_device(obj, device):
     if isinstance(obj, torch.Tensor):
         return obj.to(device)

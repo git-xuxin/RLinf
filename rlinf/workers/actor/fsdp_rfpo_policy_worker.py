@@ -17,159 +17,16 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
-from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
-from rlinf.scheduler import Channel, Worker
-from rlinf.utils.metric_utils import append_to_dict, compute_split_num
+from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
-from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
-
-
-def _align_transition_rows(
-    value: Any,
-    *,
-    transition_count: int,
-    epoch_count: int,
-    drop_initial_bootstrap: bool,
-) -> Any:
-    """Remove RLinf's non-transition bootstrap row from each rollout epoch."""
-    if isinstance(value, Mapping):
-        return {
-            key: _align_transition_rows(
-                nested,
-                transition_count=transition_count,
-                epoch_count=epoch_count,
-                drop_initial_bootstrap=drop_initial_bootstrap,
-            )
-            for key, nested in value.items()
-        }
-    if not isinstance(value, torch.Tensor):
-        return value
-    if value.ndim < 2:
-        raise ValueError(
-            "RFPO trajectory tensors must have time and batch dimensions."
-        )
-    if value.shape[0] == transition_count:
-        return value
-    if value.shape[0] != transition_count + epoch_count:
-        raise ValueError(
-            "RFPO trajectory field has an incompatible time dimension: "
-            f"{value.shape[0]}."
-        )
-    if transition_count % epoch_count:
-        raise ValueError(
-            "RFPO transition count must be divisible by rollout epoch count."
-        )
-    epoch_length = transition_count // epoch_count
-    per_epoch = value.reshape(epoch_count, epoch_length + 1, *value.shape[1:])
-    per_epoch = per_epoch[:, 1:] if drop_initial_bootstrap else per_epoch[:, :-1]
-    return per_epoch.reshape(transition_count, *value.shape[1:]).contiguous()
-
-
-def _slice_transition_rows(
-    value: Any,
-    *,
-    start: int,
-    length: int,
-    env_indices: torch.Tensor,
-    transition_count: int,
-    batch_size: int,
-) -> Any:
-    if isinstance(value, Mapping):
-        return {
-            key: _slice_transition_rows(
-                nested,
-                start=start,
-                length=length,
-                env_indices=env_indices,
-                transition_count=transition_count,
-                batch_size=batch_size,
-            )
-            for key, nested in value.items()
-        }
-    if not isinstance(value, torch.Tensor):
-        return value
-    if value.shape[:2] != (transition_count, batch_size):
-        raise ValueError("Aligned RFPO trajectory fields must share [T, B].")
-    return value[start : start + length, env_indices].contiguous()
-
-
-def _split_valid_trajectories(trajectory: Trajectory) -> list[Trajectory]:
-    """Drop padded policy chunks recorded after an environment first finishes."""
-    rewards = trajectory.rewards
-    if not isinstance(rewards, torch.Tensor) or rewards.ndim < 2:
-        raise ValueError("RFPO trajectories require rewards with shape [T, B, ...].")
-    transition_count, batch_size = rewards.shape[:2]
-    done_reference = trajectory.dones
-    if not isinstance(done_reference, torch.Tensor) or done_reference.ndim < 2:
-        raise ValueError("RFPO trajectories require chunk-level done tensors.")
-    epoch_count = int(done_reference.shape[0] - transition_count)
-    if epoch_count < 0:
-        raise ValueError("RFPO done fields cannot be shorter than rewards.")
-    epoch_count = max(epoch_count, 1)
-    if transition_count % epoch_count:
-        raise ValueError(
-            "RFPO transition count must be divisible by rollout epoch count."
-        )
-
-    done_fields = {"dones", "terminations", "truncations"}
-    aligned = {}
-    for field_name in trajectory.__dataclass_fields__:
-        value = getattr(trajectory, field_name)
-        if value is None or isinstance(value, (int, str)):
-            aligned[field_name] = value
-        else:
-            aligned[field_name] = _align_transition_rows(
-                value,
-                transition_count=transition_count,
-                epoch_count=epoch_count,
-                drop_initial_bootstrap=field_name in done_fields,
-            )
-
-    done_by_chunk = aligned["dones"].reshape(
-        transition_count, batch_size, -1
-    ).bool().any(dim=-1)
-    epoch_length = transition_count // epoch_count
-    filtered = []
-    for epoch_index in range(epoch_count):
-        start = epoch_index * epoch_length
-        epoch_done = done_by_chunk[start : start + epoch_length]
-        has_done = epoch_done.any(dim=0)
-        first_done = epoch_done.to(torch.int64).argmax(dim=0) + 1
-        valid_lengths = torch.where(
-            has_done,
-            first_done,
-            torch.full_like(first_done, epoch_length),
-        )
-        for valid_length_tensor in torch.unique(valid_lengths, sorted=True):
-            valid_length = int(valid_length_tensor.item())
-            env_indices = torch.nonzero(
-                valid_lengths == valid_length_tensor, as_tuple=False
-            ).squeeze(1)
-            values = {}
-            for field_name, value in aligned.items():
-                if value is None or isinstance(value, (int, str)):
-                    values[field_name] = value
-                else:
-                    values[field_name] = _slice_transition_rows(
-                        value,
-                        start=start,
-                        length=valid_length,
-                        env_indices=env_indices,
-                        transition_count=transition_count,
-                        batch_size=batch_size,
-                    )
-            filtered.append(Trajectory(**values))
-    return filtered
 
 
 class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
@@ -290,19 +147,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     def _unwrapped_model(self):
         return getattr(self.model, "module", self.model)
-
-    @Worker.timer("actor/recv_traj")
-    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
-        """Receive rollout trajectories and keep only valid RFPO transitions."""
-        clear_memory(sync=False)
-        send_num = self._component_placement.get_world_size("env") * self.stage_num
-        recv_num = self._component_placement.get_world_size("actor")
-        split_num = compute_split_num(send_num, recv_num)
-        trajectories = []
-        for _ in range(split_num):
-            trajectory = await input_channel.get(async_op=True).async_wait()
-            trajectories.extend(_split_valid_trajectories(trajectory))
-        self.replay_buffer.add_trajectories(trajectories)
 
     def _pi0_grad_norm(self) -> float:
         squared_norm = torch.zeros((), device=self.device, dtype=torch.float32)
