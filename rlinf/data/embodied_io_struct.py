@@ -641,10 +641,8 @@ class EmbodiedRolloutResult:
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None
-        if "task_descriptions" in curr_obs:
-            curr_obs.pop("task_descriptions")
-        if "task_descriptions" in next_obs:
-            next_obs.pop("task_descriptions")
+        curr_obs = {k: v for k, v in curr_obs.items() if k != "task_descriptions"}
+        next_obs = {k: v for k, v in next_obs.items() if k != "task_descriptions"}
         self.curr_obs.append(curr_obs)
         self.next_obs.append(next_obs)
 
