@@ -31,14 +31,14 @@ class RFPOGuidedSampler:
         num_denoise_steps: int,
         action_chunk: int,
         active_step_indices: tuple[int, ...],
-        residual_ratio: float,
+        max_residual_velocity_rms: float,
         differentiate_base_velocity: bool,
         log_prob_reduction: str,
     ) -> None:
         self.num_denoise_steps = num_denoise_steps
         self.action_chunk = action_chunk
         self.active_step_indices = frozenset(active_step_indices)
-        self.residual_ratio = residual_ratio
+        self.max_residual_velocity_rms = max_residual_velocity_rms
         self.differentiate_base_velocity = differentiate_base_velocity
         self.log_prob_reduction = log_prob_reduction
 
@@ -106,7 +106,7 @@ class RFPOGuidedSampler:
                 condition_tokens=prefix_output,
                 condition_mask=prefix_pad_masks.to(dtype=torch.bool),
                 deterministic=deterministic,
-                residual_ratio=self.residual_ratio,
+                max_residual_velocity_rms=self.max_residual_velocity_rms,
             )
             delta_velocity = actor_output["delta_velocity"]
             if delta_velocity.shape != base_velocity.shape:

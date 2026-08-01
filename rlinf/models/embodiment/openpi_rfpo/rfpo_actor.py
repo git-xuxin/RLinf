@@ -25,6 +25,31 @@ from rlinf.models.embodiment.modules.dit import DiTBackbone
 from rlinf.models.embodiment.modules.transformer import sinusoidal_position_embedding
 
 
+def project_residual_velocity(
+    candidate: torch.Tensor,
+    max_residual_velocity_rms: float,
+    *,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Project each residual sample onto a fixed RMS ball."""
+    if not math.isfinite(max_residual_velocity_rms):
+        raise ValueError("RFPO max_residual_velocity_rms must be finite.")
+    if max_residual_velocity_rms < 0:
+        raise ValueError("RFPO max_residual_velocity_rms must be non-negative.")
+    if candidate.ndim != 3:
+        raise ValueError(
+            "RFPO residual velocity must have shape [batch, horizon, dim]."
+        )
+
+    candidate_rms = candidate.float().pow(2).mean(dim=(1, 2)).sqrt()
+    projection_scale = torch.clamp(
+        max_residual_velocity_rms / candidate_rms.clamp_min(eps),
+        max=1.0,
+    )
+    projected = candidate * projection_scale[:, None, None]
+    return projected, projection_scale
+
+
 class RFPOResidualActor(nn.Module):
     """Gaussian DiT policy over full-horizon residual velocities."""
 
@@ -78,10 +103,8 @@ class RFPOResidualActor(nn.Module):
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor | None,
         deterministic: bool = False,
-        residual_ratio: float = 1.0,
+        max_residual_velocity_rms: float = 0.2,
     ) -> dict[str, torch.Tensor]:
-        if residual_ratio < 0:
-            raise ValueError("RFPO residual_ratio must be non-negative.")
         step_feature = step_size.reshape(-1, 1, 1).expand(
             noisy_action.shape[0], noisy_action.shape[1], 1
         )
@@ -119,15 +142,10 @@ class RFPOResidualActor(nn.Module):
             + math.log(2 * math.pi)
         )
 
-        projection_eps = 1e-6
-        base_velocity_rms = base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
-        candidate_rms = raw_delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
-        max_residual_rms = residual_ratio * (base_velocity_rms + projection_eps)
-        projection_scale = torch.minimum(
-            torch.ones_like(candidate_rms),
-            max_residual_rms / (candidate_rms + projection_eps),
+        delta_velocity, projection_scale = project_residual_velocity(
+            raw_delta_velocity,
+            max_residual_velocity_rms,
         )
-        delta_velocity = raw_delta_velocity * projection_scale[:, None, None]
         return {
             "delta_velocity": delta_velocity,
             "raw_delta_velocity": raw_delta_velocity,

@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -38,7 +39,7 @@ from .rfpo_sampler import RFPOGuidedSampler
 class OpenPiRFPOConfig(OpenPi0Config):
     """Configuration for pi0 residual-flow adaptation."""
 
-    residual_ratio: float = 0.1
+    max_residual_velocity_rms: float = 0.2
     num_denoise_steps: int = 4
     active_step_indices: tuple[int, ...] = field(default_factory=lambda: (2, 3))
     differentiate_base_velocity: bool = True
@@ -76,8 +77,10 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 "RFPO num_denoise_steps must match pi0 num_steps to preserve the "
                 "pretrained Euler schedule."
             )
-        if self.residual_ratio < 0:
-            raise ValueError("residual_ratio must be non-negative.")
+        if not math.isfinite(self.max_residual_velocity_rms):
+            raise ValueError("max_residual_velocity_rms must be finite.")
+        if self.max_residual_velocity_rms < 0:
+            raise ValueError("max_residual_velocity_rms must be non-negative.")
         if self.action_chunk <= 0 or self.action_chunk > self.action_horizon:
             raise ValueError("action_chunk must lie within the pi0 action horizon.")
         if self.internal_log_prob_reduction not in {"mean_active", "sum_active"}:
@@ -149,7 +152,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             num_denoise_steps=config.num_denoise_steps,
             action_chunk=config.action_chunk,
             active_step_indices=tuple(config.active_step_indices),
-            residual_ratio=config.residual_ratio,
+            max_residual_velocity_rms=config.max_residual_velocity_rms,
             differentiate_base_velocity=config.differentiate_base_velocity,
             log_prob_reduction=config.internal_log_prob_reduction,
         )

@@ -5,10 +5,10 @@ defaults:
 model_type: "openpi_rfpo"
 
 rfpo:
-  # Per-sample RMS budget relative to the frozen pi0 base velocity.
-  residual_ratio: 0.1
+  # Fixed per-sample RMS limit in the normalized pi0 velocity space.
+  max_residual_velocity_rms: 0.2
   num_denoise_steps: ${..num_steps}
-  active_step_indices: [2, 3]
+  active_step_indices: [0, 1, 2, 3]
   differentiate_base_velocity: True
 
   initial_log_std: -4.0
