@@ -321,6 +321,25 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 action_delta.float().pow(2).mean().sqrt().item()
             ),
         }
+        base_rms_per_step = output["base_velocity_rms_per_step"]
+        residual_rms_per_step = output["residual_velocity_rms_per_step"]
+        if base_rms_per_step.shape != residual_rms_per_step.shape:
+            raise ValueError(
+                "RFPO per-step base and residual RMS tensors must have matching "
+                "shapes."
+            )
+        if base_rms_per_step.ndim != 2:
+            raise ValueError(
+                "RFPO per-step RMS tensors must have shape [batch, denoise_steps]."
+            )
+        base_rms_means = base_rms_per_step.mean(dim=0).detach().cpu().tolist()
+        residual_rms_means = residual_rms_per_step.mean(dim=0).detach().cpu().tolist()
+        for step_idx, (base_rms, residual_rms) in enumerate(
+            zip(base_rms_means, residual_rms_means, strict=True)
+        ):
+            prefix = f"denoise_step_{step_idx}"
+            metrics[f"{prefix}/base_velocity_rms"] = base_rms
+            metrics[f"{prefix}/residual_velocity_rms"] = residual_rms
         return actor_loss, metrics
 
     def update_one_epoch(self, train_actor: bool = True):

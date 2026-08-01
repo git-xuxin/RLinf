@@ -387,6 +387,8 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             "internal_log_prob": output["internal_log_prob"],
             "residual_rms": output["residual_rms"],
             "base_velocity_rms": output["base_velocity_rms"],
+            "base_velocity_rms_per_step": output["base_velocity_rms_per_step"],
+            "residual_velocity_rms_per_step": output["residual_velocity_rms_per_step"],
             "residual_to_base_ratio": output["residual_to_base_ratio"],
             "residual_projection_scale": output["residual_projection_scale"],
             "active_step_mask": output["active_step_mask"],

@@ -237,6 +237,7 @@ class RFPOGuidedSampler:
 
         internal_log_probs = []
         residual_norms = []
+        residual_norms_per_step = []
         residual_ratios = []
         projection_scales = []
         velocity_norms = []
@@ -270,6 +271,7 @@ class RFPOGuidedSampler:
 
             velocity_norms.append(step_output["base_velocity_rms"])
             actor_output = step_output["actor_output"]
+            residual_rms = torch.zeros_like(step_output["base_velocity_rms"])
             if actor_output is not None:
                 active_mask[idx] = True
                 delta_velocity = step_output["delta_velocity"]
@@ -281,6 +283,7 @@ class RFPOGuidedSampler:
                     residual_rms / (step_output["base_velocity_rms"] + 1e-6)
                 )
                 projection_scales.append(actor_output["projection_scale"])
+            residual_norms_per_step.append(residual_rms)
 
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
@@ -299,7 +302,11 @@ class RFPOGuidedSampler:
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
 
-        base_velocity_rms = torch.stack(velocity_norms, dim=1).mean(dim=1)
+        base_velocity_rms_per_step = torch.stack(velocity_norms, dim=1)
+        residual_velocity_rms_per_step = torch.stack(
+            residual_norms_per_step, dim=1
+        )
+        base_velocity_rms = base_velocity_rms_per_step.mean(dim=1)
         if residual_norms:
             residual_rms = torch.stack(residual_norms, dim=1).mean(dim=1)
             residual_to_base_ratio = torch.stack(residual_ratios, dim=1).mean(dim=1)
@@ -321,6 +328,8 @@ class RFPOGuidedSampler:
             ),
             "residual_rms": residual_rms,
             "base_velocity_rms": base_velocity_rms,
+            "base_velocity_rms_per_step": base_velocity_rms_per_step,
+            "residual_velocity_rms_per_step": residual_velocity_rms_per_step,
             "residual_to_base_ratio": residual_to_base_ratio,
             "residual_projection_scale": residual_projection_scale,
             "active_step_mask": active_mask,
