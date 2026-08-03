@@ -16,13 +16,13 @@ rfpo:
   max_log_std: 0.0
   internal_log_prob_reduction: "mean_active"
 
-  actor_hidden_size: 256
-  actor_num_layers: 2
+  actor_hidden_size: 512
+  actor_num_layers: 3
   actor_num_heads: 8
   actor_mlp_ratio: 4.0
 
-  critic_hidden_size: 256
-  critic_num_layers: 2
+  critic_hidden_size: 512
+  critic_num_layers: 3
   critic_num_heads: 8
   critic_mlp_ratio: 4.0
 
