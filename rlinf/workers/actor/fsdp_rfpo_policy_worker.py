@@ -183,15 +183,16 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             ) from exc
 
     def _reshape_actions(self, actions: torch.Tensor) -> torch.Tensor:
-        action_chunk = int(self.cfg.actor.model.num_action_chunks)
-        model_action_dim = int(self._unwrapped_model().config.action_dim)
-        expected_flat_dim = action_chunk * model_action_dim
+        model_config = self._unwrapped_model().config
+        action_chunk = int(model_config.rfpo_action_chunk)
+        action_dim = int(model_config.rfpo_action_dim)
+        expected_flat_dim = action_chunk * action_dim
         if actions.ndim != 2 or actions.shape[1] != expected_flat_dim:
             raise ValueError(
                 "RFPO replay actions must contain one flattened normalized model "
                 f"chunk of size {expected_flat_dim}, got {tuple(actions.shape)}."
             )
-        return actions.reshape(actions.shape[0], action_chunk, model_action_dim)
+        return actions.reshape(actions.shape[0], action_chunk, action_dim)
 
     def _chunk_target_terms(
         self, rewards: torch.Tensor, dones: torch.Tensor
@@ -266,7 +267,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             )
             target_q_values = self.target_critic(
                 next_output["actions"],
-                state=next_output["critic_state"],
+                state_embedding=next_output["critic_state_embedding"],
                 condition_tokens=next_output["critic_condition_tokens"],
                 condition_mask=next_output["critic_condition_mask"],
             ).min(dim=-1, keepdim=True).values

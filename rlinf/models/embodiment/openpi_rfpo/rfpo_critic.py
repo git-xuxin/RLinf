@@ -44,22 +44,33 @@ class RFPOQNetwork(nn.Module):
     ) -> None:
         super().__init__()
         self.action_proj = nn.Linear(action_dim, hidden_size)
-        self.state_context_proj = nn.Linear(state_dim, context_dim)
+        self.prefix_proj = nn.Linear(context_dim, hidden_size)
+        self.state_context_proj = nn.Linear(state_dim, hidden_size)
+        self.action_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.q_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.prefix_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.state_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
         self.backbone = TransformerBackbone(
             hidden_size,
             num_layers,
             num_heads,
-            context_dim=context_dim,
+            context_dim=hidden_size,
             mlp_ratio=mlp_ratio,
             dropout=dropout,
         )
-        self.q_head = nn.Linear(hidden_size, 1)
+        self.q_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, 1),
+        )
 
     def forward(
         self,
         actions: torch.Tensor,
         *,
-        state: torch.Tensor,
+        state_embedding: torch.Tensor,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor | None,
         action_mask: torch.Tensor | None = None,
@@ -82,7 +93,10 @@ class RFPOQNetwork(nn.Module):
             raise ValueError("Every RFPO critic sample must contain a valid action.")
 
         network_dtype = self.action_proj.weight.dtype
-        action_tokens = self.action_proj(actions.to(dtype=network_dtype))
+        action_tokens = (
+            self.action_proj(actions.to(dtype=network_dtype))
+            + self.action_type_embedding
+        )
         action_tokens = (
             action_tokens
             + sinusoidal_position_embedding(
@@ -92,11 +106,37 @@ class RFPOQNetwork(nn.Module):
                 dtype=action_tokens.dtype,
             )[None]
         )
-        state_token = self.state_context_proj(state.to(dtype=network_dtype))[:, None]
-        context = torch.cat(
-            [condition_tokens.to(dtype=network_dtype), state_token], dim=1
+        if state_embedding.shape != (
+            batch_size,
+            1,
+            self.state_context_proj.in_features,
+        ):
+            raise ValueError("RFPO critic state_embedding must have shape [B, 1, S].")
+        if condition_tokens.ndim != 3 or condition_tokens.shape[0] != batch_size:
+            raise ValueError("RFPO critic prefix tokens must have shape [B, P, E].")
+        q_token = self.q_token.expand(batch_size, -1, -1)
+        input_tokens = torch.cat([action_tokens, q_token], dim=1)
+        input_mask = torch.cat(
+            [
+                action_mask,
+                torch.ones(
+                    (batch_size, 1), dtype=torch.bool, device=action_mask.device
+                ),
+            ],
+            dim=1,
         )
+        prefix_context = self.prefix_proj(
+            condition_tokens.detach().to(dtype=network_dtype)
+        ) + self.prefix_type_embedding
+        state_token = self.state_context_proj(
+            state_embedding.detach().to(dtype=network_dtype)
+        ) + self.state_type_embedding
+        context = torch.cat([prefix_context, state_token], dim=1)
         if condition_mask is not None:
+            if condition_mask.shape != condition_tokens.shape[:2]:
+                raise ValueError(
+                    "RFPO critic condition_mask must match the prefix token shape."
+                )
             state_mask = torch.ones(
                 (condition_mask.shape[0], 1),
                 dtype=torch.bool,
@@ -106,14 +146,12 @@ class RFPOQNetwork(nn.Module):
                 [condition_mask.to(dtype=torch.bool), state_mask], dim=1
             )
         hidden = self.backbone(
-            action_tokens,
-            padding_mask=action_mask,
+            input_tokens,
+            padding_mask=input_mask,
             context=context,
             context_mask=condition_mask,
         )
-        weights = action_mask.unsqueeze(-1).to(dtype=hidden.dtype)
-        pooled = (hidden * weights).sum(dim=1) / weights.sum(dim=1)
-        return self.q_head(pooled).float()
+        return self.q_head(hidden[:, -1]).float()
 
 
 class RFPODoubleQCritic(nn.Module):
@@ -128,21 +166,21 @@ class RFPODoubleQCritic(nn.Module):
         self,
         actions: torch.Tensor,
         *,
-        state: torch.Tensor,
+        state_embedding: torch.Tensor,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor | None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         q1 = self.q1(
             actions,
-            state=state,
+            state_embedding=state_embedding,
             condition_tokens=condition_tokens,
             condition_mask=condition_mask,
             action_mask=action_mask,
         )
         q2 = self.q2(
             actions,
-            state=state,
+            state_embedding=state_embedding,
             condition_tokens=condition_tokens,
             condition_mask=condition_mask,
             action_mask=action_mask,

@@ -39,6 +39,8 @@ from .rfpo_sampler import RFPOGuidedSampler
 class OpenPiRFPOConfig(OpenPi0Config):
     """Configuration for pi0 residual-flow adaptation."""
 
+    rfpo_action_chunk: int = 5
+    rfpo_action_dim: int = 7
     max_residual_velocity_rms: float = 0.2
     num_denoise_steps: int = 4
     active_step_indices: tuple[int, ...] = field(default_factory=lambda: (2, 3))
@@ -62,10 +64,6 @@ class OpenPiRFPOConfig(OpenPi0Config):
         parent_post_init = getattr(super(), "__post_init__", None)
         if parent_post_init is not None:
             parent_post_init()
-        if self.config_name != "pi0_libero":
-            raise ValueError(
-                "OpenPi RFPO initially supports only config_name='pi0_libero'."
-            )
         if self.noise_method != "flow_ode":
             raise ValueError("OpenPi RFPO requires noise_method='flow_ode'.")
         if self.use_dsrl or self.use_rlt or self.is_nft:
@@ -81,15 +79,24 @@ class OpenPiRFPOConfig(OpenPi0Config):
             raise ValueError("max_residual_velocity_rms must be finite.")
         if self.max_residual_velocity_rms < 0:
             raise ValueError("max_residual_velocity_rms must be non-negative.")
-        if self.action_chunk <= 0 or self.action_chunk > self.action_horizon:
-            raise ValueError("action_chunk must lie within the pi0 action horizon.")
+        if (
+            self.rfpo_action_chunk <= 0
+            or self.rfpo_action_chunk > self.action_horizon
+        ):
+            raise ValueError(
+                "rfpo_action_chunk must lie within the pi0 action horizon."
+            )
+        if self.rfpo_action_dim <= 0 or self.rfpo_action_dim > self.action_dim:
+            raise ValueError(
+                "rfpo_action_dim must lie within the pi0 model action width."
+            )
         if self.internal_log_prob_reduction not in {"mean_active", "sum_active"}:
             raise ValueError(
                 "internal_log_prob_reduction must be 'mean_active' or 'sum_active'."
             )
         if self.context_dim != 2048:
             raise ValueError(
-                "OpenPi RFPO pi0_libero prefix tokens have width 2048; "
+                "OpenPi RFPO prefix tokens must have width 2048; "
                 f"got context_dim={self.context_dim}."
             )
         if not 0.0 <= self.dropout < 1.0:
@@ -125,14 +132,18 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
     def __init__(self, config: OpenPiRFPOConfig) -> None:
         super().__init__(config)
         self.requires_grad_(False)
-        network_kwargs = {
-            "action_dim": config.action_dim,
-            "state_dim": config.action_dim,
-            "context_dim": config.context_dim,
-            "dropout": config.dropout,
-        }
+        if not hasattr(self, "state_proj"):
+            raise ValueError(
+                "OpenPi RFPO requires a pi0 backbone that exposes state_proj."
+            )
+        state_embedding_dim = self.state_proj.out_features
         self.residual_actor = RFPOResidualActor(
-            **network_kwargs,
+            action_horizon=config.action_horizon,
+            pi0_action_dim=config.action_dim,
+            rfpo_action_chunk=config.rfpo_action_chunk,
+            rfpo_action_dim=config.rfpo_action_dim,
+            state_dim=state_embedding_dim,
+            prefix_dim=config.context_dim,
             hidden_size=config.actor_hidden_size,
             num_layers=config.actor_num_layers,
             num_heads=config.actor_num_heads,
@@ -140,9 +151,13 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             initial_log_std=config.initial_log_std,
             min_log_std=config.min_log_std,
             max_log_std=config.max_log_std,
+            dropout=config.dropout,
         ).to(dtype=torch.bfloat16)
         self.online_critic = RFPODoubleQCritic(
-            **network_kwargs,
+            action_dim=config.rfpo_action_dim,
+            state_dim=state_embedding_dim,
+            context_dim=config.context_dim,
+            dropout=config.dropout,
             hidden_size=config.critic_hidden_size,
             num_layers=config.critic_num_layers,
             num_heads=config.critic_num_heads,
@@ -150,7 +165,8 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         ).to(dtype=torch.bfloat16)
         self.rfpo_sampler = RFPOGuidedSampler(
             num_denoise_steps=config.num_denoise_steps,
-            action_chunk=config.action_chunk,
+            rfpo_action_chunk=config.rfpo_action_chunk,
+            rfpo_action_dim=config.rfpo_action_dim,
             active_step_indices=tuple(config.active_step_indices),
             max_residual_velocity_rms=config.max_residual_velocity_rms,
             differentiate_base_velocity=config.differentiate_base_velocity,
@@ -232,13 +248,23 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
                     "RFPO condition token width does not match context_dim: "
                     f"{prefix_output.shape[-1]} != {self.config.context_dim}."
                 )
+            state_embedding = self._rfpo_state_embedding(state)
         return {
             "state": state.detach(),
+            "state_embedding": state_embedding.detach(),
             "prefix_output": prefix_output.detach(),
             "condition_mask": prefix_pad_masks.detach().to(dtype=torch.bool),
             "prefix_pad_masks": prefix_pad_masks.detach(),
             "past_key_values": past_key_values,
         }
+
+    def _rfpo_state_embedding(self, state: torch.Tensor) -> torch.Tensor:
+        """Return only pi0's raw state suffix token, excluding action/time tokens."""
+        state_dtype = self.state_proj.weight.dtype
+        state_embedding = self.state_proj(state.to(dtype=state_dtype))[:, None]
+        if state_embedding.ndim != 3 or state_embedding.shape[1] != 1:
+            raise ValueError("RFPO pi0 state embedding must have shape [B, 1, S].")
+        return state_embedding
 
     def _sample_guided(
         self,
@@ -260,6 +286,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             )
         sampler_output = self._sample_actions_with_prefix_cache(
             state=condition["state"],
+            state_embedding=condition["state_embedding"],
             prefix_output=condition["prefix_output"],
             prefix_pad_masks=condition["prefix_pad_masks"],
             past_key_values=condition["past_key_values"],
@@ -316,12 +343,16 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         mode="train",
         compute_values=True,
         *,
+        state_embedding: torch.Tensor | None = None,
         deterministic: bool | None = None,
         retain_residual_grads: bool = False,
     ) -> dict[str, Any]:
+        if state_embedding is None:
+            state_embedding = self._rfpo_state_embedding(state).detach()
         return self.rfpo_sampler.sample(
             self,
             state=state,
+            state_embedding=state_embedding,
             prefix_output=prefix_output,
             prefix_pad_masks=prefix_pad_masks,
             past_key_values=past_key_values,
@@ -385,7 +416,9 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             retain_residual_grads=retain_residual_grads,
         )
         result = {
-            "actions": output["actions"][:, : self.config.action_chunk],
+            "actions": output["actions"][
+                :, : self.config.rfpo_action_chunk, : self.config.rfpo_action_dim
+            ],
             "model_action_horizon": output["actions"],
             "internal_log_prob": output["internal_log_prob"],
             "residual_rms": output["residual_rms"],
@@ -396,7 +429,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             "residual_projection_scale": output["residual_projection_scale"],
             "active_step_mask": output["active_step_mask"],
             "active_residuals": output["active_residuals"],
-            "critic_state": condition["state"],
+            "critic_state_embedding": condition["state_embedding"],
             "critic_condition_tokens": condition["prefix_output"],
             "critic_condition_mask": condition["condition_mask"],
         }
@@ -407,11 +440,13 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
                 prefix_pad_masks=condition["prefix_pad_masks"],
                 past_key_values=condition["past_key_values"],
                 noise=noise,
-            )[:, : self.config.action_chunk]
+            )[
+                :, : self.config.rfpo_action_chunk, : self.config.rfpo_action_dim
+            ]
         if evaluate_q:
             result["q_values"] = self.online_critic(
                 result["actions"],
-                state=condition["state"],
+                state_embedding=condition["state_embedding"],
                 condition_tokens=condition["prefix_output"],
                 condition_mask=condition["condition_mask"],
             )
@@ -434,7 +469,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         condition = self._condition_from_observation(observation)
         return self.online_critic(
             actions,
-            state=condition["state"],
+            state_embedding=condition["state_embedding"],
             condition_tokens=condition["prefix_output"],
             condition_mask=condition["condition_mask"],
             action_mask=action_mask,
@@ -462,7 +497,9 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         )["actions"]
         prev_logprobs = outputs["prev_logprobs"]
         prev_values = outputs["prev_values"]
-        model_chunk = outputs["actions"][:, : self.config.action_chunk]
+        model_chunk = outputs["actions"][
+            :, : self.config.rfpo_action_chunk, : self.config.rfpo_action_dim
+        ]
         forward_inputs = {
             "tokenized_prompt": processed_obs["tokenized_prompt"],
             "tokenized_prompt_mask": processed_obs["tokenized_prompt_mask"],

@@ -121,6 +121,7 @@ actor:
   model:
     model_path: "/path/to/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     num_action_chunks: 5
+    action_dim: 7
 
     openpi:
       noise_method: "flow_ode"

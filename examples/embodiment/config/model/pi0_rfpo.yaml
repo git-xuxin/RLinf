@@ -5,6 +5,10 @@ defaults:
 model_type: "openpi_rfpo"
 
 rfpo:
+  # Active RFPO region; pi0 still denoises its full model action tensor.
+  rfpo_action_chunk: ${..num_action_chunks}
+  rfpo_action_dim: ${..action_dim}
+
   # Fixed per-sample RMS limit in the normalized pi0 velocity space.
   max_residual_velocity_rms: 0.2
   num_denoise_steps: ${..num_steps}

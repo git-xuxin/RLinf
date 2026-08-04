@@ -29,14 +29,16 @@ class RFPOGuidedSampler:
         self,
         *,
         num_denoise_steps: int,
-        action_chunk: int,
+        rfpo_action_chunk: int,
+        rfpo_action_dim: int,
         active_step_indices: tuple[int, ...],
         max_residual_velocity_rms: float,
         differentiate_base_velocity: bool,
         log_prob_reduction: str,
     ) -> None:
         self.num_denoise_steps = num_denoise_steps
-        self.action_chunk = action_chunk
+        self.rfpo_action_chunk = rfpo_action_chunk
+        self.rfpo_action_dim = rfpo_action_dim
         self.active_step_indices = frozenset(active_step_indices)
         self.max_residual_velocity_rms = max_residual_velocity_rms
         self.differentiate_base_velocity = differentiate_base_velocity
@@ -63,6 +65,7 @@ class RFPOGuidedSampler:
         x_t,
         idx,
         state,
+        state_embedding,
         prefix_output,
         prefix_pad_masks,
         past_key_values,
@@ -92,7 +95,12 @@ class RFPOGuidedSampler:
         )
         if not self.differentiate_base_velocity:
             base_velocity = base_velocity.detach()
-        base_velocity_rms = base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+        active_base_velocity = base_velocity[
+            :, : self.rfpo_action_chunk, : self.rfpo_action_dim
+        ]
+        base_velocity_rms = (
+            active_base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+        )
 
         delta_velocity = torch.zeros_like(base_velocity)
         actor_output = None
@@ -101,9 +109,8 @@ class RFPOGuidedSampler:
                 x_t,
                 base_velocity.detach(),
                 t_input,
-                -delta,
-                state=state,
-                condition_tokens=prefix_output,
+                state_embedding=state_embedding,
+                prefix_tokens=prefix_output,
                 condition_mask=prefix_pad_masks.to(dtype=torch.bool),
                 deterministic=deterministic,
                 max_residual_velocity_rms=self.max_residual_velocity_rms,
@@ -171,6 +178,7 @@ class RFPOGuidedSampler:
         model,
         *,
         state: torch.Tensor,
+        state_embedding: torch.Tensor,
         prefix_output: torch.Tensor,
         prefix_pad_masks: torch.Tensor,
         past_key_values,
@@ -197,12 +205,18 @@ class RFPOGuidedSampler:
             raise ValueError(
                 f"RFPO noise must have shape [B, H, D], got {tuple(noise.shape)}."
             )
-        if self.action_chunk > noise.shape[1]:
+        if self.rfpo_action_chunk > noise.shape[1]:
             raise ValueError(
                 "RFPO execution chunk cannot exceed the pi0 action horizon."
             )
+        if self.rfpo_action_dim > noise.shape[2]:
+            raise ValueError(
+                "RFPO action dimension cannot exceed the pi0 model action width."
+            )
         if prefix_output.shape[0] != bsize:
             raise ValueError("RFPO prefix tensors must share the state batch size.")
+        if state_embedding.ndim != 3 or state_embedding.shape[:2] != (bsize, 1):
+            raise ValueError("RFPO state embedding must have shape [B, 1, S].")
         if deterministic is None:
             deterministic = mode == "eval"
 
@@ -254,6 +268,7 @@ class RFPOGuidedSampler:
                 x_t,
                 idx,
                 state,
+                state_embedding,
                 prefix_output,
                 prefix_pad_masks,
                 past_key_values,
@@ -274,10 +289,12 @@ class RFPOGuidedSampler:
             residual_rms = torch.zeros_like(step_output["base_velocity_rms"])
             if actor_output is not None:
                 active_mask[idx] = True
-                delta_velocity = step_output["delta_velocity"]
-                active_residuals.append((idx, delta_velocity))
+                active_delta_velocity = actor_output["active_delta_velocity"]
+                active_residuals.append((idx, active_delta_velocity))
                 internal_log_probs.append(actor_output["log_prob"])
-                residual_rms = delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+                residual_rms = (
+                    active_delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+                )
                 residual_norms.append(residual_rms)
                 residual_ratios.append(
                     residual_rms / (step_output["base_velocity_rms"] + 1e-6)
@@ -288,7 +305,7 @@ class RFPOGuidedSampler:
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
         log_probs = torch.stack(log_probs, dim=1)[
-            :, :, : self.action_chunk, : model.config.action_env_dim
+            :, :, : self.rfpo_action_chunk, : self.rfpo_action_dim
         ]
         if model.config.joint_logprob:
             log_probs = log_probs.mean(dim=1)
