@@ -65,6 +65,21 @@ class RFPOQNetwork(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, 1),
         )
+        self._init_q_head_weights()
+
+    def _init_q_head_weights(self) -> None:
+        linear_layers = [
+            module for module in self.q_head if isinstance(module, nn.Linear)
+        ]
+        for module in linear_layers[:-1]:
+            nn.init.xavier_uniform_(module.weight, gain=1.0)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+        output_layer = linear_layers[-1]
+        nn.init.normal_(output_layer.weight, mean=0.0, std=1e-3)
+        if output_layer.bias is not None:
+            nn.init.zeros_(output_layer.bias)
 
     def forward(
         self,
