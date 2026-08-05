@@ -28,6 +28,9 @@ if TYPE_CHECKING:
     from rlinf.workers.actor.async_fsdp_dagger_policy_worker import (
         AsyncEmbodiedDAGGERFSDPPolicy,
     )
+    from rlinf.workers.actor.async_fsdp_rfpo_policy_worker import (
+        AsyncEmbodiedRFPOFSDPPolicy,
+    )
     from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
         AsyncEmbodiedSACFSDPPolicy,
     )
@@ -42,7 +45,11 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
     def __init__(
         self,
         cfg: DictConfig,
-        actor: Union["AsyncEmbodiedSACFSDPPolicy", "AsyncEmbodiedDAGGERFSDPPolicy"],
+        actor: Union[
+            "AsyncEmbodiedSACFSDPPolicy",
+            "AsyncEmbodiedRFPOFSDPPolicy",
+            "AsyncEmbodiedDAGGERFSDPPolicy",
+        ],
         rollout: "AsyncMultiStepRolloutWorker",
         env: "AsyncEnvWorker",
         reward: "EmbodiedRewardWorker",
