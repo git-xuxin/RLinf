@@ -35,6 +35,20 @@ from .rfpo_critic import RFPODoubleQCritic
 from .rfpo_sampler import RFPOGuidedSampler
 
 
+def _default_critic_transformer_config() -> dict[str, Any]:
+    """Return the standard PyTorch Transformer defaults used by RFPO."""
+    return {
+        "d_model": 512,
+        "nhead": 8,
+        "num_encoder_layers": 6,
+        "num_decoder_layers": 6,
+        "dim_feedforward": 2048,
+        "dropout": 0.1,
+        "activation": "relu",
+        "norm_first": False,
+    }
+
+
 @dataclass(frozen=True)
 class OpenPiRFPOConfig(OpenPi0Config):
     """Configuration for pi0 residual-flow adaptation."""
@@ -53,10 +67,10 @@ class OpenPiRFPOConfig(OpenPi0Config):
     actor_num_layers: int = 2
     actor_num_heads: int = 8
     actor_mlp_ratio: float = 4.0
-    critic_hidden_size: int = 256
-    critic_num_layers: int = 2
-    critic_num_heads: int = 8
-    critic_mlp_ratio: float = 4.0
+    critic_transformer: dict[str, Any] = field(
+        default_factory=_default_critic_transformer_config
+    )
+    critic_mlp_hidden_dims: tuple[int, ...] = (512, 256)
     dropout: float = 0.0
     context_dim: int = 2048
 
@@ -79,10 +93,7 @@ class OpenPiRFPOConfig(OpenPi0Config):
             raise ValueError("max_residual_velocity_rms must be finite.")
         if self.max_residual_velocity_rms < 0:
             raise ValueError("max_residual_velocity_rms must be non-negative.")
-        if (
-            self.rfpo_action_chunk <= 0
-            or self.rfpo_action_chunk > self.action_horizon
-        ):
+        if self.rfpo_action_chunk <= 0 or self.rfpo_action_chunk > self.action_horizon:
             raise ValueError(
                 "rfpo_action_chunk must lie within the pi0 action horizon."
             )
@@ -101,6 +112,59 @@ class OpenPiRFPOConfig(OpenPi0Config):
             )
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie within [0, 1).")
+        transformer_defaults = _default_critic_transformer_config()
+        transformer_config = dict(self.critic_transformer)
+        unknown_transformer_keys = set(transformer_config) - set(transformer_defaults)
+        if unknown_transformer_keys:
+            raise ValueError(
+                "Unsupported RFPO critic Transformer options: "
+                f"{sorted(unknown_transformer_keys)}."
+            )
+        transformer_config = transformer_defaults | transformer_config
+        integer_options = (
+            "d_model",
+            "nhead",
+            "num_encoder_layers",
+            "num_decoder_layers",
+            "dim_feedforward",
+        )
+        for option in integer_options:
+            value = transformer_config[option]
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(
+                    f"RFPO critic Transformer {option} must be a positive integer."
+                )
+        if transformer_config["d_model"] % transformer_config["nhead"] != 0:
+            raise ValueError(
+                "RFPO critic Transformer d_model must be divisible by nhead."
+            )
+        transformer_dropout = transformer_config["dropout"]
+        if (
+            isinstance(transformer_dropout, bool)
+            or not isinstance(transformer_dropout, (int, float))
+            or not 0.0 <= transformer_dropout < 1.0
+        ):
+            raise ValueError("RFPO critic Transformer dropout must lie within [0, 1).")
+        transformer_config["dropout"] = float(transformer_dropout)
+        if transformer_config["activation"] not in {"relu", "gelu"}:
+            raise ValueError(
+                "RFPO critic Transformer activation must be 'relu' or 'gelu'."
+            )
+        if not isinstance(transformer_config["norm_first"], bool):
+            raise ValueError("RFPO critic Transformer norm_first must be a boolean.")
+        object.__setattr__(self, "critic_transformer", transformer_config)
+
+        critic_mlp_hidden_dims = tuple(self.critic_mlp_hidden_dims)
+        if any(
+            isinstance(hidden_dim, bool)
+            or not isinstance(hidden_dim, int)
+            or hidden_dim <= 0
+            for hidden_dim in critic_mlp_hidden_dims
+        ):
+            raise ValueError(
+                "RFPO critic MLP hidden dimensions must be positive integers."
+            )
+        object.__setattr__(self, "critic_mlp_hidden_dims", critic_mlp_hidden_dims)
         active_steps = tuple(int(i) for i in self.active_step_indices)
         if not active_steps:
             raise ValueError("active_step_indices must contain at least one step.")
@@ -110,18 +174,12 @@ class OpenPiRFPOConfig(OpenPi0Config):
             raise ValueError(
                 "active_step_indices must lie within the denoising schedule."
             )
-        for hidden_size, num_heads, name in (
-            (self.actor_hidden_size, self.actor_num_heads, "actor"),
-            (self.critic_hidden_size, self.critic_num_heads, "critic"),
-        ):
-            if hidden_size <= 0 or num_heads <= 0:
-                raise ValueError(
-                    f"RFPO {name} hidden size and head count must be positive."
-                )
-            if hidden_size % num_heads != 0:
-                raise ValueError(
-                    f"RFPO {name} hidden size must be divisible by its head count."
-                )
+        if self.actor_hidden_size <= 0 or self.actor_num_heads <= 0:
+            raise ValueError("RFPO actor hidden size and head count must be positive.")
+        if self.actor_hidden_size % self.actor_num_heads != 0:
+            raise ValueError(
+                "RFPO actor hidden size must be divisible by its head count."
+            )
 
 
 class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
@@ -157,11 +215,8 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             action_dim=config.rfpo_action_dim,
             state_dim=state_embedding_dim,
             context_dim=config.context_dim,
-            dropout=config.dropout,
-            hidden_size=config.critic_hidden_size,
-            num_layers=config.critic_num_layers,
-            num_heads=config.critic_num_heads,
-            mlp_ratio=config.critic_mlp_ratio,
+            mlp_hidden_dims=config.critic_mlp_hidden_dims,
+            **config.critic_transformer,
         ).to(dtype=torch.bfloat16)
         self.rfpo_sampler = RFPOGuidedSampler(
             num_denoise_steps=config.num_denoise_steps,
@@ -440,9 +495,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
                 prefix_pad_masks=condition["prefix_pad_masks"],
                 past_key_values=condition["past_key_values"],
                 noise=noise,
-            )[
-                :, : self.config.rfpo_action_chunk, : self.config.rfpo_action_dim
-            ]
+            )[:, : self.config.rfpo_action_chunk, : self.config.rfpo_action_dim]
         if evaluate_q:
             result["q_values"] = self.online_critic(
                 result["actions"],

@@ -25,10 +25,16 @@ rfpo:
   actor_num_heads: 8
   actor_mlp_ratio: 4.0
 
-  critic_hidden_size: 512
-  critic_num_layers: 3
-  critic_num_heads: 8
-  critic_mlp_ratio: 4.0
+  critic_transformer:
+    d_model: 512
+    nhead: 8
+    num_encoder_layers: 6
+    num_decoder_layers: 6
+    dim_feedforward: 2048
+    dropout: 0.1
+    activation: relu
+    norm_first: false
+  critic_mlp_hidden_dims: [512, 256]
 
   context_dim: 2048
   dropout: 0.0

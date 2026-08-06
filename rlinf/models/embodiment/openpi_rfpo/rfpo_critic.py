@@ -17,18 +17,37 @@
 from __future__ import annotations
 
 import copy
+import math
+from collections.abc import Sequence
 
 import torch
 from torch import nn
 
-from rlinf.models.embodiment.modules.transformer import (
-    TransformerBackbone,
-    sinusoidal_position_embedding,
-)
+
+def _sinusoidal_position_embedding(
+    length: int,
+    embedding_dim: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    max_period: int = 10_000,
+) -> torch.Tensor:
+    """Return the fixed positional encoding from the original Transformer."""
+    positions = torch.arange(length, device=device, dtype=torch.float32)[:, None]
+    frequencies = torch.exp(
+        -math.log(max_period)
+        * torch.arange(0, embedding_dim, 2, device=device, dtype=torch.float32)
+        / embedding_dim
+    )
+    angles = positions * frequencies[None]
+    embedding = torch.zeros((length, embedding_dim), device=device, dtype=torch.float32)
+    embedding[:, 0::2] = torch.sin(angles)
+    embedding[:, 1::2] = torch.cos(angles[:, : embedding[:, 1::2].shape[1]])
+    return embedding.to(dtype=dtype)
 
 
 class RFPOQNetwork(nn.Module):
-    """Evaluate a chunk using OpenPI's preprocessed state and prefix output."""
+    """Evaluate an action chunk with a standard encoder-decoder Transformer."""
 
     def __init__(
         self,
@@ -36,50 +55,46 @@ class RFPOQNetwork(nn.Module):
         action_dim: int,
         state_dim: int,
         context_dim: int,
-        hidden_size: int,
-        num_layers: int,
-        num_heads: int,
-        mlp_ratio: float,
+        d_model: int,
+        nhead: int,
+        num_encoder_layers: int,
+        num_decoder_layers: int,
+        dim_feedforward: int,
         dropout: float,
+        activation: str,
+        norm_first: bool,
+        mlp_hidden_dims: Sequence[int],
     ) -> None:
         super().__init__()
-        self.action_proj = nn.Linear(action_dim, hidden_size)
-        self.prefix_proj = nn.Linear(context_dim, hidden_size)
-        self.state_context_proj = nn.Linear(state_dim, hidden_size)
-        self.action_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
-        self.q_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
-        self.prefix_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
-        self.state_type_embedding = nn.Parameter(torch.zeros(1, 1, hidden_size))
-        self.backbone = TransformerBackbone(
-            hidden_size,
-            num_layers,
-            num_heads,
-            context_dim=hidden_size,
-            mlp_ratio=mlp_ratio,
+        self.action_proj = nn.Linear(action_dim, d_model)
+        self.prefix_proj = nn.Linear(context_dim, d_model)
+        self.state_proj = nn.Linear(state_dim, d_model)
+        self.value_token = nn.Parameter(torch.empty(1, 1, d_model))
+        self.transformer = nn.Transformer(
+            d_model=d_model,
+            nhead=nhead,
+            num_encoder_layers=num_encoder_layers,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
             dropout=dropout,
+            activation=activation,
+            batch_first=True,
+            norm_first=norm_first,
         )
-        self.q_head = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, 1),
-        )
-        self._init_q_head_weights()
+        q_head_dims = (d_model, *mlp_hidden_dims, 1)
+        q_head_layers: list[nn.Module] = []
+        for layer_index, (input_dim, output_dim) in enumerate(
+            zip(q_head_dims[:-1], q_head_dims[1:])
+        ):
+            q_head_layers.append(nn.Linear(input_dim, output_dim))
+            if layer_index < len(q_head_dims) - 2:
+                q_head_layers.append(nn.GELU())
+        self.q_head = nn.Sequential(*q_head_layers)
+        nn.init.normal_(self.value_token, mean=0.0, std=0.02)
 
-    def _init_q_head_weights(self) -> None:
-        linear_layers = [
-            module for module in self.q_head if isinstance(module, nn.Linear)
-        ]
-        for module in linear_layers[:-1]:
-            nn.init.xavier_uniform_(module.weight, gain=1.0)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-
-        output_layer = linear_layers[-1]
-        nn.init.normal_(output_layer.weight, mean=0.0, std=1e-3)
-        if output_layer.bias is not None:
-            nn.init.zeros_(output_layer.bias)
+    @staticmethod
+    def _padding_mask(valid_mask: torch.Tensor) -> torch.Tensor:
+        return ~valid_mask.to(dtype=torch.bool)
 
     def forward(
         self,
@@ -90,7 +105,9 @@ class RFPOQNetwork(nn.Module):
         condition_mask: torch.Tensor | None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return Q values without changing OpenPI state or prefix features."""
+        """Return Q values while preserving gradients through ``actions``."""
+        if actions.ndim != 3 or actions.shape[2] != self.action_proj.in_features:
+            raise ValueError("RFPO critic actions must have shape [B, H, A].")
         batch_size, action_chunk, _ = actions.shape
         if action_mask is None:
             action_mask = torch.ones(
@@ -107,31 +124,33 @@ class RFPOQNetwork(nn.Module):
         if not torch.all(action_mask.any(dim=1)):
             raise ValueError("Every RFPO critic sample must contain a valid action.")
 
-        network_dtype = self.action_proj.weight.dtype
-        action_tokens = (
-            self.action_proj(actions.to(dtype=network_dtype))
-            + self.action_type_embedding
-        )
-        action_tokens = (
-            action_tokens
-            + sinusoidal_position_embedding(
-                action_tokens.shape[1],
-                action_tokens.shape[2],
-                device=action_tokens.device,
-                dtype=action_tokens.dtype,
-            )[None]
-        )
         if state_embedding.shape != (
             batch_size,
             1,
-            self.state_context_proj.in_features,
+            self.state_proj.in_features,
         ):
             raise ValueError("RFPO critic state_embedding must have shape [B, 1, S].")
-        if condition_tokens.ndim != 3 or condition_tokens.shape[0] != batch_size:
+        if (
+            condition_tokens.ndim != 3
+            or condition_tokens.shape[0] != batch_size
+            or condition_tokens.shape[2] != self.prefix_proj.in_features
+        ):
             raise ValueError("RFPO critic prefix tokens must have shape [B, P, E].")
-        q_token = self.q_token.expand(batch_size, -1, -1)
-        input_tokens = torch.cat([action_tokens, q_token], dim=1)
-        input_mask = torch.cat(
+
+        network_dtype = self.action_proj.weight.dtype
+        action_tokens = self.action_proj(actions.to(dtype=network_dtype))
+        value_token = self.value_token.expand(batch_size, -1, -1)
+        target_tokens = torch.cat([action_tokens, value_token], dim=1)
+        target_tokens = (
+            target_tokens
+            + _sinusoidal_position_embedding(
+                target_tokens.shape[1],
+                target_tokens.shape[2],
+                device=target_tokens.device,
+                dtype=target_tokens.dtype,
+            )[None]
+        )
+        target_valid_mask = torch.cat(
             [
                 action_mask,
                 torch.ones(
@@ -140,31 +159,52 @@ class RFPOQNetwork(nn.Module):
             ],
             dim=1,
         )
+
         prefix_context = self.prefix_proj(
             condition_tokens.detach().to(dtype=network_dtype)
-        ) + self.prefix_type_embedding
-        state_token = self.state_context_proj(
+        )
+        state_context = self.state_proj(
             state_embedding.detach().to(dtype=network_dtype)
-        ) + self.state_type_embedding
-        context = torch.cat([prefix_context, state_token], dim=1)
+        )
+        source_tokens = torch.cat([prefix_context, state_context], dim=1)
+        source_tokens = (
+            source_tokens
+            + _sinusoidal_position_embedding(
+                source_tokens.shape[1],
+                source_tokens.shape[2],
+                device=source_tokens.device,
+                dtype=source_tokens.dtype,
+            )[None]
+        )
+
+        source_padding_mask = None
         if condition_mask is not None:
             if condition_mask.shape != condition_tokens.shape[:2]:
                 raise ValueError(
                     "RFPO critic condition_mask must match the prefix token shape."
                 )
-            state_mask = torch.ones(
-                (condition_mask.shape[0], 1),
-                dtype=torch.bool,
-                device=condition_mask.device,
+            source_valid_mask = torch.cat(
+                [
+                    condition_mask.to(device=condition_tokens.device, dtype=torch.bool),
+                    torch.ones(
+                        (batch_size, 1),
+                        dtype=torch.bool,
+                        device=condition_tokens.device,
+                    ),
+                ],
+                dim=1,
             )
-            condition_mask = torch.cat(
-                [condition_mask.to(dtype=torch.bool), state_mask], dim=1
-            )
-        hidden = self.backbone(
-            input_tokens,
-            padding_mask=input_mask,
-            context=context,
-            context_mask=condition_mask,
+            source_padding_mask = self._padding_mask(source_valid_mask)
+
+        hidden = self.transformer(
+            src=source_tokens,
+            tgt=target_tokens,
+            src_key_padding_mask=source_padding_mask,
+            tgt_key_padding_mask=self._padding_mask(target_valid_mask),
+            memory_key_padding_mask=source_padding_mask,
+            src_is_causal=False,
+            tgt_is_causal=False,
+            memory_is_causal=False,
         )
         return self.q_head(hidden[:, -1]).float()
 
