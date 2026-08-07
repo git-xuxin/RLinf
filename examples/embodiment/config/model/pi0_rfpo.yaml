@@ -28,13 +28,14 @@ rfpo:
   critic_transformer:
     d_model: 512
     nhead: 8
-    num_encoder_layers: 6
-    num_decoder_layers: 6
-    dim_feedforward: 2048
+    num_encoder_layers: 3
+    num_decoder_layers: 3
+    dim_feedforward: 1024
     dropout: 0.1
     activation: relu
-    norm_first: false
-  critic_mlp_hidden_dims: [512, 256]
+    norm_first: true
+
+  critic_mlp_hidden_dims: [256, 128]
 
   context_dim: 2048
   dropout: 0.0
