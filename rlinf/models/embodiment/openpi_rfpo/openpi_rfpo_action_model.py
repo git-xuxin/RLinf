@@ -35,17 +35,21 @@ from .rfpo_critic import RFPODoubleQCritic
 from .rfpo_sampler import RFPOGuidedSampler
 
 
-def _default_critic_transformer_config() -> dict[str, Any]:
-    """Return the standard PyTorch Transformer defaults used by RFPO."""
+def _default_critic_gemma3_config() -> dict[str, Any]:
+    """Return the randomly initialized Gemma3 critic defaults."""
     return {
-        "d_model": 512,
-        "nhead": 8,
-        "num_encoder_layers": 6,
-        "num_decoder_layers": 6,
-        "dim_feedforward": 2048,
-        "dropout": 0.1,
-        "activation": "relu",
-        "norm_first": False,
+        "hidden_size": 512,
+        "intermediate_size": 1024,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 8,
+        "num_key_value_heads": 4,
+        "head_dim": 64,
+        "max_position_embeddings": 1024,
+        "attention_dropout": 0.1,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000.0,
     }
 
 
@@ -67,10 +71,10 @@ class OpenPiRFPOConfig(OpenPi0Config):
     actor_num_layers: int = 2
     actor_num_heads: int = 8
     actor_mlp_ratio: float = 4.0
-    critic_transformer: dict[str, Any] = field(
-        default_factory=_default_critic_transformer_config
-    )
-    critic_mlp_hidden_dims: tuple[int, ...] = (512, 256)
+    critic_gemma3: dict[str, Any] = field(default_factory=_default_critic_gemma3_config)
+    critic_prefix_length: int = 816
+    critic_mlp_hidden_dims: tuple[int, ...] = (256, 128)
+    critic_q_output_init_std: float = 1e-3
     dropout: float = 0.0
     context_dim: int = 2048
 
@@ -112,59 +116,101 @@ class OpenPiRFPOConfig(OpenPi0Config):
             )
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError("dropout must lie within [0, 1).")
-        transformer_defaults = _default_critic_transformer_config()
-        transformer_config = dict(self.critic_transformer)
-        unknown_transformer_keys = set(transformer_config) - set(transformer_defaults)
-        if unknown_transformer_keys:
+        gemma3_defaults = _default_critic_gemma3_config()
+        gemma3_config = dict(self.critic_gemma3)
+        unknown_gemma3_keys = set(gemma3_config) - set(gemma3_defaults)
+        if unknown_gemma3_keys:
             raise ValueError(
-                "Unsupported RFPO critic Transformer options: "
-                f"{sorted(unknown_transformer_keys)}."
+                "Unsupported RFPO critic Gemma3 options: "
+                f"{sorted(unknown_gemma3_keys)}."
             )
-        transformer_config = transformer_defaults | transformer_config
+        gemma3_config = gemma3_defaults | gemma3_config
         integer_options = (
-            "d_model",
-            "nhead",
-            "num_encoder_layers",
-            "num_decoder_layers",
-            "dim_feedforward",
+            "hidden_size",
+            "intermediate_size",
+            "num_hidden_layers",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "head_dim",
+            "max_position_embeddings",
         )
         for option in integer_options:
-            value = transformer_config[option]
+            value = gemma3_config[option]
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(
-                    f"RFPO critic Transformer {option} must be a positive integer."
+                    f"RFPO critic Gemma3 {option} must be a positive integer."
                 )
-        if transformer_config["d_model"] % transformer_config["nhead"] != 0:
-            raise ValueError(
-                "RFPO critic Transformer d_model must be divisible by nhead."
-            )
-        transformer_dropout = transformer_config["dropout"]
         if (
-            isinstance(transformer_dropout, bool)
-            or not isinstance(transformer_dropout, (int, float))
-            or not 0.0 <= transformer_dropout < 1.0
+            gemma3_config["num_attention_heads"] % gemma3_config["num_key_value_heads"]
+            != 0
         ):
-            raise ValueError("RFPO critic Transformer dropout must lie within [0, 1).")
-        transformer_config["dropout"] = float(transformer_dropout)
-        if transformer_config["activation"] not in {"relu", "gelu"}:
             raise ValueError(
-                "RFPO critic Transformer activation must be 'relu' or 'gelu'."
+                "RFPO critic Gemma3 num_attention_heads must be divisible by "
+                "num_key_value_heads."
             )
-        if not isinstance(transformer_config["norm_first"], bool):
-            raise ValueError("RFPO critic Transformer norm_first must be a boolean.")
-        object.__setattr__(self, "critic_transformer", transformer_config)
+        attention_dropout = gemma3_config["attention_dropout"]
+        if (
+            isinstance(attention_dropout, bool)
+            or not isinstance(attention_dropout, (int, float))
+            or not 0.0 <= attention_dropout < 1.0
+        ):
+            raise ValueError(
+                "RFPO critic Gemma3 attention_dropout must lie within [0, 1)."
+            )
+        gemma3_config["attention_dropout"] = float(attention_dropout)
+        hidden_activation = gemma3_config["hidden_activation"]
+        if not isinstance(hidden_activation, str) or not hidden_activation:
+            raise ValueError(
+                "RFPO critic Gemma3 hidden_activation must be a non-empty string."
+            )
+        for option in ("initializer_range", "rms_norm_eps", "rope_theta"):
+            value = gemma3_config[option]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(
+                    f"RFPO critic Gemma3 {option} must be finite and positive."
+                )
+            gemma3_config[option] = float(value)
+        if (
+            isinstance(self.critic_prefix_length, bool)
+            or not isinstance(self.critic_prefix_length, int)
+            or self.critic_prefix_length <= 0
+        ):
+            raise ValueError("critic_prefix_length must be a positive integer.")
+        required_sequence_length = (
+            self.rfpo_action_chunk + self.critic_prefix_length + 2
+        )
+        if gemma3_config["max_position_embeddings"] < required_sequence_length:
+            raise ValueError(
+                "RFPO critic Gemma3 max_position_embeddings must cover action, "
+                "prefix, state, and value tokens: "
+                f"{gemma3_config['max_position_embeddings']} < "
+                f"{required_sequence_length}."
+            )
+        object.__setattr__(self, "critic_gemma3", gemma3_config)
 
         critic_mlp_hidden_dims = tuple(self.critic_mlp_hidden_dims)
-        if any(
+        if len(critic_mlp_hidden_dims) != 2 or any(
             isinstance(hidden_dim, bool)
             or not isinstance(hidden_dim, int)
             or hidden_dim <= 0
             for hidden_dim in critic_mlp_hidden_dims
         ):
             raise ValueError(
-                "RFPO critic MLP hidden dimensions must be positive integers."
+                "RFPO critic MLP requires exactly two positive hidden dimensions."
             )
         object.__setattr__(self, "critic_mlp_hidden_dims", critic_mlp_hidden_dims)
+        if (
+            isinstance(self.critic_q_output_init_std, bool)
+            or not isinstance(self.critic_q_output_init_std, (int, float))
+            or not math.isfinite(self.critic_q_output_init_std)
+            or self.critic_q_output_init_std <= 0
+        ):
+            raise ValueError("critic_q_output_init_std must be finite and positive.")
         active_steps = tuple(int(i) for i in self.active_step_indices)
         if not active_steps:
             raise ValueError("active_step_indices must contain at least one step.")
@@ -195,6 +241,11 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
                 "OpenPi RFPO requires a pi0 backbone that exposes state_proj."
             )
         state_embedding_dim = self.state_proj.out_features
+        if state_embedding_dim != 1024:
+            raise ValueError(
+                "OpenPi RFPO state embedding must have width 1024; "
+                f"got {state_embedding_dim}."
+            )
         self.residual_actor = RFPOResidualActor(
             action_horizon=config.action_horizon,
             pi0_action_dim=config.action_dim,
@@ -215,8 +266,10 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             action_dim=config.rfpo_action_dim,
             state_dim=state_embedding_dim,
             context_dim=config.context_dim,
+            prefix_length=config.critic_prefix_length,
             mlp_hidden_dims=config.critic_mlp_hidden_dims,
-            **config.critic_transformer,
+            q_output_init_std=config.critic_q_output_init_std,
+            **config.critic_gemma3,
         ).to(dtype=torch.bfloat16)
         self.rfpo_sampler = RFPOGuidedSampler(
             num_denoise_steps=config.num_denoise_steps,
