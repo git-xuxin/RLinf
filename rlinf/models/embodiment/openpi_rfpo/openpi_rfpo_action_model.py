@@ -67,10 +67,14 @@ class OpenPiRFPOConfig(OpenPi0Config):
     min_log_std: float = -8.0
     max_log_std: float = 0.0
     internal_log_prob_reduction: str = "mean_active"
-    actor_hidden_size: int = 256
-    actor_num_layers: int = 2
-    actor_num_heads: int = 8
-    actor_mlp_ratio: float = 4.0
+    dit_hidden_size: int = 384
+    dit_depth: int = 12
+    dit_num_heads: int = 6
+    dit_mlp_ratio: float = 4.0
+    condition_decoder_num_layers: int = 2
+    condition_decoder_num_heads: int = 6
+    condition_decoder_mlp_ratio: float = 4.0
+    timestep_frequency_embedding_size: int = 256
     critic_gemma3: dict[str, Any] = field(default_factory=_default_critic_gemma3_config)
     critic_prefix_length: int = 816
     critic_mlp_hidden_dims: tuple[int, ...] = (256, 128)
@@ -220,11 +224,35 @@ class OpenPiRFPOConfig(OpenPi0Config):
             raise ValueError(
                 "active_step_indices must lie within the denoising schedule."
             )
-        if self.actor_hidden_size <= 0 or self.actor_num_heads <= 0:
-            raise ValueError("RFPO actor hidden size and head count must be positive.")
-        if self.actor_hidden_size % self.actor_num_heads != 0:
+        architecture_integer_options = (
+            "dit_hidden_size",
+            "dit_depth",
+            "dit_num_heads",
+            "condition_decoder_num_layers",
+            "condition_decoder_num_heads",
+            "timestep_frequency_embedding_size",
+        )
+        for option in architecture_integer_options:
+            value = getattr(self, option)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"RFPO {option} must be a positive integer.")
+        architecture_ratios = ("dit_mlp_ratio", "condition_decoder_mlp_ratio")
+        for option in architecture_ratios:
+            value = getattr(self, option)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"RFPO {option} must be finite and positive.")
+        if self.dit_hidden_size % self.dit_num_heads != 0:
+            raise ValueError("RFPO DiT hidden size must be divisible by its head count.")
+        if self.dit_hidden_size % 2 != 0:
+            raise ValueError("RFPO DiT hidden size must be even for sin-cos positions.")
+        if self.dit_hidden_size % self.condition_decoder_num_heads != 0:
             raise ValueError(
-                "RFPO actor hidden size must be divisible by its head count."
+                "RFPO condition decoder hidden size must be divisible by its head count."
             )
 
 
@@ -247,16 +275,17 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
                 f"got {state_embedding_dim}."
             )
         self.residual_actor = RFPOResidualActor(
-            action_horizon=config.action_horizon,
-            pi0_action_dim=config.action_dim,
             rfpo_action_chunk=config.rfpo_action_chunk,
             rfpo_action_dim=config.rfpo_action_dim,
-            state_dim=state_embedding_dim,
             prefix_dim=config.context_dim,
-            hidden_size=config.actor_hidden_size,
-            num_layers=config.actor_num_layers,
-            num_heads=config.actor_num_heads,
-            mlp_ratio=config.actor_mlp_ratio,
+            hidden_size=config.dit_hidden_size,
+            dit_depth=config.dit_depth,
+            dit_num_heads=config.dit_num_heads,
+            dit_mlp_ratio=config.dit_mlp_ratio,
+            condition_decoder_num_layers=config.condition_decoder_num_layers,
+            condition_decoder_num_heads=config.condition_decoder_num_heads,
+            condition_decoder_mlp_ratio=config.condition_decoder_mlp_ratio,
+            timestep_frequency_embedding_size=config.timestep_frequency_embedding_size,
             initial_log_std=config.initial_log_std,
             min_log_std=config.min_log_std,
             max_log_std=config.max_log_std,
@@ -394,6 +423,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             )
         sampler_output = self._sample_actions_with_prefix_cache(
             state=condition["state"],
+            observation=observation,
             state_embedding=condition["state_embedding"],
             prefix_output=condition["prefix_output"],
             prefix_pad_masks=condition["prefix_pad_masks"],
@@ -436,6 +466,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             prefix_output,
             prefix_pad_masks,
             past_key_values,
+            observation=observation,
             noise=noise,
             mode=mode,
             compute_values=compute_values,
@@ -451,14 +482,18 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         mode="train",
         compute_values=True,
         *,
+        observation: _model.Observation | None = None,
         state_embedding: torch.Tensor | None = None,
         deterministic: bool | None = None,
         retain_residual_grads: bool = False,
     ) -> dict[str, Any]:
         if state_embedding is None:
             state_embedding = self._rfpo_state_embedding(state).detach()
+        if observation is None:
+            raise ValueError("RFPO sampling requires the processed observation.")
         return self.rfpo_sampler.sample(
             self,
+            observation=observation,
             state=state,
             state_embedding=state_embedding,
             prefix_output=prefix_output,

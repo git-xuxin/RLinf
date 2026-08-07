@@ -20,6 +20,7 @@ import random
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 
 class RFPOGuidedSampler:
@@ -62,6 +63,7 @@ class RFPOGuidedSampler:
     def sample_mean_var_val(
         self,
         model,
+        observation,
         x_t,
         idx,
         state,
@@ -77,9 +79,6 @@ class RFPOGuidedSampler:
         retain_residual_grads: bool,
     ):
         """Copy OpenPI's step body and add the SAC residual to ``v_t``."""
-        # Keep this body aligned with
-        # OpenPi0ForRLActionPrediction.sample_mean_var_val. RFPO-specific code
-        # is confined to the block between base_velocity and v_t below.
         bsize = state.shape[0]
         device = state.device
         step_idx = idx
@@ -105,17 +104,27 @@ class RFPOGuidedSampler:
         delta_velocity = torch.zeros_like(base_velocity)
         actor_output = None
         if step_idx in self.active_step_indices:
+            suffix_embedding, _, _, _ = model.embed_suffix(state, x_t, t_input)
+            suffix_embedding = suffix_embedding[:, : self.rfpo_action_chunk + 1]
             actor_output = model.residual_actor(
-                x_t,
-                base_velocity.detach(),
+                active_base_velocity,
                 t_input,
-                state_embedding=state_embedding,
+                suffix_embedding=suffix_embedding,
                 prefix_tokens=prefix_output,
                 condition_mask=prefix_pad_masks.to(dtype=torch.bool),
                 deterministic=deterministic,
                 max_residual_velocity_rms=self.max_residual_velocity_rms,
             )
-            delta_velocity = actor_output["delta_velocity"]
+            active_delta_velocity = actor_output["delta_velocity"]
+            delta_velocity = F.pad(
+                active_delta_velocity,
+                (
+                    0,
+                    base_velocity.shape[2] - self.rfpo_action_dim,
+                    0,
+                    base_velocity.shape[1] - self.rfpo_action_chunk,
+                ),
+            )
             if delta_velocity.shape != base_velocity.shape:
                 raise ValueError(
                     "RFPO SAC delta_velocity must match the pi0 velocity shape."
@@ -177,6 +186,7 @@ class RFPOGuidedSampler:
         self,
         model,
         *,
+        observation,
         state: torch.Tensor,
         state_embedding: torch.Tensor,
         prefix_output: torch.Tensor,
@@ -265,6 +275,7 @@ class RFPOGuidedSampler:
                 sample_method = "flow_ode"
             x_t_mean, x_t_std, value_t, _, step_output = self.sample_mean_var_val(
                 model,
+                observation,
                 x_t,
                 idx,
                 state,

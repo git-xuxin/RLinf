@@ -20,10 +20,15 @@ rfpo:
   max_log_std: 0.0
   internal_log_prob_reduction: "mean_active"
 
-  actor_hidden_size: 512
-  actor_num_layers: 3
-  actor_num_heads: 8
-  actor_mlp_ratio: 4.0
+  dit_hidden_size: 512
+  dit_depth: 4
+  dit_num_heads: 8
+  dit_mlp_ratio: 2.0
+
+  condition_decoder_num_layers: 2
+  condition_decoder_num_heads: 8
+  condition_decoder_mlp_ratio: 2.0
+  timestep_frequency_embedding_size: 256
 
   critic_gemma3:
     hidden_size: 512
