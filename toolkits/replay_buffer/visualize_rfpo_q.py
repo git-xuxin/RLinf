@@ -28,8 +28,8 @@ Example: ``python toolkits/replay_buffer/visualize_rfpo_q.py --ckpt CKPT
 --trajectory-dir TRAJ_DIR --num-episodes 10``
 
 python toolkits/replay_buffer/visualize_rfpo_q.py \
---ckpt /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_120/actor \
---trajectory-dir /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_120/actor/rfpo_components/replay_buffer/rank_1 \
+--ckpt /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_200/actor \
+--trajectory-dir /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_200/actor/rfpo_components/replay_buffer/rank_1 \
 --num-episodes 20 \
 --min-prefix-steps 20
 
