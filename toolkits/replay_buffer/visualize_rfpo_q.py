@@ -28,9 +28,9 @@ Example: ``python toolkits/replay_buffer/visualize_rfpo_q.py --ckpt CKPT
 --trajectory-dir TRAJ_DIR --num-episodes 10``
 
 python toolkits/replay_buffer/visualize_rfpo_q.py \
---ckpt /mnt/public2/xuxin/RFPO/RLinf/logs/20260806-03:30:52-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_80/actor \
---trajectory-dir /mnt/public2/xuxin/RFPO/RLinf/logs/20260806-03:30:52-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_80/actor/rfpo_components/replay_buffer/rank_0 \
---num-episodes 10 \
+--ckpt /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_120/actor \
+--trajectory-dir /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_120/actor/rfpo_components/replay_buffer/rank_1 \
+--num-episodes 20 \
 --min-prefix-steps 20
 
 """
@@ -56,6 +56,13 @@ _WEIGHT_CANDIDATES = (
     Path("model_state_dict/full_weights.pt"),
     Path("full_weights.pt"),
 )
+_Q_Y_MIN = -0.1
+_Q_Y_MAX = 1.0
+_Q_Y_TICK_STEP = 0.1
+_LOG_TIMESTAMP_PATTERN = re.compile(
+    r"(?P<date>\d{8})-(?P<hour>\d{2})[:-](?P<minute>\d{2})[:-](?P<second>\d{2})"
+)
+_GLOBAL_STEP_PATTERN = re.compile(r"global_step_(?P<step>\d+)")
 
 
 @dataclass(frozen=True)
@@ -113,6 +120,35 @@ def resolve_full_weights(ckpt: str | Path) -> Path:
     raise FileNotFoundError(
         f"No full_weights.pt found under {path}. Checked: {checked}"
     )
+
+
+def default_output_dir(ckpt: str | Path) -> Path:
+    """Build a repository-level output directory from checkpoint metadata."""
+    checkpoint_path = Path(ckpt).expanduser().resolve()
+    path_text = str(checkpoint_path)
+    timestamp_match = _LOG_TIMESTAMP_PATTERN.search(path_text)
+    step_matches = list(_GLOBAL_STEP_PATTERN.finditer(path_text))
+    if timestamp_match is None or not step_matches:
+        missing = []
+        if timestamp_match is None:
+            missing.append("log timestamp such as 20260806-03:30:52")
+        if not step_matches:
+            missing.append("global_step_<N>")
+        raise ValueError(
+            f"Could not infer {' and '.join(missing)} from checkpoint path "
+            f"{checkpoint_path}. Pass --output-dir explicitly."
+        )
+
+    timestamp = "-".join(
+        timestamp_match.group(name)
+        for name in ("date", "hour", "minute", "second")
+    )
+    training_step = step_matches[-1].group("step")
+    directory_name = (
+        f"rfpo_q_visualizations_log_{timestamp}_step_{training_step}"
+    )
+    repository_root = Path(__file__).resolve().parents[2]
+    return repository_root / directory_name
 
 
 def _has_actor_model_config(path: Path) -> bool:
@@ -586,13 +622,13 @@ def _write_episode_csv(
             )
 
 
-def _curve_limits(q_values: np.ndarray) -> tuple[float, float]:
-    finite = q_values[np.isfinite(q_values)]
-    if finite.size == 0:
-        return -1.0, 1.0
-    lower, upper = float(finite.min()), float(finite.max())
-    padding = max((upper - lower) * 0.12, 0.05)
-    return lower - padding, upper + padding
+def _configure_q_axis(axis: Any, episode_length: int) -> None:
+    """Apply the shared fixed Q-axis range and tick resolution."""
+    axis.set_xlim(0, max(episode_length - 1, 1))
+    axis.set_ylim(_Q_Y_MIN, _Q_Y_MAX)
+    axis.set_yticks(
+        np.arange(_Q_Y_MIN, _Q_Y_MAX + _Q_Y_TICK_STEP / 2, _Q_Y_TICK_STEP)
+    )
 
 
 def render_episode(
@@ -614,7 +650,6 @@ def render_episode(
 
     q_min = q_values.min(axis=1)
     steps = np.arange(spec.length)
-    y_lower, y_upper = _curve_limits(q_values)
     curve_path = output_stem.with_name(f"{output_stem.name}_q.png")
     csv_path = output_stem.with_name(f"{output_stem.name}_q.csv")
     video_path = output_stem.with_suffix(".mp4")
@@ -624,8 +659,7 @@ def render_episode(
     axis.plot(steps, q_values[:, 1], color="#ea580c", label="Q2", linewidth=1.6)
     axis.plot(steps, q_min, color="#15803d", label="min(Q1, Q2)", linewidth=2.2)
     axis.set(xlabel="Episode observation", ylabel="Q(s, replay action)")
-    axis.set_xlim(0, max(spec.length - 1, 1))
-    axis.set_ylim(y_lower, y_upper)
+    _configure_q_axis(axis, spec.length)
     axis.grid(True, alpha=0.25)
     axis.legend(loc="best")
     fig.savefig(curve_path, dpi=160)
@@ -652,8 +686,7 @@ def render_episode(
     cursor = q_axis.axvline(0, color="#b91c1c", linewidth=1.5)
     point = q_axis.scatter([0], [q_min[0]], color="#b91c1c", s=36, zorder=5)
     q_axis.set(xlabel="Episode observation", ylabel="Q(s, replay action)")
-    q_axis.set_xlim(0, max(spec.length - 1, 1))
-    q_axis.set_ylim(y_lower, y_upper)
+    _configure_q_axis(q_axis, spec.length)
     q_axis.grid(True, alpha=0.25)
     q_axis.legend(loc="best")
     fig.tight_layout()
@@ -751,7 +784,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--output-dir",
         "--output_dir",
         dest="output_dir",
-        help="Output directory (default: <trajectory-dir>/rfpo_q_visualizations)",
+        help=(
+            "Exact output directory. By default, write under the repository root "
+            "using the checkpoint log timestamp and global step."
+        ),
     )
     parser.add_argument(
         "--config",
@@ -811,7 +847,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
-        else trajectory_dir / "rfpo_q_visualizations"
+        else default_output_dir(weights_path)
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     device = _select_device(args.device)
@@ -907,6 +943,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "checkpoint": str(weights_path),
         "training_config": str(config_path),
         "trajectory_dir": str(trajectory_dir),
+        "output_dir": str(output_dir),
         "requested_episodes": args.num_episodes,
         "min_prefix_steps": args.min_prefix_steps,
         "produced_episodes": len(manifest_entries),
