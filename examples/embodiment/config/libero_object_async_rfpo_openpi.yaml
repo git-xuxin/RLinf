@@ -54,7 +54,7 @@ algorithm:
 
   bootstrap_type: standard
   gamma: 0.99
-  tau: 0.005
+  tau: 0.05
 
   entropy_tuning:
     alpha_type: fixed_alpha
@@ -69,12 +69,12 @@ algorithm:
     enable_cache: True
     cache_size: 100
     sample_window_size: 100
-    min_buffer_size: 10
+    min_buffer_size: 20
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
-  train_actor_steps: 10
+  train_actor_steps: 20
 
   filter_rewards: False
   rewards_lower_bound: 0.1
@@ -116,7 +116,7 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 64
+  micro_batch_size: 32
   global_batch_size: 256
   seed: 42
   enable_offload: False
