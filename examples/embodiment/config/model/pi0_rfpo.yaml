@@ -9,15 +9,15 @@ rfpo:
   rfpo_action_chunk: ${..num_action_chunks}
   rfpo_action_dim: ${..action_dim}
 
-  # Fixed per-sample RMS limit in the normalized pi0 velocity space.
-  max_residual_velocity_rms: 0.2
+  # Bounded Gaussian parameters in the normalized pi0 velocity space.
+  mean_scale: 0.05
   num_denoise_steps: ${..num_steps}
   active_step_indices: [0, 1, 2, 3]
   differentiate_base_velocity: True
 
-  initial_log_std: -4.0
+  # init_log_std is the midpoint of min_log_std and max_log_std.
   min_log_std: -8.0
-  max_log_std: 0.0
+  max_log_std: -2.0
   internal_log_prob_reduction: "mean_active"
 
   dit_hidden_size: 512

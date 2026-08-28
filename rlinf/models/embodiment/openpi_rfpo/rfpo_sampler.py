@@ -33,7 +33,6 @@ class RFPOGuidedSampler:
         rfpo_action_chunk: int,
         rfpo_action_dim: int,
         active_step_indices: tuple[int, ...],
-        max_residual_velocity_rms: float,
         differentiate_base_velocity: bool,
         log_prob_reduction: str,
     ) -> None:
@@ -41,7 +40,6 @@ class RFPOGuidedSampler:
         self.rfpo_action_chunk = rfpo_action_chunk
         self.rfpo_action_dim = rfpo_action_dim
         self.active_step_indices = frozenset(active_step_indices)
-        self.max_residual_velocity_rms = max_residual_velocity_rms
         self.differentiate_base_velocity = differentiate_base_velocity
         self.log_prob_reduction = log_prob_reduction
 
@@ -97,9 +95,7 @@ class RFPOGuidedSampler:
         active_base_velocity = base_velocity[
             :, : self.rfpo_action_chunk, : self.rfpo_action_dim
         ]
-        base_velocity_rms = (
-            active_base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
-        )
+        base_velocity_rms = active_base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
 
         delta_velocity = torch.zeros_like(base_velocity)
         actor_output = None
@@ -113,7 +109,6 @@ class RFPOGuidedSampler:
                 prefix_tokens=prefix_output,
                 condition_mask=prefix_pad_masks.to(dtype=torch.bool),
                 deterministic=deterministic,
-                max_residual_velocity_rms=self.max_residual_velocity_rms,
             )
             active_delta_velocity = actor_output["delta_velocity"]
             delta_velocity = F.pad(
@@ -260,10 +255,11 @@ class RFPOGuidedSampler:
         denoise_inds = denoise_inds[None].repeat(bsize, 1)
 
         internal_log_probs = []
-        residual_norms = []
-        residual_norms_per_step = []
-        residual_ratios = []
-        projection_scales = []
+        delta_velocity_rms_per_step = []
+        mean_abs_per_step = []
+        log_std_mean_per_step = []
+        mean_tanh_saturation_fraction_per_step = []
+        log_std_tanh_saturation_fraction_per_step = []
         velocity_norms = []
         active_residuals: list[tuple[int, torch.Tensor]] = []
         active_mask = torch.zeros(num_steps, dtype=torch.bool, device=device)
@@ -297,21 +293,39 @@ class RFPOGuidedSampler:
 
             velocity_norms.append(step_output["base_velocity_rms"])
             actor_output = step_output["actor_output"]
-            residual_rms = torch.zeros_like(step_output["base_velocity_rms"])
+            zero_metric = torch.zeros_like(step_output["base_velocity_rms"])
+            delta_velocity_rms = zero_metric
+            mean_abs = zero_metric
+            log_std_mean = zero_metric
+            mean_tanh_saturation_fraction = zero_metric
+            log_std_tanh_saturation_fraction = zero_metric
             if actor_output is not None:
                 active_mask[idx] = True
-                active_delta_velocity = actor_output["active_delta_velocity"]
+                active_delta_velocity = actor_output["delta_velocity"]
                 active_residuals.append((idx, active_delta_velocity))
                 internal_log_probs.append(actor_output["log_prob"])
-                residual_rms = (
+                delta_velocity_rms = (
                     active_delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
                 )
-                residual_norms.append(residual_rms)
-                residual_ratios.append(
-                    residual_rms / (step_output["base_velocity_rms"] + 1e-6)
+                mean_abs = actor_output["mean"].float().abs().mean(dim=(1, 2))
+                log_std_mean = actor_output["log_std"].float().mean(dim=(1, 2))
+                mean_tanh_saturation_fraction = (
+                    (actor_output["mean_tanh"].float().abs() >= 0.95)
+                    .float()
+                    .mean(dim=(1, 2))
                 )
-                projection_scales.append(actor_output["projection_scale"])
-            residual_norms_per_step.append(residual_rms)
+                log_std_tanh_saturation_fraction = (
+                    (actor_output["log_std_tanh"].float().abs() >= 0.95)
+                    .float()
+                    .mean(dim=(1, 2))
+                )
+            delta_velocity_rms_per_step.append(delta_velocity_rms)
+            mean_abs_per_step.append(mean_abs)
+            log_std_mean_per_step.append(log_std_mean)
+            mean_tanh_saturation_fraction_per_step.append(mean_tanh_saturation_fraction)
+            log_std_tanh_saturation_fraction_per_step.append(
+                log_std_tanh_saturation_fraction
+            )
 
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
@@ -331,20 +345,7 @@ class RFPOGuidedSampler:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
 
         base_velocity_rms_per_step = torch.stack(velocity_norms, dim=1)
-        residual_velocity_rms_per_step = torch.stack(
-            residual_norms_per_step, dim=1
-        )
-        base_velocity_rms = base_velocity_rms_per_step.mean(dim=1)
-        if residual_norms:
-            residual_rms = torch.stack(residual_norms, dim=1).mean(dim=1)
-            residual_to_base_ratio = torch.stack(residual_ratios, dim=1).mean(dim=1)
-            residual_projection_scale = torch.stack(projection_scales, dim=1).mean(
-                dim=1
-            )
-        else:
-            residual_rms = torch.zeros_like(base_velocity_rms)
-            residual_to_base_ratio = torch.zeros_like(base_velocity_rms)
-            residual_projection_scale = torch.ones_like(base_velocity_rms)
+        delta_velocity_rms_per_step = torch.stack(delta_velocity_rms_per_step, dim=1)
         return {
             "actions": x_0,
             "chains": chains,
@@ -354,12 +355,16 @@ class RFPOGuidedSampler:
             "internal_log_prob": self._reduce_log_probs(
                 internal_log_probs, bsize, device
             ),
-            "residual_rms": residual_rms,
-            "base_velocity_rms": base_velocity_rms,
             "base_velocity_rms_per_step": base_velocity_rms_per_step,
-            "residual_velocity_rms_per_step": residual_velocity_rms_per_step,
-            "residual_to_base_ratio": residual_to_base_ratio,
-            "residual_projection_scale": residual_projection_scale,
+            "delta_velocity_rms_per_step": delta_velocity_rms_per_step,
+            "mean_abs_per_step": torch.stack(mean_abs_per_step, dim=1),
+            "log_std_mean_per_step": torch.stack(log_std_mean_per_step, dim=1),
+            "mean_tanh_saturation_fraction_per_step": torch.stack(
+                mean_tanh_saturation_fraction_per_step, dim=1
+            ),
+            "log_std_tanh_saturation_fraction_per_step": torch.stack(
+                log_std_tanh_saturation_fraction_per_step, dim=1
+            ),
             "active_step_mask": active_mask,
             "active_residuals": active_residuals,
         }

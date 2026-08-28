@@ -28,31 +28,6 @@ from rlinf.models.embodiment.modules.dit import (
 )
 
 
-def project_residual_velocity(
-    candidate: torch.Tensor,
-    max_residual_velocity_rms: float,
-    *,
-    eps: float = 1e-6,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Project each residual sample onto a fixed RMS ball."""
-    if not math.isfinite(max_residual_velocity_rms):
-        raise ValueError("RFPO max_residual_velocity_rms must be finite.")
-    if max_residual_velocity_rms < 0:
-        raise ValueError("RFPO max_residual_velocity_rms must be non-negative.")
-    if candidate.ndim != 3:
-        raise ValueError(
-            "RFPO residual velocity must have shape [batch, horizon, dim]."
-        )
-
-    candidate_rms = candidate.float().pow(2).mean(dim=(1, 2)).sqrt()
-    projection_scale = torch.clamp(
-        max_residual_velocity_rms / candidate_rms.clamp_min(eps),
-        max=1.0,
-    )
-    projected = candidate * projection_scale[:, None, None]
-    return projected, projection_scale
-
-
 class RFPOResidualActor(nn.Module):
     """Condition-decoder plus official DiT policy over active residual velocity."""
 
@@ -73,15 +48,26 @@ class RFPOResidualActor(nn.Module):
         condition_decoder_mlp_ratio: float,
         timestep_frequency_embedding_size: int,
         dropout: float,
-        initial_log_std: float,
+        mean_scale: float,
         min_log_std: float,
         max_log_std: float,
     ) -> None:
         super().__init__()
-        if min_log_std > initial_log_std or initial_log_std > max_log_std:
-            raise ValueError(
-                "initial_log_std must lie within [min_log_std, max_log_std]."
-            )
+        for name, value in (
+            ("mean_scale", mean_scale),
+            ("min_log_std", min_log_std),
+            ("max_log_std", max_log_std),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"RFPO {name} must be finite.")
+        if mean_scale <= 0:
+            raise ValueError("RFPO mean_scale must be positive.")
+        if min_log_std >= max_log_std:
+            raise ValueError("RFPO min_log_std must be less than max_log_std.")
         if rfpo_action_chunk <= 0 or rfpo_action_dim <= 0:
             raise ValueError("RFPO action chunk and dimension must be positive.")
         if hidden_size <= 0 or hidden_size % dit_num_heads != 0:
@@ -95,8 +81,9 @@ class RFPOResidualActor(nn.Module):
         if not 0.0 <= dropout < 1.0:
             raise ValueError("RFPO actor dropout must lie within [0, 1).")
 
-        self.min_log_std = float(min_log_std)
-        self.max_log_std = float(max_log_std)
+        self.mean_scale = float(mean_scale)
+        self.init_log_std = 0.5 * (float(min_log_std) + float(max_log_std))
+        self.log_std_scale = 0.5 * (float(max_log_std) - float(min_log_std))
         self.rfpo_action_chunk = int(rfpo_action_chunk)
         self.rfpo_action_dim = int(rfpo_action_dim)
         self.hidden_size = int(hidden_size)
@@ -133,11 +120,13 @@ class RFPOResidualActor(nn.Module):
             output_dim=2 * rfpo_action_dim,
             dropout=dropout,
         )
-        self._initialize_weights(initial_log_std)
+        self._initialize_weights()
 
-    def _initialize_weights(self, initial_log_std: float) -> None:
-        """Initialize adapters like the official DiT and set Gaussian prior."""
-        for module in self.modules():
+    def _initialize_weights(self) -> None:
+        """Initialize actor adapters without resetting the DiT trunk."""
+        for name, module in self.named_modules():
+            if name == "dit" or name.startswith("dit."):
+                continue
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
@@ -145,17 +134,8 @@ class RFPOResidualActor(nn.Module):
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
         nn.init.normal_(self.timestep_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.timestep_embedder.mlp[2].weight, std=0.02)
-        for block in self.dit.blocks:
-            nn.init.zeros_(block.adaLN_modulation[-1].weight)
-            nn.init.zeros_(block.adaLN_modulation[-1].bias)
-        nn.init.zeros_(self.dit.final_layer.adaLN_modulation[-1].weight)
-        nn.init.zeros_(self.dit.final_layer.adaLN_modulation[-1].bias)
-        nn.init.zeros_(self.dit.final_layer.linear.weight)
+        nn.init.normal_(self.dit.final_layer.linear.weight, mean=0.0, std=1.0e-4)
         nn.init.zeros_(self.dit.final_layer.linear.bias)
-        with torch.no_grad():
-            self.dit.final_layer.linear.bias[self.rfpo_action_dim :].fill_(
-                initial_log_std
-            )
 
     def forward(
         self,
@@ -166,7 +146,6 @@ class RFPOResidualActor(nn.Module):
         prefix_tokens: torch.Tensor,
         condition_mask: torch.Tensor | None,
         deterministic: bool = False,
-        max_residual_velocity_rms: float = 0.2,
     ) -> dict[str, torch.Tensor]:
         """Predict and sample active residual velocities."""
         if base_velocity.ndim != 3:
@@ -190,25 +169,34 @@ class RFPOResidualActor(nn.Module):
             )
         if prefix_tokens.ndim != 3 or prefix_tokens.shape[0] != batch_size:
             raise ValueError("RFPO prefix tokens must have shape [B, P, E].")
-        if condition_mask is not None and condition_mask.shape != prefix_tokens.shape[:2]:
+        if (
+            condition_mask is not None
+            and condition_mask.shape != prefix_tokens.shape[:2]
+        ):
             raise ValueError("RFPO condition_mask must match prefix token shape.")
 
         actor_dtype = self.base_velocity_input.weight.dtype
         action_tokens = self.base_velocity_input(base_velocity.to(dtype=actor_dtype))
-        action_tokens = action_tokens + get_1d_sincos_pos_embed(
-            action_chunk,
-            self.hidden_size,
-            device=action_tokens.device,
-            dtype=action_tokens.dtype,
-        )[None]
+        action_tokens = (
+            action_tokens
+            + get_1d_sincos_pos_embed(
+                action_chunk,
+                self.hidden_size,
+                device=action_tokens.device,
+                dtype=action_tokens.dtype,
+            )[None]
+        )
 
         suffix_tokens = self.suffix_input(suffix_embedding.to(dtype=actor_dtype))
-        suffix_tokens = suffix_tokens + get_1d_sincos_pos_embed(
-            action_chunk + 1,
-            self.hidden_size,
-            device=suffix_tokens.device,
-            dtype=suffix_tokens.dtype,
-        )[None]
+        suffix_tokens = (
+            suffix_tokens
+            + get_1d_sincos_pos_embed(
+                action_chunk + 1,
+                self.hidden_size,
+                device=suffix_tokens.device,
+                dtype=suffix_tokens.dtype,
+            )[None]
+        )
         timestep_token = self.timestep_embedder(timestep).to(dtype=actor_dtype)
         cls_token = self.cls_token.expand(batch_size, -1, -1) + timestep_token[:, None]
         queries = torch.cat([suffix_tokens, cls_token], dim=1)
@@ -226,30 +214,26 @@ class RFPOResidualActor(nn.Module):
         )
         conditioning = decoded_queries[:, -1]
 
-        hidden = self.dit.forward_features(action_tokens, conditioning)
-        final_output = self.dit.final_layer(hidden, conditioning).float()
-        mean, log_std = final_output.chunk(2, dim=-1)
-        log_std = log_std.clamp(self.min_log_std, self.max_log_std)
+        raw_mean, raw_log_std = (
+            self.dit(action_tokens, conditioning).float().chunk(2, dim=-1)
+        )
+        mean_tanh = torch.tanh(raw_mean)
+        log_std_tanh = torch.tanh(raw_log_std)
+        mean = self.mean_scale * mean_tanh
+        log_std = self.init_log_std + self.log_std_scale * log_std_tanh
         std = log_std.exp()
-        raw_delta_velocity = (
-            mean if deterministic else mean + std * torch.randn_like(mean)
-        )
+        delta_velocity = mean if deterministic else mean + std * torch.randn_like(mean)
         log_prob = -0.5 * (
-            ((raw_delta_velocity - mean) / std).pow(2)
-            + 2 * log_std
-            + math.log(2 * math.pi)
-        )
-        delta_velocity, projection_scale = project_residual_velocity(
-            raw_delta_velocity,
-            max_residual_velocity_rms,
+            ((delta_velocity - mean) / std).pow(2) + 2 * log_std + math.log(2 * math.pi)
         )
         return {
             "delta_velocity": delta_velocity,
-            "active_delta_velocity": delta_velocity,
-            "raw_delta_velocity": raw_delta_velocity,
+            "raw_mean": raw_mean,
+            "raw_log_std": raw_log_std,
+            "mean_tanh": mean_tanh,
+            "log_std_tanh": log_std_tanh,
             "mean": mean,
             "log_std": log_std,
             "std": std,
             "log_prob": log_prob,
-            "projection_scale": projection_scale,
         }

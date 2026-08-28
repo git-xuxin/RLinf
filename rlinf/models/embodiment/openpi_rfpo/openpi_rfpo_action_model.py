@@ -59,13 +59,12 @@ class OpenPiRFPOConfig(OpenPi0Config):
 
     rfpo_action_chunk: int = 5
     rfpo_action_dim: int = 7
-    max_residual_velocity_rms: float = 0.2
+    mean_scale: float = 0.15
     num_denoise_steps: int = 4
     active_step_indices: tuple[int, ...] = field(default_factory=lambda: (2, 3))
     differentiate_base_velocity: bool = True
-    initial_log_std: float = -4.0
     min_log_std: float = -8.0
-    max_log_std: float = 0.0
+    max_log_std: float = -2.0
     internal_log_prob_reduction: str = "mean_active"
     dit_hidden_size: int = 384
     dit_depth: int = 12
@@ -97,10 +96,18 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 "RFPO num_denoise_steps must match pi0 num_steps to preserve the "
                 "pretrained Euler schedule."
             )
-        if not math.isfinite(self.max_residual_velocity_rms):
-            raise ValueError("max_residual_velocity_rms must be finite.")
-        if self.max_residual_velocity_rms < 0:
-            raise ValueError("max_residual_velocity_rms must be non-negative.")
+        for option in ("mean_scale", "min_log_std", "max_log_std"):
+            value = getattr(self, option)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"RFPO {option} must be finite.")
+        if self.mean_scale <= 0:
+            raise ValueError("mean_scale must be positive.")
+        if self.min_log_std >= self.max_log_std:
+            raise ValueError("min_log_std must be less than max_log_std.")
         if self.rfpo_action_chunk <= 0 or self.rfpo_action_chunk > self.action_horizon:
             raise ValueError(
                 "rfpo_action_chunk must lie within the pi0 action horizon."
@@ -247,7 +254,9 @@ class OpenPiRFPOConfig(OpenPi0Config):
             ):
                 raise ValueError(f"RFPO {option} must be finite and positive.")
         if self.dit_hidden_size % self.dit_num_heads != 0:
-            raise ValueError("RFPO DiT hidden size must be divisible by its head count.")
+            raise ValueError(
+                "RFPO DiT hidden size must be divisible by its head count."
+            )
         if self.dit_hidden_size % 2 != 0:
             raise ValueError("RFPO DiT hidden size must be even for sin-cos positions.")
         if self.dit_hidden_size % self.condition_decoder_num_heads != 0:
@@ -257,7 +266,6 @@ class OpenPiRFPOConfig(OpenPi0Config):
 
 
 class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
-    """pi0 action model with a constrained residual-flow policy."""
 
     config: OpenPiRFPOConfig
 
@@ -286,7 +294,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             condition_decoder_num_heads=config.condition_decoder_num_heads,
             condition_decoder_mlp_ratio=config.condition_decoder_mlp_ratio,
             timestep_frequency_embedding_size=config.timestep_frequency_embedding_size,
-            initial_log_std=config.initial_log_std,
+            mean_scale=config.mean_scale,
             min_log_std=config.min_log_std,
             max_log_std=config.max_log_std,
             dropout=config.dropout,
@@ -305,7 +313,6 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             rfpo_action_chunk=config.rfpo_action_chunk,
             rfpo_action_dim=config.rfpo_action_dim,
             active_step_indices=tuple(config.active_step_indices),
-            max_residual_velocity_rms=config.max_residual_velocity_rms,
             differentiate_base_velocity=config.differentiate_base_velocity,
             log_prob_reduction=config.internal_log_prob_reduction,
         )
@@ -564,12 +571,16 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             ],
             "model_action_horizon": output["actions"],
             "internal_log_prob": output["internal_log_prob"],
-            "residual_rms": output["residual_rms"],
-            "base_velocity_rms": output["base_velocity_rms"],
             "base_velocity_rms_per_step": output["base_velocity_rms_per_step"],
-            "residual_velocity_rms_per_step": output["residual_velocity_rms_per_step"],
-            "residual_to_base_ratio": output["residual_to_base_ratio"],
-            "residual_projection_scale": output["residual_projection_scale"],
+            "delta_velocity_rms_per_step": output["delta_velocity_rms_per_step"],
+            "mean_abs_per_step": output["mean_abs_per_step"],
+            "log_std_mean_per_step": output["log_std_mean_per_step"],
+            "mean_tanh_saturation_fraction_per_step": output[
+                "mean_tanh_saturation_fraction_per_step"
+            ],
+            "log_std_tanh_saturation_fraction_per_step": output[
+                "log_std_tanh_saturation_fraction_per_step"
+            ],
             "active_step_mask": output["active_step_mask"],
             "active_residuals": output["active_residuals"],
             "critic_state_embedding": condition["state_embedding"],
@@ -650,8 +661,6 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             "model_action": outputs["actions"]
             .reshape(outputs["actions"].shape[0], -1)
             .contiguous(),
-            "rfpo_residual_rms": outputs["residual_rms"],
-            "rfpo_base_velocity_rms": outputs["base_velocity_rms"],
         }
 
         # Clone observations to avoid cross-step reference issues.

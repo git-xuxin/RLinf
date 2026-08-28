@@ -78,9 +78,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 f"{unexpected_trainable_names[:8]}"
             )
         self.param_names_need_sync = [
-            name
-            for name in trainable_names
-            if name.startswith("residual_actor.")
+            name for name in trainable_names if name.startswith("residual_actor.")
         ]
         if not self.param_names_need_sync:
             raise ValueError("RFPO residual actor has no trainable parameters.")
@@ -118,9 +116,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             **{
                 key: value
                 for key in ("init_scale", "growth_interval")
-                if (
-                    value := self.cfg.actor.fsdp_config.grad_scaler.get(key, None)
-                )
+                if (value := self.cfg.actor.fsdp_config.grad_scaler.get(key, None))
                 is not None
             },
         )
@@ -212,9 +208,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             ],
             dim=1,
         )
-        gamma_powers = torch.arange(
-            horizon, device=rewards.device, dtype=torch.float32
-        )
+        gamma_powers = torch.arange(horizon, device=rewards.device, dtype=torch.float32)
         discounted_reward = (
             rewards
             * valid_mask.to(dtype=rewards.dtype)
@@ -249,9 +243,11 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         rewards, bootstrap_discount, valid_mask = self._chunk_target_terms(
             batch["rewards"], batch["dones"]
         )
-        terminations = batch["terminations"].reshape(
-            batch["terminations"].shape[0], -1
-        ).to(dtype=torch.bool)
+        terminations = (
+            batch["terminations"]
+            .reshape(batch["terminations"].shape[0], -1)
+            .to(dtype=torch.bool)
+        )
         if terminations.shape != valid_mask.shape:
             raise ValueError(
                 "RFPO chunk terminations must match rewards and dones shape."
@@ -265,15 +261,19 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 tokenized_prompt=tokenized_prompt,
                 tokenized_prompt_mask=tokenized_prompt_mask,
             )
-            target_q_values = self.target_critic(
-                next_output["actions"],
-                state_embedding=next_output["critic_state_embedding"],
-                condition_tokens=next_output["critic_condition_tokens"],
-                condition_mask=next_output["critic_condition_mask"],
-            ).min(dim=-1, keepdim=True).values
-            target = rewards + (
-                ~terminated
-            ) * bootstrap_discount * target_q_values.float()
+            target_q_values = (
+                self.target_critic(
+                    next_output["actions"],
+                    state_embedding=next_output["critic_state_embedding"],
+                    condition_tokens=next_output["critic_condition_tokens"],
+                    condition_mask=next_output["critic_condition_mask"],
+                )
+                .min(dim=-1, keepdim=True)
+                .values
+            )
+            target = (
+                rewards + (~terminated) * bootstrap_discount * target_q_values.float()
+            )
 
         current_q_values = self.model(
             forward_type=ForwardType.RFPO_Q,
@@ -309,38 +309,49 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         q_min = output["q_values"].min(dim=-1, keepdim=True).values
         alpha = self.entropy_temp.compute_alpha().detach().float()
         actor_loss = (
-            -q_min.float()
-            + alpha * output["internal_log_prob"].float().unsqueeze(-1)
+            -q_min.float() + alpha * output["internal_log_prob"].float().unsqueeze(-1)
         ).mean()
         action_delta = output["actions"] - output["pi0_actions"]
         metrics = {
-            "residual_to_base_ratio": output["residual_to_base_ratio"].mean().item(),
-            "residual_projection_scale": output["residual_projection_scale"]
-            .mean()
-            .item(),
             "action_delta_from_pi0_rms": (
                 action_delta.float().pow(2).mean().sqrt().item()
             ),
         }
         base_rms_per_step = output["base_velocity_rms_per_step"]
-        residual_rms_per_step = output["residual_velocity_rms_per_step"]
-        if base_rms_per_step.shape != residual_rms_per_step.shape:
-            raise ValueError(
-                "RFPO per-step base and residual RMS tensors must have matching "
-                "shapes."
-            )
+        per_step_metrics = {
+            "base_velocity_rms": base_rms_per_step,
+            "delta_velocity_rms": output["delta_velocity_rms_per_step"],
+            "mean_abs": output["mean_abs_per_step"],
+            "log_std_mean": output["log_std_mean_per_step"],
+            "mean_tanh_saturation_fraction": output[
+                "mean_tanh_saturation_fraction_per_step"
+            ],
+            "log_std_tanh_saturation_fraction": output[
+                "log_std_tanh_saturation_fraction_per_step"
+            ],
+        }
         if base_rms_per_step.ndim != 2:
             raise ValueError(
-                "RFPO per-step RMS tensors must have shape [batch, denoise_steps]."
+                "RFPO per-step metrics must have shape [batch, denoise_steps]."
             )
-        base_rms_means = base_rms_per_step.mean(dim=0).detach().cpu().tolist()
-        residual_rms_means = residual_rms_per_step.mean(dim=0).detach().cpu().tolist()
-        for step_idx, (base_rms, residual_rms) in enumerate(
-            zip(base_rms_means, residual_rms_means, strict=True)
-        ):
+        for metric_name, metric_values in per_step_metrics.items():
+            if metric_values.shape != base_rms_per_step.shape:
+                raise ValueError(
+                    f"RFPO {metric_name} must match base_velocity_rms shape."
+                )
+        active_step_mask = output["active_step_mask"]
+        if active_step_mask.shape != (base_rms_per_step.shape[1],):
+            raise ValueError("RFPO active_step_mask must match denoise steps.")
+        per_step_means = {
+            name: values.mean(dim=0).detach().cpu().tolist()
+            for name, values in per_step_metrics.items()
+        }
+        for step_idx, is_active in enumerate(active_step_mask.detach().cpu().tolist()):
+            if not is_active:
+                continue
             prefix = f"denoise_step_{step_idx}"
-            metrics[f"{prefix}/base_velocity_rms"] = base_rms
-            metrics[f"{prefix}/residual_velocity_rms"] = residual_rms
+            for metric_name, metric_values in per_step_means.items():
+                metrics[f"{prefix}/{metric_name}"] = metric_values[step_idx]
         return actor_loss, metrics
 
     def update_one_epoch(self, train_actor: bool = True):
@@ -379,10 +390,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             "rfpo/critic_loss": np.mean(critic_losses),
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": critic_grad_norm,
-            **{
-                f"rfpo/{key}": np.mean(value)
-                for key, value in critic_metrics.items()
-            },
+            **{f"rfpo/{key}": np.mean(value) for key, value in critic_metrics.items()},
         }
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
