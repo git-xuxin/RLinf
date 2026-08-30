@@ -40,9 +40,9 @@ class RFPOResidualActor(nn.Module):
         rfpo_action_dim: int,
         prefix_dim: int,
         hidden_size: int,
-        dit_depth: int,
-        dit_num_heads: int,
-        dit_mlp_ratio: float,
+        depth: int,
+        num_heads: int,
+        mlp_ratio: float,
         condition_decoder_num_layers: int,
         condition_decoder_num_heads: int,
         condition_decoder_mlp_ratio: float,
@@ -70,7 +70,7 @@ class RFPOResidualActor(nn.Module):
             raise ValueError("RFPO min_log_std must be less than max_log_std.")
         if rfpo_action_chunk <= 0 or rfpo_action_dim <= 0:
             raise ValueError("RFPO action chunk and dimension must be positive.")
-        if hidden_size <= 0 or hidden_size % dit_num_heads != 0:
+        if hidden_size <= 0 or hidden_size % num_heads != 0:
             raise ValueError("DiT hidden_size must be positive and divisible by heads.")
         if hidden_size % condition_decoder_num_heads != 0:
             raise ValueError(
@@ -114,9 +114,9 @@ class RFPOResidualActor(nn.Module):
         )
         self.dit = DiTBackbone(
             hidden_size,
-            dit_depth,
-            dit_num_heads,
-            mlp_ratio=dit_mlp_ratio,
+            depth,
+            num_heads,
+            mlp_ratio=mlp_ratio,
             output_dim=2 * rfpo_action_dim,
             dropout=dropout,
         )

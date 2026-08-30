@@ -35,8 +35,26 @@ from .rfpo_critic import RFPODoubleQCritic
 from .rfpo_sampler import RFPOGuidedSampler
 
 
-def _default_critic_gemma3_config() -> dict[str, Any]:
-    """Return the randomly initialized Gemma3 critic defaults."""
+def _default_actor_config() -> dict[str, Any]:
+    """Return the RFPO DiT actor defaults."""
+    return {
+        "hidden_size": 384,
+        "depth": 12,
+        "num_heads": 6,
+        "mlp_ratio": 4.0,
+        "condition_decoder_num_layers": 2,
+        "condition_decoder_num_heads": 6,
+        "condition_decoder_mlp_ratio": 4.0,
+        "timestep_frequency_embedding_size": 256,
+        "dropout": 0.0,
+        "mean_scale": 0.15,
+        "min_log_std": -8.0,
+        "max_log_std": -2.0,
+    }
+
+
+def _default_critic_config() -> dict[str, Any]:
+    """Return the RFPO Gemma3 critic defaults."""
     return {
         "hidden_size": 512,
         "intermediate_size": 1024,
@@ -50,6 +68,9 @@ def _default_critic_gemma3_config() -> dict[str, Any]:
         "initializer_range": 0.02,
         "rms_norm_eps": 1e-6,
         "rope_theta": 1_000_000.0,
+        "prefix_length": 816,
+        "mlp_hidden_dims": (256, 128),
+        "q_output_init_std": 1e-3,
     }
 
 
@@ -59,26 +80,12 @@ class OpenPiRFPOConfig(OpenPi0Config):
 
     rfpo_action_chunk: int = 5
     rfpo_action_dim: int = 7
-    mean_scale: float = 0.15
     num_denoise_steps: int = 4
     active_step_indices: tuple[int, ...] = field(default_factory=lambda: (2, 3))
     differentiate_base_velocity: bool = True
-    min_log_std: float = -8.0
-    max_log_std: float = -2.0
     internal_log_prob_reduction: str = "mean_active"
-    dit_hidden_size: int = 384
-    dit_depth: int = 12
-    dit_num_heads: int = 6
-    dit_mlp_ratio: float = 4.0
-    condition_decoder_num_layers: int = 2
-    condition_decoder_num_heads: int = 6
-    condition_decoder_mlp_ratio: float = 4.0
-    timestep_frequency_embedding_size: int = 256
-    critic_gemma3: dict[str, Any] = field(default_factory=_default_critic_gemma3_config)
-    critic_prefix_length: int = 816
-    critic_mlp_hidden_dims: tuple[int, ...] = (256, 128)
-    critic_q_output_init_std: float = 1e-3
-    dropout: float = 0.0
+    actor: dict[str, Any] = field(default_factory=_default_actor_config)
+    critic: dict[str, Any] = field(default_factory=_default_critic_config)
     context_dim: int = 2048
 
     def __post_init__(self) -> None:
@@ -96,18 +103,26 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 "RFPO num_denoise_steps must match pi0 num_steps to preserve the "
                 "pretrained Euler schedule."
             )
+        actor_defaults = _default_actor_config()
+        actor_config = dict(self.actor)
+        unknown_actor_keys = set(actor_config) - set(actor_defaults)
+        if unknown_actor_keys:
+            raise ValueError(
+                f"Unsupported RFPO actor options: {sorted(unknown_actor_keys)}."
+            )
+        actor_config = actor_defaults | actor_config
         for option in ("mean_scale", "min_log_std", "max_log_std"):
-            value = getattr(self, option)
+            value = actor_config[option]
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
                 or not math.isfinite(value)
             ):
-                raise ValueError(f"RFPO {option} must be finite.")
-        if self.mean_scale <= 0:
-            raise ValueError("mean_scale must be positive.")
-        if self.min_log_std >= self.max_log_std:
-            raise ValueError("min_log_std must be less than max_log_std.")
+                raise ValueError(f"RFPO actor {option} must be finite.")
+        if actor_config["mean_scale"] <= 0:
+            raise ValueError("RFPO actor mean_scale must be positive.")
+        if actor_config["min_log_std"] >= actor_config["max_log_std"]:
+            raise ValueError("RFPO actor min_log_std must be less than max_log_std.")
         if self.rfpo_action_chunk <= 0 or self.rfpo_action_chunk > self.action_horizon:
             raise ValueError(
                 "rfpo_action_chunk must lie within the pi0 action horizon."
@@ -125,17 +140,23 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 "OpenPi RFPO prefix tokens must have width 2048; "
                 f"got context_dim={self.context_dim}."
             )
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError("dropout must lie within [0, 1).")
-        gemma3_defaults = _default_critic_gemma3_config()
-        gemma3_config = dict(self.critic_gemma3)
-        unknown_gemma3_keys = set(gemma3_config) - set(gemma3_defaults)
-        if unknown_gemma3_keys:
+        dropout = actor_config["dropout"]
+        if (
+            isinstance(dropout, bool)
+            or not isinstance(dropout, (int, float))
+            or not 0.0 <= dropout < 1.0
+        ):
+            raise ValueError("RFPO actor dropout must lie within [0, 1).")
+        actor_config["dropout"] = float(dropout)
+
+        critic_defaults = _default_critic_config()
+        critic_config = dict(self.critic)
+        unknown_critic_keys = set(critic_config) - set(critic_defaults)
+        if unknown_critic_keys:
             raise ValueError(
-                "Unsupported RFPO critic Gemma3 options: "
-                f"{sorted(unknown_gemma3_keys)}."
+                f"Unsupported RFPO critic options: {sorted(unknown_critic_keys)}."
             )
-        gemma3_config = gemma3_defaults | gemma3_config
+        critic_config = critic_defaults | critic_config
         integer_options = (
             "hidden_size",
             "intermediate_size",
@@ -146,20 +167,21 @@ class OpenPiRFPOConfig(OpenPi0Config):
             "max_position_embeddings",
         )
         for option in integer_options:
-            value = gemma3_config[option]
+            value = critic_config[option]
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(
                     f"RFPO critic Gemma3 {option} must be a positive integer."
                 )
         if (
-            gemma3_config["num_attention_heads"] % gemma3_config["num_key_value_heads"]
+            critic_config["num_attention_heads"]
+            % critic_config["num_key_value_heads"]
             != 0
         ):
             raise ValueError(
                 "RFPO critic Gemma3 num_attention_heads must be divisible by "
                 "num_key_value_heads."
             )
-        attention_dropout = gemma3_config["attention_dropout"]
+        attention_dropout = critic_config["attention_dropout"]
         if (
             isinstance(attention_dropout, bool)
             or not isinstance(attention_dropout, (int, float))
@@ -168,14 +190,14 @@ class OpenPiRFPOConfig(OpenPi0Config):
             raise ValueError(
                 "RFPO critic Gemma3 attention_dropout must lie within [0, 1)."
             )
-        gemma3_config["attention_dropout"] = float(attention_dropout)
-        hidden_activation = gemma3_config["hidden_activation"]
+        critic_config["attention_dropout"] = float(attention_dropout)
+        hidden_activation = critic_config["hidden_activation"]
         if not isinstance(hidden_activation, str) or not hidden_activation:
             raise ValueError(
                 "RFPO critic Gemma3 hidden_activation must be a non-empty string."
             )
         for option in ("initializer_range", "rms_norm_eps", "rope_theta"):
-            value = gemma3_config[option]
+            value = critic_config[option]
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
@@ -185,26 +207,24 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 raise ValueError(
                     f"RFPO critic Gemma3 {option} must be finite and positive."
                 )
-            gemma3_config[option] = float(value)
+            critic_config[option] = float(value)
+        prefix_length = critic_config["prefix_length"]
         if (
-            isinstance(self.critic_prefix_length, bool)
-            or not isinstance(self.critic_prefix_length, int)
-            or self.critic_prefix_length <= 0
+            isinstance(prefix_length, bool)
+            or not isinstance(prefix_length, int)
+            or prefix_length <= 0
         ):
-            raise ValueError("critic_prefix_length must be a positive integer.")
-        required_sequence_length = (
-            self.rfpo_action_chunk + self.critic_prefix_length + 2
-        )
-        if gemma3_config["max_position_embeddings"] < required_sequence_length:
+            raise ValueError("RFPO critic prefix_length must be a positive integer.")
+        required_sequence_length = self.rfpo_action_chunk + prefix_length + 2
+        if critic_config["max_position_embeddings"] < required_sequence_length:
             raise ValueError(
                 "RFPO critic Gemma3 max_position_embeddings must cover action, "
                 "prefix, state, and value tokens: "
-                f"{gemma3_config['max_position_embeddings']} < "
+                f"{critic_config['max_position_embeddings']} < "
                 f"{required_sequence_length}."
             )
-        object.__setattr__(self, "critic_gemma3", gemma3_config)
 
-        critic_mlp_hidden_dims = tuple(self.critic_mlp_hidden_dims)
+        critic_mlp_hidden_dims = tuple(critic_config["mlp_hidden_dims"])
         if len(critic_mlp_hidden_dims) != 2 or any(
             isinstance(hidden_dim, bool)
             or not isinstance(hidden_dim, int)
@@ -214,14 +234,18 @@ class OpenPiRFPOConfig(OpenPi0Config):
             raise ValueError(
                 "RFPO critic MLP requires exactly two positive hidden dimensions."
             )
-        object.__setattr__(self, "critic_mlp_hidden_dims", critic_mlp_hidden_dims)
+        critic_config["mlp_hidden_dims"] = critic_mlp_hidden_dims
+        q_output_init_std = critic_config["q_output_init_std"]
         if (
-            isinstance(self.critic_q_output_init_std, bool)
-            or not isinstance(self.critic_q_output_init_std, (int, float))
-            or not math.isfinite(self.critic_q_output_init_std)
-            or self.critic_q_output_init_std <= 0
+            isinstance(q_output_init_std, bool)
+            or not isinstance(q_output_init_std, (int, float))
+            or not math.isfinite(q_output_init_std)
+            or q_output_init_std <= 0
         ):
-            raise ValueError("critic_q_output_init_std must be finite and positive.")
+            raise ValueError(
+                "RFPO critic q_output_init_std must be finite and positive."
+            )
+        critic_config["q_output_init_std"] = float(q_output_init_std)
         active_steps = tuple(int(i) for i in self.active_step_indices)
         if not active_steps:
             raise ValueError("active_step_indices must contain at least one step.")
@@ -232,37 +256,45 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 "active_step_indices must lie within the denoising schedule."
             )
         architecture_integer_options = (
-            "dit_hidden_size",
-            "dit_depth",
-            "dit_num_heads",
+            "hidden_size",
+            "depth",
+            "num_heads",
             "condition_decoder_num_layers",
             "condition_decoder_num_heads",
             "timestep_frequency_embedding_size",
         )
         for option in architecture_integer_options:
-            value = getattr(self, option)
+            value = actor_config[option]
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"RFPO {option} must be a positive integer.")
-        architecture_ratios = ("dit_mlp_ratio", "condition_decoder_mlp_ratio")
+                raise ValueError(f"RFPO actor {option} must be a positive integer.")
+        architecture_ratios = ("mlp_ratio", "condition_decoder_mlp_ratio")
         for option in architecture_ratios:
-            value = getattr(self, option)
+            value = actor_config[option]
             if (
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
                 or not math.isfinite(value)
                 or value <= 0
             ):
-                raise ValueError(f"RFPO {option} must be finite and positive.")
-        if self.dit_hidden_size % self.dit_num_heads != 0:
+                raise ValueError(
+                    f"RFPO actor {option} must be finite and positive."
+                )
+        if actor_config["hidden_size"] % actor_config["num_heads"] != 0:
             raise ValueError(
                 "RFPO DiT hidden size must be divisible by its head count."
             )
-        if self.dit_hidden_size % 2 != 0:
+        if actor_config["hidden_size"] % 2 != 0:
             raise ValueError("RFPO DiT hidden size must be even for sin-cos positions.")
-        if self.dit_hidden_size % self.condition_decoder_num_heads != 0:
+        if (
+            actor_config["hidden_size"]
+            % actor_config["condition_decoder_num_heads"]
+            != 0
+        ):
             raise ValueError(
                 "RFPO condition decoder hidden size must be divisible by its head count."
             )
+        object.__setattr__(self, "actor", actor_config)
+        object.__setattr__(self, "critic", critic_config)
 
 
 class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
@@ -286,27 +318,13 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             rfpo_action_chunk=config.rfpo_action_chunk,
             rfpo_action_dim=config.rfpo_action_dim,
             prefix_dim=config.context_dim,
-            hidden_size=config.dit_hidden_size,
-            dit_depth=config.dit_depth,
-            dit_num_heads=config.dit_num_heads,
-            dit_mlp_ratio=config.dit_mlp_ratio,
-            condition_decoder_num_layers=config.condition_decoder_num_layers,
-            condition_decoder_num_heads=config.condition_decoder_num_heads,
-            condition_decoder_mlp_ratio=config.condition_decoder_mlp_ratio,
-            timestep_frequency_embedding_size=config.timestep_frequency_embedding_size,
-            mean_scale=config.mean_scale,
-            min_log_std=config.min_log_std,
-            max_log_std=config.max_log_std,
-            dropout=config.dropout,
+            **config.actor,
         ).to(dtype=torch.bfloat16)
         self.online_critic = RFPODoubleQCritic(
             action_dim=config.rfpo_action_dim,
             state_dim=state_embedding_dim,
             context_dim=config.context_dim,
-            prefix_length=config.critic_prefix_length,
-            mlp_hidden_dims=config.critic_mlp_hidden_dims,
-            q_output_init_std=config.critic_q_output_init_std,
-            **config.critic_gemma3,
+            **config.critic,
         ).to(dtype=torch.bfloat16)
         self.rfpo_sampler = RFPOGuidedSampler(
             num_denoise_steps=config.num_denoise_steps,

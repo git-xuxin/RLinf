@@ -9,28 +9,31 @@ rfpo:
   rfpo_action_chunk: ${..num_action_chunks}
   rfpo_action_dim: ${..action_dim}
 
-  # Bounded Gaussian parameters in the normalized pi0 velocity space.
-  mean_scale: 0.05
   num_denoise_steps: ${..num_steps}
   active_step_indices: [0, 1, 2, 3]
   differentiate_base_velocity: True
-
-  # init_log_std is the midpoint of min_log_std and max_log_std.
-  min_log_std: -8.0
-  max_log_std: -2.0
   internal_log_prob_reduction: "mean_active"
 
-  dit_hidden_size: 512
-  dit_depth: 4
-  dit_num_heads: 8
-  dit_mlp_ratio: 2.0
+  actor:
+    # Actor architecture: DiT.
+    hidden_size: 512
+    depth: 4
+    num_heads: 8
+    mlp_ratio: 2.0
+    condition_decoder_num_layers: 2
+    condition_decoder_num_heads: 8
+    condition_decoder_mlp_ratio: 2.0
+    timestep_frequency_embedding_size: 256
+    dropout: 0.0
 
-  condition_decoder_num_layers: 2
-  condition_decoder_num_heads: 8
-  condition_decoder_mlp_ratio: 2.0
-  timestep_frequency_embedding_size: 256
+    # Bounded Gaussian parameters in the normalized pi0 velocity space.
+    mean_scale: 0.05
+    # init_log_std is the midpoint of min_log_std and max_log_std.
+    min_log_std: -8.0
+    max_log_std: -2.0
 
-  critic_gemma3:
+  critic:
+    # Critic architecture: Gemma3.
     hidden_size: 512
     intermediate_size: 1024
     num_hidden_layers: 3
@@ -43,10 +46,8 @@ rfpo:
     initializer_range: 0.02
     rms_norm_eps: 1.0e-6
     rope_theta: 1000000.0
-
-  critic_prefix_length: 816
-  critic_mlp_hidden_dims: [256, 128]
-  critic_q_output_init_std: 1.0e-3
+    prefix_length: 816
+    mlp_hidden_dims: [256, 128]
+    q_output_init_std: 1.0e-3
 
   context_dim: 2048
-  dropout: 0.0
