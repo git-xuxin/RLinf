@@ -589,15 +589,21 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             ],
             "model_action_horizon": output["actions"],
             "internal_log_prob": output["internal_log_prob"],
-            "base_velocity_rms_per_step": output["base_velocity_rms_per_step"],
-            "delta_velocity_rms_per_step": output["delta_velocity_rms_per_step"],
-            "mean_abs_per_step": output["mean_abs_per_step"],
-            "log_std_mean_per_step": output["log_std_mean_per_step"],
-            "mean_tanh_saturation_fraction_per_step": output[
-                "mean_tanh_saturation_fraction_per_step"
+            "base_velocity_group_rms_per_step": output[
+                "base_velocity_group_rms_per_step"
             ],
-            "log_std_tanh_saturation_fraction_per_step": output[
-                "log_std_tanh_saturation_fraction_per_step"
+            "delta_velocity_group_rms_per_step": output[
+                "delta_velocity_group_rms_per_step"
+            ],
+            "mean_group_abs_mean_per_step": output[
+                "mean_group_abs_mean_per_step"
+            ],
+            "log_std_group_mean_per_step": output["log_std_group_mean_per_step"],
+            "mean_tanh_group_saturation_fraction_per_step": output[
+                "mean_tanh_group_saturation_fraction_per_step"
+            ],
+            "log_std_tanh_group_saturation_fraction_per_step": output[
+                "log_std_tanh_group_saturation_fraction_per_step"
             ],
             "active_step_mask": output["active_step_mask"],
             "active_residuals": output["active_residuals"],

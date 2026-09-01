@@ -17,10 +17,53 @@
 from __future__ import annotations
 
 import random
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
+
+
+RFPO_ACTION_GROUPS = (
+    ("translation", slice(0, 3)),
+    ("rotation", slice(3, 6)),
+    ("gripper", slice(6, 7)),
+)
+RFPO_ACTION_GROUP_NAMES = tuple(name for name, _ in RFPO_ACTION_GROUPS)
+
+
+def reduce_rfpo_action_groups(
+    values: torch.Tensor,
+    reduction: Literal["rms", "abs_mean", "mean", "fraction"],
+    *,
+    preserve_leading_dims: int = 1,
+) -> torch.Tensor:
+    """Reduce a LIBERO action tensor without mixing semantic action groups.
+
+    The final action axis must follow LIBERO's seven-dimensional layout:
+    translation ``[0:3]``, rotation ``[3:6]``, and gripper ``[6]``. The
+    returned tensor appends a three-element action-group axis in that order.
+    """
+    if values.ndim <= preserve_leading_dims:
+        raise ValueError("RFPO action metrics require at least one reduction axis.")
+    if values.shape[-1] != 7:
+        raise ValueError(
+            "RFPO LIBERO action metrics require action_dim=7, got "
+            f"{values.shape[-1]}."
+        )
+    reduction_dims = tuple(range(preserve_leading_dims, values.ndim))
+    reduced_groups = []
+    for _, action_slice in RFPO_ACTION_GROUPS:
+        group_values = values[..., action_slice].float()
+        if reduction == "rms":
+            reduced = group_values.square().mean(dim=reduction_dims).sqrt()
+        elif reduction == "abs_mean":
+            reduced = group_values.abs().mean(dim=reduction_dims)
+        elif reduction in {"mean", "fraction"}:
+            reduced = group_values.mean(dim=reduction_dims)
+        else:
+            raise ValueError(f"Unsupported RFPO action metric reduction: {reduction}")
+        reduced_groups.append(reduced)
+    return torch.stack(reduced_groups, dim=-1)
 
 
 class RFPOGuidedSampler:
@@ -95,7 +138,9 @@ class RFPOGuidedSampler:
         active_base_velocity = base_velocity[
             :, : self.rfpo_action_chunk, : self.rfpo_action_dim
         ]
-        base_velocity_rms = active_base_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+        base_velocity_group_rms = reduce_rfpo_action_groups(
+            active_base_velocity, "rms"
+        )
 
         delta_velocity = torch.zeros_like(base_velocity)
         actor_output = None
@@ -172,7 +217,7 @@ class RFPOGuidedSampler:
         x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
         step_output = {
             "actor_output": actor_output,
-            "base_velocity_rms": base_velocity_rms,
+            "base_velocity_group_rms": base_velocity_group_rms,
             "delta_velocity": delta_velocity,
         }
         return x_t_mean, x_t_std, value_t, v_t, step_output
@@ -255,12 +300,12 @@ class RFPOGuidedSampler:
         denoise_inds = denoise_inds[None].repeat(bsize, 1)
 
         internal_log_probs = []
-        delta_velocity_rms_per_step = []
-        mean_abs_per_step = []
-        log_std_mean_per_step = []
-        mean_tanh_saturation_fraction_per_step = []
-        log_std_tanh_saturation_fraction_per_step = []
-        velocity_norms = []
+        delta_velocity_group_rms_per_step = []
+        mean_group_abs_mean_per_step = []
+        log_std_group_mean_per_step = []
+        mean_tanh_group_saturation_fraction_per_step = []
+        log_std_tanh_group_saturation_fraction_per_step = []
+        base_velocity_group_rms_per_step = []
         active_residuals: list[tuple[int, torch.Tensor]] = []
         active_mask = torch.zeros(num_steps, dtype=torch.bool, device=device)
 
@@ -291,40 +336,48 @@ class RFPOGuidedSampler:
             chains.append(x_t)
             log_probs.append(log_prob)
 
-            velocity_norms.append(step_output["base_velocity_rms"])
+            base_velocity_group_rms_per_step.append(
+                step_output["base_velocity_group_rms"]
+            )
             actor_output = step_output["actor_output"]
-            zero_metric = torch.zeros_like(step_output["base_velocity_rms"])
-            delta_velocity_rms = zero_metric
-            mean_abs = zero_metric
-            log_std_mean = zero_metric
-            mean_tanh_saturation_fraction = zero_metric
-            log_std_tanh_saturation_fraction = zero_metric
+            zero_group_metric = torch.zeros_like(
+                step_output["base_velocity_group_rms"]
+            )
+            delta_velocity_group_rms = zero_group_metric
+            mean_group_abs_mean = zero_group_metric
+            log_std_group_mean = zero_group_metric
+            mean_tanh_group_saturation_fraction = zero_group_metric
+            log_std_tanh_group_saturation_fraction = zero_group_metric
             if actor_output is not None:
                 active_mask[idx] = True
                 active_delta_velocity = actor_output["delta_velocity"]
                 active_residuals.append((idx, active_delta_velocity))
                 internal_log_probs.append(actor_output["log_prob"])
-                delta_velocity_rms = (
-                    active_delta_velocity.float().pow(2).mean(dim=(1, 2)).sqrt()
+                delta_velocity_group_rms = reduce_rfpo_action_groups(
+                    active_delta_velocity, "rms"
                 )
-                mean_abs = actor_output["mean"].float().abs().mean(dim=(1, 2))
-                log_std_mean = actor_output["log_std"].float().mean(dim=(1, 2))
-                mean_tanh_saturation_fraction = (
-                    (actor_output["mean_tanh"].float().abs() >= 0.95)
-                    .float()
-                    .mean(dim=(1, 2))
+                mean_group_abs_mean = reduce_rfpo_action_groups(
+                    actor_output["mean"], "abs_mean"
                 )
-                log_std_tanh_saturation_fraction = (
-                    (actor_output["log_std_tanh"].float().abs() >= 0.95)
-                    .float()
-                    .mean(dim=(1, 2))
+                log_std_group_mean = reduce_rfpo_action_groups(
+                    actor_output["log_std"], "mean"
                 )
-            delta_velocity_rms_per_step.append(delta_velocity_rms)
-            mean_abs_per_step.append(mean_abs)
-            log_std_mean_per_step.append(log_std_mean)
-            mean_tanh_saturation_fraction_per_step.append(mean_tanh_saturation_fraction)
-            log_std_tanh_saturation_fraction_per_step.append(
-                log_std_tanh_saturation_fraction
+                mean_tanh_group_saturation_fraction = reduce_rfpo_action_groups(
+                    actor_output["mean_tanh"].float().abs() >= 0.95,
+                    "fraction",
+                )
+                log_std_tanh_group_saturation_fraction = reduce_rfpo_action_groups(
+                    actor_output["log_std_tanh"].float().abs() >= 0.95,
+                    "fraction",
+                )
+            delta_velocity_group_rms_per_step.append(delta_velocity_group_rms)
+            mean_group_abs_mean_per_step.append(mean_group_abs_mean)
+            log_std_group_mean_per_step.append(log_std_group_mean)
+            mean_tanh_group_saturation_fraction_per_step.append(
+                mean_tanh_group_saturation_fraction
+            )
+            log_std_tanh_group_saturation_fraction_per_step.append(
+                log_std_tanh_group_saturation_fraction
             )
 
         x_0 = x_t
@@ -344,8 +397,6 @@ class RFPOGuidedSampler:
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
 
-        base_velocity_rms_per_step = torch.stack(velocity_norms, dim=1)
-        delta_velocity_rms_per_step = torch.stack(delta_velocity_rms_per_step, dim=1)
         return {
             "actions": x_0,
             "chains": chains,
@@ -355,15 +406,23 @@ class RFPOGuidedSampler:
             "internal_log_prob": self._reduce_log_probs(
                 internal_log_probs, bsize, device
             ),
-            "base_velocity_rms_per_step": base_velocity_rms_per_step,
-            "delta_velocity_rms_per_step": delta_velocity_rms_per_step,
-            "mean_abs_per_step": torch.stack(mean_abs_per_step, dim=1),
-            "log_std_mean_per_step": torch.stack(log_std_mean_per_step, dim=1),
-            "mean_tanh_saturation_fraction_per_step": torch.stack(
-                mean_tanh_saturation_fraction_per_step, dim=1
+            "base_velocity_group_rms_per_step": torch.stack(
+                base_velocity_group_rms_per_step, dim=1
             ),
-            "log_std_tanh_saturation_fraction_per_step": torch.stack(
-                log_std_tanh_saturation_fraction_per_step, dim=1
+            "delta_velocity_group_rms_per_step": torch.stack(
+                delta_velocity_group_rms_per_step, dim=1
+            ),
+            "mean_group_abs_mean_per_step": torch.stack(
+                mean_group_abs_mean_per_step, dim=1
+            ),
+            "log_std_group_mean_per_step": torch.stack(
+                log_std_group_mean_per_step, dim=1
+            ),
+            "mean_tanh_group_saturation_fraction_per_step": torch.stack(
+                mean_tanh_group_saturation_fraction_per_step, dim=1
+            ),
+            "log_std_tanh_group_saturation_fraction_per_step": torch.stack(
+                log_std_tanh_group_saturation_fraction_per_step, dim=1
             ),
             "active_step_mask": active_mask,
             "active_residuals": active_residuals,

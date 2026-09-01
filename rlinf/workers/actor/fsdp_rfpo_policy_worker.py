@@ -24,6 +24,10 @@ import torch.nn.functional as F
 
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
+from rlinf.models.embodiment.openpi_rfpo.rfpo_sampler import (
+    RFPO_ACTION_GROUP_NAMES,
+    reduce_rfpo_action_groups,
+)
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
@@ -312,46 +316,65 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             -q_min.float() + alpha * output["internal_log_prob"].float().unsqueeze(-1)
         ).mean()
         action_delta = output["actions"] - output["pi0_actions"]
+        action_delta_group_rms = reduce_rfpo_action_groups(
+            action_delta, "rms", preserve_leading_dims=0
+        )
         metrics = {
-            "action_delta_from_pi0_rms": (
-                action_delta.float().pow(2).mean().sqrt().item()
-            ),
-        }
-        base_rms_per_step = output["base_velocity_rms_per_step"]
-        per_step_metrics = {
-            "base_velocity_rms": base_rms_per_step,
-            "delta_velocity_rms": output["delta_velocity_rms_per_step"],
-            "mean_abs": output["mean_abs_per_step"],
-            "log_std_mean": output["log_std_mean_per_step"],
-            "mean_tanh_saturation_fraction": output[
-                "mean_tanh_saturation_fraction_per_step"
-            ],
-            "log_std_tanh_saturation_fraction": output[
-                "log_std_tanh_saturation_fraction_per_step"
-            ],
-        }
-        if base_rms_per_step.ndim != 2:
-            raise ValueError(
-                "RFPO per-step metrics must have shape [batch, denoise_steps]."
+            f"action_delta_from_pi0/{group_name}_rms": group_rms.item()
+            for group_name, group_rms in zip(
+                RFPO_ACTION_GROUP_NAMES, action_delta_group_rms, strict=True
             )
-        for metric_name, metric_values in per_step_metrics.items():
-            if metric_values.shape != base_rms_per_step.shape:
+        }
+        base_group_rms_per_step = output["base_velocity_group_rms_per_step"]
+        per_step_metrics = {
+            ("base_velocity", "rms"): base_group_rms_per_step,
+            ("delta_velocity", "rms"): output[
+                "delta_velocity_group_rms_per_step"
+            ],
+            ("residual_mean", "abs_mean"): output[
+                "mean_group_abs_mean_per_step"
+            ],
+            ("residual_log_std", "mean"): output[
+                "log_std_group_mean_per_step"
+            ],
+            ("mean_tanh_saturation", "fraction"): output[
+                "mean_tanh_group_saturation_fraction_per_step"
+            ],
+            ("log_std_tanh_saturation", "fraction"): output[
+                "log_std_tanh_group_saturation_fraction_per_step"
+            ],
+        }
+        expected_metric_shape = (
+            base_group_rms_per_step.shape[0],
+            base_group_rms_per_step.shape[1],
+            len(RFPO_ACTION_GROUP_NAMES),
+        )
+        if base_group_rms_per_step.shape != expected_metric_shape:
+            raise ValueError(
+                "RFPO per-step metrics must have shape "
+                "[batch, denoise_steps, action_groups]."
+            )
+        for (metric_name, _), metric_values in per_step_metrics.items():
+            if metric_values.shape != expected_metric_shape:
                 raise ValueError(
-                    f"RFPO {metric_name} must match base_velocity_rms shape."
+                    f"RFPO {metric_name} must match grouped base-velocity shape."
                 )
         active_step_mask = output["active_step_mask"]
-        if active_step_mask.shape != (base_rms_per_step.shape[1],):
+        if active_step_mask.shape != (base_group_rms_per_step.shape[1],):
             raise ValueError("RFPO active_step_mask must match denoise steps.")
         per_step_means = {
-            name: values.mean(dim=0).detach().cpu().tolist()
-            for name, values in per_step_metrics.items()
+            metric_spec: values.mean(dim=0).detach().cpu()
+            for metric_spec, values in per_step_metrics.items()
         }
         for step_idx, is_active in enumerate(active_step_mask.detach().cpu().tolist()):
             if not is_active:
                 continue
             prefix = f"denoise_step_{step_idx}"
-            for metric_name, metric_values in per_step_means.items():
-                metrics[f"{prefix}/{metric_name}"] = metric_values[step_idx]
+            for (metric_name, statistic), metric_values in per_step_means.items():
+                for group_idx, group_name in enumerate(RFPO_ACTION_GROUP_NAMES):
+                    metrics[f"{prefix}/{metric_name}/{group_name}_{statistic}"] = (
+                        metric_values[step_idx, group_idx].item()
+                    )
         return actor_loss, metrics
 
     def update_one_epoch(self, train_actor: bool = True):
