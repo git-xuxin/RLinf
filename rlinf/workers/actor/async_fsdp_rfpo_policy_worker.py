@@ -89,8 +89,14 @@ class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
                 return
             await asyncio.sleep(1)
 
+    def _should_train_actor(self, global_step: int | None) -> bool | None:
+        threshold = self.cfg.algorithm.get("train_critic_before_actor_steps", None)
+        if global_step is None or threshold is None:
+            return None
+        return global_step >= threshold
+
     @Worker.timer("run_training")
-    async def run_training(self):
+    async def run_training(self, global_step: int | None = None):
         """SAC training using replay buffer"""
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
@@ -99,11 +105,13 @@ class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
         # Check if replay buffer has enough samples
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
         await self._wait_for_replay_buffer_ready(min_buffer_size)
-        train_actor_steps = max(
-            min_buffer_size,
-            self.cfg.algorithm.get("train_actor_steps", 0),
-        )
-        train_actor = await self.replay_buffer.is_ready_async(train_actor_steps)
+        train_actor = self._should_train_actor(global_step)
+        if train_actor is None:
+            train_actor_steps = max(
+                min_buffer_size,
+                self.cfg.algorithm.get("train_actor_steps", 0),
+            )
+            train_actor = await self.replay_buffer.is_ready_async(train_actor_steps)
 
         torch.distributed.barrier()
 

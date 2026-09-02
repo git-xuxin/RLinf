@@ -31,6 +31,7 @@ runner:
   only_eval: False
   val_check_interval: -1
   save_interval: 50
+  first_weight_sync_step: 30
   weight_sync_interval: 1
 
 algorithm:
@@ -80,7 +81,7 @@ algorithm:
 
   target_update_freq: 1
   target_update_type: all
-  train_actor_steps: 50  # ${algorithm.replay_buffer.min_buffer_size}
+  train_critic_before_actor_steps: 30
 
   filter_rewards: False
   rewards_lower_bound: 0.1

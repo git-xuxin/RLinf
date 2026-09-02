@@ -65,6 +65,14 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
         self.sync_weight_no_wait = self.cfg.actor.get("sync_weight_no_wait", False)
+        self.first_weight_sync_step = self.cfg.runner.get("first_weight_sync_step", 0)
+
+    def _should_sync_rollout_weights(self) -> bool:
+        if self.global_step < self.first_weight_sync_step:
+            return False
+        return (self.global_step - self.first_weight_sync_step) % (
+            self.weight_sync_interval
+        ) == 0
 
     def get_env_metrics(self) -> tuple[dict, list[dict], list[dict]]:
         results: list[dict] = []
@@ -199,14 +207,16 @@ class AsyncEmbodiedRunner(EmbodiedRunner):
                 self._open_profiling_window(profiled_step)
             skip_step = False
             with self.timer("step"):
-                actor_training_handle: Handle = self.actor.run_training()
+                actor_training_handle: Handle = self.actor.run_training(
+                    global_step=self.global_step
+                )
                 actor_result = actor_training_handle.wait()
                 if not actor_result[0]:
                     skip_step = True
 
                 if not skip_step:
                     self.global_step += 1
-                    if self.global_step % self.weight_sync_interval == 0:
+                    if self._should_sync_rollout_weights():
                         self.update_rollout_weights(no_wait=self.sync_weight_no_wait)
 
                     training_metrics = {
