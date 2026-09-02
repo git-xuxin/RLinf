@@ -27,10 +27,10 @@ rfpo:
     dropout: 0.0
 
     # Bounded Gaussian parameters in the normalized pi0 velocity space.
-    mean_scale: 0.05
+    mean_scale: 0.1
     # init_log_std is the midpoint of min_log_std and max_log_std.
     min_log_std: -8.0
-    max_log_std: -2.0
+    max_log_std: -4.0
 
   critic:
     # Critic architecture: Gemma3.

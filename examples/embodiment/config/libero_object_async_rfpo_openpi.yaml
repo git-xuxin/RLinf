@@ -50,7 +50,13 @@ algorithm:
   loss_agg_func: "token-mean"
 
   backup_entropy: False
-  critic_actor_ratio: 4
+  critic_actor_ratio: 2
+
+  # Penalize the pre-tanh DiT mean per semantic action group. 
+  raw_mean_l2_coefficients:
+    translation: 2.0e-4
+    rotation: 2.0e-4
+    gripper: 2.0e-4
 
   bootstrap_type: standard
   gamma: 0.99
@@ -69,12 +75,12 @@ algorithm:
     enable_cache: True
     cache_size: 100
     sample_window_size: 100
-    min_buffer_size: 20
+    min_buffer_size: 10
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
-  train_actor_steps: ${algorithm.replay_buffer.min_buffer_size}
+  train_actor_steps: 50  # ${algorithm.replay_buffer.min_buffer_size}
 
   filter_rewards: False
   rewards_lower_bound: 0.1

@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import math
 import os
+from collections.abc import Mapping
+from numbers import Real
 
 import numpy as np
 import torch
@@ -26,11 +29,76 @@ from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
 from rlinf.models.embodiment.openpi_rfpo.rfpo_sampler import (
     RFPO_ACTION_GROUP_NAMES,
+    compute_rfpo_raw_mean_l2,
     reduce_rfpo_action_groups,
 )
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
+
+
+def parse_raw_mean_l2_coefficients(
+    config: Mapping | None,
+) -> tuple[float, float, float]:
+    """Validate RFPO raw-mean L2 coefficients in action-group order."""
+    if config is None:
+        return (0.0, 0.0, 0.0)
+    if not isinstance(config, Mapping):
+        raise ValueError("algorithm.raw_mean_l2_coefficients must be a mapping.")
+
+    unknown_keys = set(config) - set(RFPO_ACTION_GROUP_NAMES)
+    if unknown_keys:
+        raise ValueError(
+            f"Unsupported RFPO raw-mean L2 groups: {sorted(unknown_keys)}."
+        )
+
+    coefficients = []
+    for group_name in RFPO_ACTION_GROUP_NAMES:
+        value = config.get(group_name, 0.0)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            raise ValueError(
+                "RFPO raw-mean L2 coefficient "
+                f"'{group_name}' must be finite and non-negative."
+            )
+        coefficients.append(float(value))
+    return tuple(coefficients)
+
+
+def compute_rfpo_actor_loss(
+    q_min: torch.Tensor,
+    internal_log_prob: torch.Tensor,
+    alpha: torch.Tensor,
+    raw_mean_group_mse_per_step: torch.Tensor,
+    active_step_mask: torch.Tensor,
+    raw_mean_l2_coefficients: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute RFPO actor loss and its non-redundant logged components."""
+    actor_q_loss = -q_min.float().mean()
+    actor_entropy_loss = (
+        alpha.float() * internal_log_prob.float().unsqueeze(-1)
+    ).mean()
+    base_actor_loss = (
+        -q_min.float() + alpha.float() * internal_log_prob.float().unsqueeze(-1)
+    ).mean()
+    raw_mean_l2_loss, raw_mean_group_mse, weighted_raw_mean_l2 = (
+        compute_rfpo_raw_mean_l2(
+            raw_mean_group_mse_per_step,
+            active_step_mask,
+            raw_mean_l2_coefficients,
+        )
+    )
+    return (
+        base_actor_loss + raw_mean_l2_loss,
+        actor_q_loss,
+        actor_entropy_loss,
+        raw_mean_group_mse,
+        weighted_raw_mean_l2,
+    )
 
 
 class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
@@ -54,6 +122,13 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 "RFPO requires FSDP auto-wrap so the residual actor and critic "
                 "remain separate from the mixed-dtype frozen pi0 parameters."
             )
+        self.raw_mean_l2_coefficients = torch.tensor(
+            parse_raw_mean_l2_coefficients(
+                self.cfg.algorithm.get("raw_mean_l2_coefficients", None)
+            ),
+            device=self.device,
+            dtype=torch.float32,
+        )
         self.setup_model_and_optimizer()
         self.setup_sac_components()
         self.soft_update_target_critic(tau=1.0)
@@ -312,9 +387,20 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         q_min = output["q_values"].min(dim=-1, keepdim=True).values
         alpha = self.entropy_temp.compute_alpha().detach().float()
-        actor_loss = (
-            -q_min.float() + alpha * output["internal_log_prob"].float().unsqueeze(-1)
-        ).mean()
+        (
+            actor_loss,
+            actor_q_loss,
+            actor_entropy_loss,
+            raw_mean_group_mse,
+            weighted_raw_mean_l2,
+        ) = compute_rfpo_actor_loss(
+            q_min,
+            output["internal_log_prob"],
+            alpha,
+            output["raw_mean_group_mse_per_step"],
+            output["active_step_mask"],
+            self.raw_mean_l2_coefficients,
+        )
         action_delta = output["actions"] - output["pi0_actions"]
         action_delta_group_rms = reduce_rfpo_action_groups(
             action_delta, "rms", preserve_leading_dims=0
@@ -325,18 +411,26 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 RFPO_ACTION_GROUP_NAMES, action_delta_group_rms, strict=True
             )
         }
+        metrics.update(
+            {
+                "actor_loss/q": actor_q_loss.item(),
+                "actor_loss/entropy": actor_entropy_loss.item(),
+            }
+        )
+        for group_name, group_mse, weighted_loss in zip(
+            RFPO_ACTION_GROUP_NAMES,
+            raw_mean_group_mse,
+            weighted_raw_mean_l2,
+            strict=True,
+        ):
+            metrics[f"raw_mean_l2/{group_name}_mse"] = group_mse.item()
+            metrics[f"actor_loss/raw_mean_l2/{group_name}"] = weighted_loss.item()
         base_group_rms_per_step = output["base_velocity_group_rms_per_step"]
         per_step_metrics = {
             ("base_velocity", "rms"): base_group_rms_per_step,
-            ("delta_velocity", "rms"): output[
-                "delta_velocity_group_rms_per_step"
-            ],
-            ("residual_mean", "abs_mean"): output[
-                "mean_group_abs_mean_per_step"
-            ],
-            ("residual_log_std", "mean"): output[
-                "log_std_group_mean_per_step"
-            ],
+            ("delta_velocity", "rms"): output["delta_velocity_group_rms_per_step"],
+            ("residual_mean", "abs_mean"): output["mean_group_abs_mean_per_step"],
+            ("residual_log_std", "mean"): output["log_std_group_mean_per_step"],
             ("mean_tanh_saturation", "fraction"): output[
                 "mean_tanh_group_saturation_fraction_per_step"
             ],

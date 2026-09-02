@@ -173,8 +173,7 @@ class OpenPiRFPOConfig(OpenPi0Config):
                     f"RFPO critic Gemma3 {option} must be a positive integer."
                 )
         if (
-            critic_config["num_attention_heads"]
-            % critic_config["num_key_value_heads"]
+            critic_config["num_attention_heads"] % critic_config["num_key_value_heads"]
             != 0
         ):
             raise ValueError(
@@ -276,9 +275,7 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 or not math.isfinite(value)
                 or value <= 0
             ):
-                raise ValueError(
-                    f"RFPO actor {option} must be finite and positive."
-                )
+                raise ValueError(f"RFPO actor {option} must be finite and positive.")
         if actor_config["hidden_size"] % actor_config["num_heads"] != 0:
             raise ValueError(
                 "RFPO DiT hidden size must be divisible by its head count."
@@ -286,8 +283,7 @@ class OpenPiRFPOConfig(OpenPi0Config):
         if actor_config["hidden_size"] % 2 != 0:
             raise ValueError("RFPO DiT hidden size must be even for sin-cos positions.")
         if (
-            actor_config["hidden_size"]
-            % actor_config["condition_decoder_num_heads"]
+            actor_config["hidden_size"] % actor_config["condition_decoder_num_heads"]
             != 0
         ):
             raise ValueError(
@@ -298,7 +294,6 @@ class OpenPiRFPOConfig(OpenPi0Config):
 
 
 class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
-
     config: OpenPiRFPOConfig
 
     def __init__(self, config: OpenPiRFPOConfig) -> None:
@@ -595,9 +590,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             "delta_velocity_group_rms_per_step": output[
                 "delta_velocity_group_rms_per_step"
             ],
-            "mean_group_abs_mean_per_step": output[
-                "mean_group_abs_mean_per_step"
-            ],
+            "mean_group_abs_mean_per_step": output["mean_group_abs_mean_per_step"],
             "log_std_group_mean_per_step": output["log_std_group_mean_per_step"],
             "mean_tanh_group_saturation_fraction_per_step": output[
                 "mean_tanh_group_saturation_fraction_per_step"
@@ -605,6 +598,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             "log_std_tanh_group_saturation_fraction_per_step": output[
                 "log_std_tanh_group_saturation_fraction_per_step"
             ],
+            "raw_mean_group_mse_per_step": output["raw_mean_group_mse_per_step"],
             "active_step_mask": output["active_step_mask"],
             "active_residuals": output["active_residuals"],
             "critic_state_embedding": condition["state_embedding"],

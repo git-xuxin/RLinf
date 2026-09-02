@@ -22,7 +22,6 @@ from typing import Any, Literal
 import torch
 import torch.nn.functional as F
 
-
 RFPO_ACTION_GROUPS = (
     ("translation", slice(0, 3)),
     ("rotation", slice(3, 6)),
@@ -33,7 +32,7 @@ RFPO_ACTION_GROUP_NAMES = tuple(name for name, _ in RFPO_ACTION_GROUPS)
 
 def reduce_rfpo_action_groups(
     values: torch.Tensor,
-    reduction: Literal["rms", "abs_mean", "mean", "fraction"],
+    reduction: Literal["rms", "abs_mean", "mean", "mean_square", "fraction"],
     *,
     preserve_leading_dims: int = 1,
 ) -> torch.Tensor:
@@ -47,8 +46,7 @@ def reduce_rfpo_action_groups(
         raise ValueError("RFPO action metrics require at least one reduction axis.")
     if values.shape[-1] != 7:
         raise ValueError(
-            "RFPO LIBERO action metrics require action_dim=7, got "
-            f"{values.shape[-1]}."
+            f"RFPO LIBERO action metrics require action_dim=7, got {values.shape[-1]}."
         )
     reduction_dims = tuple(range(preserve_leading_dims, values.ndim))
     reduced_groups = []
@@ -58,12 +56,52 @@ def reduce_rfpo_action_groups(
             reduced = group_values.square().mean(dim=reduction_dims).sqrt()
         elif reduction == "abs_mean":
             reduced = group_values.abs().mean(dim=reduction_dims)
+        elif reduction == "mean_square":
+            reduced = group_values.square().mean(dim=reduction_dims)
         elif reduction in {"mean", "fraction"}:
             reduced = group_values.mean(dim=reduction_dims)
         else:
             raise ValueError(f"Unsupported RFPO action metric reduction: {reduction}")
         reduced_groups.append(reduced)
     return torch.stack(reduced_groups, dim=-1)
+
+
+def compute_rfpo_raw_mean_l2(
+    raw_mean_group_mse_per_step: torch.Tensor,
+    active_step_mask: torch.Tensor,
+    coefficients: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute dimension-balanced raw-mean L2 terms for active RFPO steps.
+
+    Args:
+        raw_mean_group_mse_per_step: Per-sample, per-denoise-step MSE with
+            shape ``[batch, denoise_steps, 3]``.
+        active_step_mask: Boolean mask with shape ``[denoise_steps]``.
+        coefficients: Translation, rotation, and gripper coefficients with
+            shape ``[3]``.
+
+    Returns:
+        Total penalty, unweighted group MSE, and weighted group losses.
+    """
+    if raw_mean_group_mse_per_step.ndim != 3:
+        raise ValueError("RFPO raw-mean group MSE must have shape [B, S, 3].")
+    if raw_mean_group_mse_per_step.shape[-1] != len(RFPO_ACTION_GROUP_NAMES):
+        raise ValueError("RFPO raw-mean group MSE must contain three groups.")
+    if active_step_mask.shape != (raw_mean_group_mse_per_step.shape[1],):
+        raise ValueError("RFPO active-step mask must match the denoise-step axis.")
+    if active_step_mask.dtype != torch.bool:
+        raise ValueError("RFPO active-step mask must be boolean.")
+    if not active_step_mask.any():
+        raise ValueError("RFPO raw-mean L2 requires at least one active step.")
+    if coefficients.shape != (len(RFPO_ACTION_GROUP_NAMES),):
+        raise ValueError("RFPO raw-mean L2 coefficients must have shape [3].")
+
+    active_group_mse = raw_mean_group_mse_per_step[:, active_step_mask, :]
+    group_mse = active_group_mse.float().mean(dim=(0, 1))
+    weighted_group_losses = group_mse * coefficients.to(
+        device=group_mse.device, dtype=group_mse.dtype
+    )
+    return weighted_group_losses.sum(), group_mse, weighted_group_losses
 
 
 class RFPOGuidedSampler:
@@ -138,9 +176,7 @@ class RFPOGuidedSampler:
         active_base_velocity = base_velocity[
             :, : self.rfpo_action_chunk, : self.rfpo_action_dim
         ]
-        base_velocity_group_rms = reduce_rfpo_action_groups(
-            active_base_velocity, "rms"
-        )
+        base_velocity_group_rms = reduce_rfpo_action_groups(active_base_velocity, "rms")
 
         delta_velocity = torch.zeros_like(base_velocity)
         actor_output = None
@@ -305,6 +341,7 @@ class RFPOGuidedSampler:
         log_std_group_mean_per_step = []
         mean_tanh_group_saturation_fraction_per_step = []
         log_std_tanh_group_saturation_fraction_per_step = []
+        raw_mean_group_mse_per_step = []
         base_velocity_group_rms_per_step = []
         active_residuals: list[tuple[int, torch.Tensor]] = []
         active_mask = torch.zeros(num_steps, dtype=torch.bool, device=device)
@@ -340,14 +377,13 @@ class RFPOGuidedSampler:
                 step_output["base_velocity_group_rms"]
             )
             actor_output = step_output["actor_output"]
-            zero_group_metric = torch.zeros_like(
-                step_output["base_velocity_group_rms"]
-            )
+            zero_group_metric = torch.zeros_like(step_output["base_velocity_group_rms"])
             delta_velocity_group_rms = zero_group_metric
             mean_group_abs_mean = zero_group_metric
             log_std_group_mean = zero_group_metric
             mean_tanh_group_saturation_fraction = zero_group_metric
             log_std_tanh_group_saturation_fraction = zero_group_metric
+            raw_mean_group_mse = zero_group_metric
             if actor_output is not None:
                 active_mask[idx] = True
                 active_delta_velocity = actor_output["delta_velocity"]
@@ -370,6 +406,9 @@ class RFPOGuidedSampler:
                     actor_output["log_std_tanh"].float().abs() >= 0.95,
                     "fraction",
                 )
+                raw_mean_group_mse = reduce_rfpo_action_groups(
+                    actor_output["raw_mean"], "mean_square"
+                )
             delta_velocity_group_rms_per_step.append(delta_velocity_group_rms)
             mean_group_abs_mean_per_step.append(mean_group_abs_mean)
             log_std_group_mean_per_step.append(log_std_group_mean)
@@ -379,6 +418,7 @@ class RFPOGuidedSampler:
             log_std_tanh_group_saturation_fraction_per_step.append(
                 log_std_tanh_group_saturation_fraction
             )
+            raw_mean_group_mse_per_step.append(raw_mean_group_mse)
 
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
@@ -423,6 +463,9 @@ class RFPOGuidedSampler:
             ),
             "log_std_tanh_group_saturation_fraction_per_step": torch.stack(
                 log_std_tanh_group_saturation_fraction_per_step, dim=1
+            ),
+            "raw_mean_group_mse_per_step": torch.stack(
+                raw_mean_group_mse_per_step, dim=1
             ),
             "active_step_mask": active_mask,
             "active_residuals": active_residuals,
