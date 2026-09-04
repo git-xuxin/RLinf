@@ -197,8 +197,7 @@ class RFPOResidualActor(nn.Module):
                 dtype=suffix_tokens.dtype,
             )[None]
         )
-        timestep_token = self.timestep_embedder(timestep).to(dtype=actor_dtype)
-        cls_token = self.cls_token.expand(batch_size, -1, -1) + timestep_token[:, None]
+        cls_token = self.cls_token.expand(batch_size, -1, -1)
         queries = torch.cat([suffix_tokens, cls_token], dim=1)
 
         prefix_memory = self.prefix_input(prefix_tokens.detach().to(dtype=actor_dtype))
@@ -212,7 +211,9 @@ class RFPOResidualActor(nn.Module):
             memory=prefix_memory,
             memory_key_padding_mask=memory_key_padding_mask,
         )
-        conditioning = decoded_queries[:, -1]
+        decoded_cls = decoded_queries[:, -1]
+        timestep_token = self.timestep_embedder(timestep).to(dtype=actor_dtype)
+        conditioning = decoded_cls + timestep_token
 
         raw_mean, raw_log_std = (
             self.dit(action_tokens, conditioning).float().chunk(2, dim=-1)
