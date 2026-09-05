@@ -31,7 +31,7 @@ runner:
   only_eval: False
   val_check_interval: -1
   save_interval: 50
-  first_weight_sync_step: 30
+  first_weight_sync_step: 100
   weight_sync_interval: 1
 
 algorithm:
@@ -51,17 +51,17 @@ algorithm:
   loss_agg_func: "token-mean"
 
   backup_entropy: False
-  critic_actor_ratio: 2
+  critic_actor_ratio: 8
 
   # Penalize the pre-tanh DiT mean per semantic action group. 
   raw_mean_l2_coefficients:
-    translation: 2.0e-4
-    rotation: 2.0e-4
-    gripper: 2.0e-4
+    translation: 1.0e-4
+    rotation: 1.0e-4
+    gripper: 1.0e-4
 
   bootstrap_type: standard
   gamma: 0.99
-  tau: 0.05
+  tau: 0.005
 
   entropy_tuning:
     alpha_type: fixed_alpha
@@ -81,7 +81,7 @@ algorithm:
 
   target_update_freq: 1
   target_update_type: all
-  train_critic_before_actor_steps: 30
+  train_critic_before_actor_steps: 50
 
   filter_rewards: False
   rewards_lower_bound: 0.1
@@ -138,12 +138,12 @@ actor:
 
   optim:
     clip_grad: 1.0
-    lr: 1.0e-4
+    lr: 2.0e-5
     lr_scheduler: torch_constant
 
   critic_optim:
     clip_grad: 1.0
-    lr: 1.0e-4
+    lr: 2.0e-5
     lr_scheduler: torch_constant
 
   fsdp_config:
