@@ -36,8 +36,9 @@ class EntropyTemperature(nn.Module):
         if alpha_type == "exp":
             init = np.log(initial_alpha)
         elif alpha_type == "softplus":
-            # softplus^{-1}(x) = log(exp(x) - 1)
-            init = np.log(np.exp(initial_alpha) - 1.0)
+            # softplus^{-1}(x) = x + log(1 - exp(-x)). This form stays
+            # accurate for small temperatures and does not overflow for large x.
+            init = initial_alpha + np.log(-np.expm1(-initial_alpha))
         elif alpha_type == "fixed_alpha":
             self.register_buffer(
                 "fixed_alpha",

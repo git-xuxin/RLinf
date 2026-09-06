@@ -101,6 +101,31 @@ def compute_rfpo_actor_loss(
     )
 
 
+def compute_rfpo_alpha_loss(
+    internal_log_prob: torch.Tensor,
+    alpha: torch.Tensor,
+    target_entropy: float,
+) -> torch.Tensor:
+    """Compute the RFPO temperature loss without policy gradients."""
+    entropy_error = internal_log_prob.detach().float().mean() + float(target_entropy)
+    return -alpha.float() * entropy_error
+
+
+def get_rfpo_default_target_entropy(model_config) -> float:
+    """Return target entropy in the sampler's internal log-prob units."""
+    entropy_dim = int(model_config.rfpo_action_chunk) * int(
+        model_config.rfpo_action_dim
+    )
+    reduction = model_config.internal_log_prob_reduction
+    if reduction == "sum_active":
+        entropy_dim *= len(model_config.active_step_indices)
+    elif reduction != "mean_active":
+        raise ValueError(
+            "RFPO internal_log_prob_reduction must be 'mean_active' or 'sum_active'."
+        )
+    return -float(entropy_dim)
+
+
 class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
     """Synchronous trajectory actor-critic worker for RFPO."""
 
@@ -189,7 +214,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             filtered_optim_config={"critic": self.cfg.actor.critic_optim},
         )
         self.optimizer, self.qf_optimizer = optimizers
-        self.build_lr_schedulers()
         self.grad_scaler = self.build_grad_scaler(
             self.cfg.actor.fsdp_config.grad_scaler.get("enabled", False),
             **{
@@ -201,10 +225,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         entropy_config = self.cfg.algorithm.get("entropy_tuning", {})
         alpha_type = entropy_config.get("alpha_type", "fixed_alpha")
-        if alpha_type != "fixed_alpha":
-            raise ValueError(
-                "RFPO initial implementation supports only fixed entropy alpha."
-            )
         alpha = float(
             entropy_config.get(
                 "initial_alpha", self.cfg.algorithm.get("entropy_alpha", 0.0)
@@ -217,6 +237,20 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             dtype=torch.float32,
         )
         self.alpha_optimizer = None
+        if alpha_type != "fixed_alpha":
+            self.target_entropy = float(
+                entropy_config.get(
+                    "target_entropy",
+                    get_rfpo_default_target_entropy(module.config),
+                )
+            )
+            if not math.isfinite(self.target_entropy):
+                raise ValueError("RFPO target_entropy must be finite.")
+            self.alpha_optimizer = torch.optim.Adam(
+                self.entropy_temp.parameters(),
+                lr=entropy_config.optim.lr,
+            )
+        self.build_lr_schedulers()
         self.target_model_initialized = True
         self.use_dsrl = False
 
@@ -350,6 +384,10 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 .min(dim=-1, keepdim=True)
                 .values
             )
+            if self.cfg.algorithm.get("backup_entropy", True):
+                next_log_prob = next_output["internal_log_prob"].float().unsqueeze(-1)
+                alpha = self.entropy_temp.compute_alpha().detach().float()
+                target_q_values = target_q_values.float() - alpha * next_log_prob
             target = (
                 rewards + (~terminated) * bootstrap_discount * target_q_values.float()
             )
@@ -469,7 +507,23 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                     metrics[f"{prefix}/{metric_name}/{group_name}_{statistic}"] = (
                         metric_values[step_idx, group_idx].item()
                     )
-        return actor_loss, metrics
+        entropy = -output["internal_log_prob"].detach().float().mean()
+        return actor_loss, entropy, metrics
+
+    def forward_alpha(self, batch):
+        tokenized_prompt, tokenized_prompt_mask = self._prompt_inputs(batch)
+        with torch.no_grad():
+            output = self.model(
+                forward_type=ForwardType.RFPO_ACTOR,
+                obs=batch["curr_obs"],
+                tokenized_prompt=tokenized_prompt,
+                tokenized_prompt_mask=tokenized_prompt_mask,
+            )
+        return compute_rfpo_alpha_loss(
+            output["internal_log_prob"],
+            self.entropy_temp.compute_alpha(),
+            self.target_entropy,
+        )
 
     def update_one_epoch(self, train_actor: bool = True):
         global_batch_size_per_rank = (
@@ -514,12 +568,14 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.optimizer.zero_grad()
             self.qf_optimizer.zero_grad()
             actor_losses = []
+            entropies = []
             actor_metrics = {}
             for batch in micro_batches:
-                actor_loss, metrics = self.forward_actor(batch)
+                actor_loss, entropy, metrics = self.forward_actor(batch)
                 actor_loss = actor_loss / self.gradient_accumulation
                 actor_loss.backward()
                 actor_losses.append(actor_loss.item() * self.gradient_accumulation)
+                entropies.append(entropy.item())
                 append_to_dict(actor_metrics, metrics)
             self.qf_optimizer.zero_grad()
             self._pi0_grad_norm()
@@ -530,11 +586,35 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             )
             self.optimizer.step()
             self.lr_scheduler.step()
+
+            alpha_losses = [0.0]
+            alpha_grad_norm = 0.0
+            if self.alpha_optimizer is not None:
+                self.alpha_optimizer.zero_grad()
+                alpha_losses = []
+                for batch in micro_batches:
+                    alpha_loss = self.forward_alpha(batch) / self.gradient_accumulation
+                    alpha_loss.backward()
+                    alpha_losses.append(alpha_loss.item() * self.gradient_accumulation)
+                torch.distributed.all_reduce(
+                    self.entropy_temp.base_alpha.grad,
+                    op=torch.distributed.ReduceOp.AVG,
+                )
+                alpha_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.entropy_temp.base_alpha,
+                    self.cfg.algorithm.entropy_tuning.optim.clip_grad,
+                )
+                self.alpha_optimizer.step()
+                self.alpha_lr_scheduler.step()
             metrics_data.update(
                 {
                     "rfpo/actor_loss": np.mean(actor_losses),
+                    "rfpo/internal_residual_entropy": np.mean(entropies),
+                    "rfpo/alpha_loss": np.mean(alpha_losses),
+                    "rfpo/alpha": self.entropy_temp.alpha,
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
                     "actor/grad_norm": actor_grad_norm,
+                    "alpha/grad_norm": alpha_grad_norm,
                     **{
                         f"rfpo/{key}": np.mean(value)
                         for key, value in actor_metrics.items()
@@ -563,6 +643,14 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         component_dir = os.path.join(save_base_path, "rfpo_components")
         os.makedirs(component_dir, exist_ok=True)
+        if self.alpha_optimizer is not None:
+            self._strategy.save_checkpoint(
+                model=self.entropy_temp,
+                optimizers=self.alpha_optimizer,
+                lr_schedulers=self.alpha_lr_scheduler,
+                save_path=os.path.join(component_dir, "alpha"),
+                save_full_model_weights=False,
+            )
         torch.save(
             self.target_critic.state_dict(),
             os.path.join(component_dir, f"target_critic_rank_{self._rank}.pt"),
@@ -588,6 +676,13 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             checkpoint_format="local_shard",
         )
         component_dir = os.path.join(load_base_path, "rfpo_components")
+        if self.alpha_optimizer is not None:
+            self._strategy.load_checkpoint(
+                model=self.entropy_temp,
+                optimizers=self.alpha_optimizer,
+                lr_schedulers=self.alpha_lr_scheduler,
+                load_path=os.path.join(component_dir, "alpha"),
+            )
         self.target_critic.load_state_dict(
             torch.load(
                 os.path.join(component_dir, f"target_critic_rank_{self._rank}.pt"),
