@@ -29,6 +29,10 @@ from rlinf.workers.actor.fsdp_rfpo_policy_worker import EmbodiedRFPOFSDPPolicy
 class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
     should_stop = False
 
+    def get_rollout_sync_version(self) -> int:
+        """Expose the learner update count to asynchronous rollout workers."""
+        return int(self.update_step)
+
     async def recv_rollout_trajectories(self, input_channel):
         if getattr(self, "_recv_queue", None) is None:
             self._recv_queue = queue.Queue()

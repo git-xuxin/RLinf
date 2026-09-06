@@ -205,8 +205,8 @@ class RFPOGuidedSampler:
                 raise ValueError(
                     "RFPO SAC delta_velocity must match the pi0 velocity shape."
                 )
-            if retain_residual_grads and delta_velocity.requires_grad:
-                delta_velocity.retain_grad()
+            if retain_residual_grads and active_delta_velocity.requires_grad:
+                active_delta_velocity.retain_grad()
 
         # This is the only change to OpenPI's denoising vector field.
         v_t = base_velocity + delta_velocity
