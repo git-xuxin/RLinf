@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 import torch
 from openpi.models import model as _model
+from torch.utils._pytree import tree_map
 
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.models.embodiment.openpi.openpi_action_model import (
@@ -33,6 +34,13 @@ from rlinf.utils.nested_dict_process import copy_dict_tensor
 from .rfpo_actor import RFPOResidualActor
 from .rfpo_critic import RFPODoubleQCritic
 from .rfpo_sampler import RFPOGuidedSampler
+
+
+def _input_transform_compatible(value: Any) -> Any:
+    """Restore BF16 FSDP inputs to a NumPy-compatible floating dtype."""
+    if torch.is_tensor(value) and value.dtype == torch.bfloat16:
+        return value.float()
+    return value
 
 
 def _default_actor_config() -> dict[str, Any]:
@@ -314,13 +322,13 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             rfpo_action_dim=config.rfpo_action_dim,
             prefix_dim=config.context_dim,
             **config.actor,
-        ).to(dtype=torch.bfloat16)
+        )
         self.online_critic = RFPODoubleQCritic(
             action_dim=config.rfpo_action_dim,
             state_dim=state_embedding_dim,
             context_dim=config.context_dim,
             **config.critic,
-        ).to(dtype=torch.bfloat16)
+        )
         self.rfpo_sampler = RFPOGuidedSampler(
             num_denoise_steps=config.num_denoise_steps,
             rfpo_action_chunk=config.rfpo_action_chunk,
@@ -386,6 +394,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
                 )
             to_process_obs["tokenized_prompt"] = tokenized_prompt
             to_process_obs["tokenized_prompt_mask"] = tokenized_prompt_mask
+        to_process_obs = tree_map(_input_transform_compatible, to_process_obs)
         processed_obs = self.input_transform(to_process_obs, transpose=False)
         processed_obs = self.precision_processor(processed_obs)
         return _model.Observation.from_dict(processed_obs)
