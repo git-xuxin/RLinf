@@ -112,12 +112,14 @@ class RFPOResidualActor(nn.Module):
             num_layers=condition_decoder_num_layers,
             norm=nn.LayerNorm(hidden_size, eps=1e-6),
         )
+        # Variance is state-independent, so its gradients cannot flow into DiT.
+        self.raw_log_std = nn.Parameter(torch.zeros(1, 1, rfpo_action_dim))
         self.dit = DiTBackbone(
             hidden_size,
             depth,
             num_heads,
             mlp_ratio=mlp_ratio,
-            output_dim=2 * rfpo_action_dim,
+            output_dim=rfpo_action_dim,
             dropout=dropout,
         )
         self._initialize_weights()
@@ -134,6 +136,7 @@ class RFPOResidualActor(nn.Module):
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
         nn.init.normal_(self.timestep_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.timestep_embedder.mlp[2].weight, std=0.02)
+        nn.init.zeros_(self.raw_log_std)
         nn.init.normal_(self.dit.final_layer.linear.weight, mean=0.0, std=1.0e-4)
         nn.init.zeros_(self.dit.final_layer.linear.bias)
 
@@ -215,9 +218,8 @@ class RFPOResidualActor(nn.Module):
         timestep_token = self.timestep_embedder(timestep).to(dtype=actor_dtype)
         conditioning = decoded_cls + timestep_token
 
-        raw_mean, raw_log_std = (
-            self.dit(action_tokens, conditioning).float().chunk(2, dim=-1)
-        )
+        raw_mean = self.dit(action_tokens, conditioning).float()
+        raw_log_std = self.raw_log_std.expand_as(raw_mean).float()
         mean_tanh = torch.tanh(raw_mean)
         log_std_tanh = torch.tanh(raw_log_std)
         mean = self.mean_scale * mean_tanh

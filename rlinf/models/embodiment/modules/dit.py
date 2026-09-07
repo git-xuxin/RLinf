@@ -153,7 +153,7 @@ class FinalLayer(nn.Module):
     """RFPO adaptation of the official DiT final layer.
 
     The official image model expands each token to patch pixels. RFPO instead
-    emits two action parameters per token: mean and log standard deviation.
+    emits token-wise action parameters such as the residual velocity mean.
     """
 
     def __init__(self, hidden_size: int, output_dim: int) -> None:
