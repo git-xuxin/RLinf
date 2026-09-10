@@ -404,7 +404,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             current_q_values.float(), target.expand_as(current_q_values).float()
         )
         metrics = {
-            "q_data": current_q_values.mean().item(),
+            "q_data": current_q_values.min(dim=-1).values.mean().item(),
             "q_target": target.mean().item(),
             "q_disagreement": (current_q_values[:, 0] - current_q_values[:, 1])
             .abs()
@@ -451,6 +451,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         }
         metrics.update(
             {
+                "q_pi": q_min.mean().item(),
                 "actor_loss/q": actor_q_loss.item(),
                 "actor_loss/entropy": actor_entropy_loss.item(),
             }
