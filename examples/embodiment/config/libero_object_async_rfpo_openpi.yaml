@@ -48,7 +48,7 @@ algorithm:
   backup_entropy: False
   critic_actor_ratio: 4
 
-  # Penalize the pre-tanh DiT mean per semantic action group. 
+  # Penalize the raw DiT mean before its optional output transform.
   raw_mean_l2_coefficients:
     translation: 1.0e-4
     rotation: 1.0e-4

@@ -48,11 +48,14 @@ class RFPOResidualActor(nn.Module):
         condition_decoder_mlp_ratio: float,
         timestep_frequency_embedding_size: int,
         dropout: float,
+        use_tanh_mean_scaling: bool,
         mean_scale: float,
         min_log_std: float,
         max_log_std: float,
     ) -> None:
         super().__init__()
+        if not isinstance(use_tanh_mean_scaling, bool):
+            raise ValueError("RFPO use_tanh_mean_scaling must be boolean.")
         for name, value in (
             ("mean_scale", mean_scale),
             ("min_log_std", min_log_std),
@@ -81,6 +84,7 @@ class RFPOResidualActor(nn.Module):
         if not 0.0 <= dropout < 1.0:
             raise ValueError("RFPO actor dropout must lie within [0, 1).")
 
+        self.use_tanh_mean_scaling = use_tanh_mean_scaling
         self.mean_scale = float(mean_scale)
         self.init_log_std = 0.5 * (float(min_log_std) + float(max_log_std))
         self.log_std_scale = 0.5 * (float(max_log_std) - float(min_log_std))
@@ -220,9 +224,11 @@ class RFPOResidualActor(nn.Module):
 
         raw_mean = self.dit(action_tokens, conditioning).float()
         raw_log_std = self.raw_log_std.expand_as(raw_mean).float()
+        # Keep this diagnostic available in identity mode without using it in
+        # the sampled action or its gradient path.
         mean_tanh = torch.tanh(raw_mean)
         log_std_tanh = torch.tanh(raw_log_std)
-        mean = self.mean_scale * mean_tanh
+        mean = self.mean_scale * mean_tanh if self.use_tanh_mean_scaling else raw_mean
         log_std = self.init_log_std + self.log_std_scale * log_std_tanh
         std = log_std.exp()
         delta_velocity = mean if deterministic else mean + std * torch.randn_like(mean)

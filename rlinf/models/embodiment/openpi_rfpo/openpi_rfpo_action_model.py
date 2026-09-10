@@ -55,6 +55,7 @@ def _default_actor_config() -> dict[str, Any]:
         "condition_decoder_mlp_ratio": 4.0,
         "timestep_frequency_embedding_size": 256,
         "dropout": 0.0,
+        "use_tanh_mean_scaling": False,
         "mean_scale": 0.15,
         "min_log_std": -8.0,
         "max_log_std": -2.0,
@@ -119,6 +120,8 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 f"Unsupported RFPO actor options: {sorted(unknown_actor_keys)}."
             )
         actor_config = actor_defaults | actor_config
+        if not isinstance(actor_config["use_tanh_mean_scaling"], bool):
+            raise ValueError("RFPO actor use_tanh_mean_scaling must be boolean.")
         for option in ("mean_scale", "min_log_std", "max_log_std"):
             value = actor_config[option]
             if (

@@ -26,7 +26,9 @@ rfpo:
     timestep_frequency_embedding_size: 256
     dropout: 0.0
 
-    # Bounded Gaussian parameters in the normalized pi0 velocity space.
+    # Use the raw DiT mean; set true to restore tanh(raw_mean) * mean_scale.
+    use_tanh_mean_scaling: false
+    # Used only when use_tanh_mean_scaling is true.
     mean_scale: 0.1
     # init_log_std is the midpoint of min_log_std and max_log_std.
     min_log_std: -8.0
