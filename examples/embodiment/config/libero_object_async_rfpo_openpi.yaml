@@ -47,6 +47,8 @@ algorithm:
 
   backup_entropy: False
   critic_actor_ratio: 4
+  # sample two Q-networks with replacement before taking min.
+  critic_subsample_size: 2
 
   # Penalize the raw DiT mean before its optional output transform.
   raw_mean_l2_coefficients:

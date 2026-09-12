@@ -111,6 +111,41 @@ def compute_rfpo_alpha_loss(
     return -alpha.float() * entropy_error
 
 
+def subsample_min_q_values(
+    q_values: torch.Tensor,
+    *,
+    sample_size: int,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample Q-networks with replacement and return their minimum.
+
+    Sampling follows the RLPD implementation: one set of indices is sampled
+    per forward call and shared by every item in the batch.
+    """
+    if q_values.ndim < 1 or q_values.shape[-1] < 2:
+        raise ValueError("RFPO Q values must contain at least two networks.")
+    if (
+        isinstance(sample_size, bool)
+        or not isinstance(sample_size, int)
+        or sample_size <= 0
+        or sample_size > q_values.shape[-1]
+    ):
+        raise ValueError(
+            "RFPO critic_subsample_size must be a positive integer no larger "
+            "than num_q_networks."
+        )
+
+    sample_indices = torch.randint(
+        0,
+        q_values.shape[-1],
+        (sample_size,),
+        generator=generator,
+        device=q_values.device,
+    )
+    sampled_q_values = q_values.index_select(dim=-1, index=sample_indices)
+    return sampled_q_values.min(dim=-1, keepdim=True).values, sample_indices
+
+
 def get_rfpo_default_target_entropy(model_config) -> float:
     """Return target entropy in the sampler's internal log-prob units."""
     entropy_dim = int(model_config.rfpo_action_chunk) * int(
@@ -156,6 +191,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         self.setup_model_and_optimizer()
         self.setup_sac_components()
+        self._validate_critic_sampling_config()
         self.soft_update_target_critic(tau=1.0)
 
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
@@ -256,6 +292,31 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     def _unwrapped_model(self):
         return getattr(self.model, "module", self.model)
+
+    def _validate_critic_sampling_config(self) -> None:
+        """Validate RFPO's fixed two-network RLPD sampling setup."""
+        self.critic_subsample_size = int(
+            self.cfg.algorithm.get("critic_subsample_size", 2)
+        )
+        num_q_networks = int(
+            self._unwrapped_model().config.critic["num_q_networks"]
+        )
+        if self.critic_subsample_size != 2:
+            raise ValueError("RFPO critic_subsample_size must be 2.")
+        if self.critic_subsample_size > num_q_networks:
+            raise ValueError(
+                "RFPO critic_subsample_size cannot exceed num_q_networks: "
+                f"{self.critic_subsample_size} > {num_q_networks}."
+            )
+
+    def _subsample_min_q_values(
+        self, q_values: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return subsample_min_q_values(
+            q_values,
+            sample_size=self.critic_subsample_size,
+            generator=self.critic_sample_generator,
+        )
 
     def _pi0_grad_norm(self) -> float:
         squared_norm = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -374,15 +435,14 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 tokenized_prompt=tokenized_prompt,
                 tokenized_prompt_mask=tokenized_prompt_mask,
             )
-            target_q_values = (
-                self.target_critic(
-                    next_output["actions"],
-                    state_embedding=next_output["critic_state_embedding"],
-                    condition_tokens=next_output["critic_condition_tokens"],
-                    condition_mask=next_output["critic_condition_mask"],
-                )
-                .min(dim=-1, keepdim=True)
-                .values
+            all_target_q_values = self.target_critic(
+                next_output["actions"],
+                state_embedding=next_output["critic_state_embedding"],
+                condition_tokens=next_output["critic_condition_tokens"],
+                condition_mask=next_output["critic_condition_mask"],
+            )
+            target_q_values, target_sample_indices = self._subsample_min_q_values(
+                all_target_q_values
             )
             if self.cfg.algorithm.get("backup_entropy", True):
                 next_log_prob = next_output["internal_log_prob"].float().unsqueeze(-1)
@@ -405,12 +465,23 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         metrics = {
             "q_data": current_q_values.min(dim=-1).values.mean().item(),
+            "q_data_mean": current_q_values.mean().item(),
             "q_target": target.mean().item(),
-            "q_disagreement": (current_q_values[:, 0] - current_q_values[:, 1])
-            .abs()
+            "q_disagreement": (
+                current_q_values.max(dim=-1).values
+                - current_q_values.min(dim=-1).values
+            )
             .mean()
             .item(),
+            "target_sample_index_0": target_sample_indices[0].item(),
+            "target_sample_index_1": target_sample_indices[1].item(),
         }
+        metrics.update(
+            {
+                f"q_value_{q_index}": q_values.mean().item()
+                for q_index, q_values in enumerate(current_q_values.unbind(dim=-1))
+            }
+        )
         return critic_loss, metrics
 
     def forward_actor(self, batch):
@@ -423,7 +494,9 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             evaluate_q=True,
             compute_pi0_baseline=True,
         )
-        q_min = output["q_values"].min(dim=-1, keepdim=True).values
+        q_min, actor_sample_indices = self._subsample_min_q_values(
+            output["q_values"]
+        )
         alpha = self.entropy_temp.compute_alpha().detach().float()
         (
             actor_loss,
@@ -452,6 +525,8 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         metrics.update(
             {
                 "q_pi": q_min.mean().item(),
+                "actor_sample_index_0": actor_sample_indices[0].item(),
+                "actor_sample_index_1": actor_sample_indices[1].item(),
                 "actor_loss/q": actor_q_loss.item(),
                 "actor_loss/entropy": actor_entropy_loss.item(),
             }

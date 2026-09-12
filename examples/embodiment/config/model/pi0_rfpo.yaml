@@ -35,7 +35,9 @@ rfpo:
     max_log_std: -4.0
 
   critic:
-    # Critic architecture: Gemma3.
+    num_q_networks: 10
+
+    # Per-network critic architecture.
     hidden_size: 512
     intermediate_size: 1024
     num_hidden_layers: 3

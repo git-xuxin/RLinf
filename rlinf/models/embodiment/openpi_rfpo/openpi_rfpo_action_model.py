@@ -65,6 +65,7 @@ def _default_actor_config() -> dict[str, Any]:
 def _default_critic_config() -> dict[str, Any]:
     """Return the RFPO Gemma3 critic defaults."""
     return {
+        "num_q_networks": 10,
         "hidden_size": 512,
         "intermediate_size": 1024,
         "num_hidden_layers": 6,
@@ -169,6 +170,7 @@ class OpenPiRFPOConfig(OpenPi0Config):
             )
         critic_config = critic_defaults | critic_config
         integer_options = (
+            "num_q_networks",
             "hidden_size",
             "intermediate_size",
             "num_hidden_layers",
@@ -183,6 +185,10 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 raise ValueError(
                     f"RFPO critic Gemma3 {option} must be a positive integer."
                 )
+        if critic_config["num_q_networks"] < 2:
+            raise ValueError(
+                "RFPO critic num_q_networks must be greater than or equal to 2."
+            )
         if (
             critic_config["num_attention_heads"] % critic_config["num_key_value_heads"]
             != 0
