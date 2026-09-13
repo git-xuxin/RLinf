@@ -36,6 +36,7 @@ rfpo:
 
   critic:
     # Critic architecture: Gemma3.
+    num_q_heads: 10
     hidden_size: 512
     intermediate_size: 1024
     num_hidden_layers: 3

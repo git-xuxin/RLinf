@@ -19,16 +19,16 @@ candidate keeps its observation and replay action as ``a0``. The remaining
 actions add the configured physical angle to one rotation component. Angles are
 converted from radians into the normalized action space consumed by the critic.
 
-The plot overlays ``min(Q1, Q2)`` for all action variants at every candidate.
-The CSV retains both critic heads, their minimum, and the ranking against the
-unperturbed replay action.
+The plot overlays the all-head Q mean used by RFPO's actor for every action
+variant at each candidate. The CSV retains every critic head, the ensemble mean,
+the all-head minimum, and the ranking against the unperturbed replay action.
 
 Example::
 
     # Reuse one episode selected from visualize_rfpo_q.py.
     python toolkits/replay_buffer/visualize_rfpo_q_rotation.py \
         --episode-ref /path/to/episode_0003_..._q.png
-    
+
     python toolkits/replay_buffer/visualize_rfpo_q_rotation.py \
         --episode-ref /mnt/public2/xuxin/RFPO/RLinf/rfpo_q_visualizations_log_20260807-19-56-19_step_200/episode_0015_trajectory_465_0eab0f35-2da3-576a-a6ea-279529880cbd_env_002_t_0003_0040_q.png
 
@@ -36,7 +36,7 @@ Example::
         --ckpt /path/to/logs/20260806-03:30:52-run/.../global_step_80/actor \
         --trajectory-file /path/to/trajectory_12_weights.pt \
         --candidate-stride 5 --env-index 0
-    
+
     python toolkits/replay_buffer/visualize_rfpo_q_rotation.py \
         --ckpt /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_200/actor \
         --trajectory-file /mnt/public2/xuxin/RFPO/RLinf/logs/20260807-19:56:19-libero_object_async_rfpo_openpi/libero_object_async_rfpo_openpi/checkpoints/global_step_200/actor/rfpo_components/replay_buffer/rank_1/trajectory_464_0eab0f35-2da3-576a-a6ea-279529880cbd.pt \
@@ -135,9 +135,7 @@ def resolve_episode_selection(
     if episode_ref is None and episode_index is None:
         raise ValueError("An episode_ref or episode_index is required")
 
-    reference_path = (
-        Path(episode_ref).expanduser() if episode_ref is not None else None
-    )
+    reference_path = Path(episode_ref).expanduser() if episode_ref is not None else None
     if manifest_path is None:
         if reference_path is None:
             raise ValueError("episode_index requires --episode-manifest")
@@ -159,8 +157,7 @@ def resolve_episode_selection(
         selected_index = int(episode_index)
         if selected_index < 0 or selected_index >= len(episodes):
             raise IndexError(
-                f"episode_index must lie in [0, {len(episodes)}), got "
-                f"{selected_index}"
+                f"episode_index must lie in [0, {len(episodes)}), got {selected_index}"
             )
     else:
         assert episode_ref is not None
@@ -222,9 +219,7 @@ def resolve_episode_selection(
         start=start,
         stop=stop,
         checkpoint=(
-            str(raw_manifest["checkpoint"])
-            if raw_manifest.get("checkpoint")
-            else None
+            str(raw_manifest["checkpoint"]) if raw_manifest.get("checkpoint") else None
         ),
         training_config=(
             str(raw_manifest["training_config"])
@@ -249,9 +244,7 @@ def candidate_time_indices(
         raise ValueError(f"candidate_start must lie in [0, {time_size})")
     stop = time_size if candidate_stop is None else int(candidate_stop)
     if stop <= candidate_start or stop > time_size:
-        raise ValueError(
-            f"candidate_stop must lie in ({candidate_start}, {time_size}]"
-        )
+        raise ValueError(f"candidate_stop must lie in ({candidate_start}, {time_size}]")
     return list(range(candidate_start, stop, candidate_stride))
 
 
@@ -346,8 +339,7 @@ def infer_normalized_units_per_radian(
         ) from exc
 
     physical_delta = (
-        unit_output[..., rotation_action_dim]
-        - zero_output[..., rotation_action_dim]
+        unit_output[..., rotation_action_dim] - zero_output[..., rotation_action_dim]
     ).float()
     finite_delta = physical_delta[torch.isfinite(physical_delta)]
     if finite_delta.numel() == 0:
@@ -439,12 +431,13 @@ def evaluate_candidate_variants(
         all_q_values.append(q_values.float().cpu())
 
     result = torch.cat(all_q_values, dim=0).numpy()
-    expected_shape = (candidate_count * variant_count, 2)
+    num_q_heads = int(model.config.critic["num_q_heads"])
+    expected_shape = (candidate_count * variant_count, num_q_heads)
     if result.shape != expected_shape:
         raise ValueError(
             f"RFPO critic returned {result.shape}, expected {expected_shape}"
         )
-    return result.reshape(candidate_count, variant_count, 2)
+    return result.reshape(candidate_count, variant_count, num_q_heads)
 
 
 def summarize_candidates(
@@ -454,34 +447,39 @@ def summarize_candidates(
     comparison_tolerance: float,
 ) -> dict[str, Any]:
     """Rank the unchanged replay action against all angle variants."""
-    expected_shape = (len(candidate_indices), len(metadata), 2)
-    if q_values.shape != expected_shape:
-        raise ValueError(f"q_values must have shape {expected_shape}")
+    expected_leading_shape = (len(candidate_indices), len(metadata))
+    if (
+        q_values.ndim != 3
+        or q_values.shape[:2] != expected_leading_shape
+        or q_values.shape[-1] == 0
+    ):
+        raise ValueError(
+            "q_values must have shape "
+            f"{(*expected_leading_shape, 'num_q_heads>0')}, got {q_values.shape}"
+        )
     if not np.isfinite(q_values).all():
         raise ValueError("q_values must be finite")
     if comparison_tolerance < 0 or not math.isfinite(comparison_tolerance):
         raise ValueError("comparison_tolerance must be finite and non-negative")
 
-    q_min = q_values.min(axis=-1)
+    q_mean = q_values.mean(axis=-1)
     candidates = []
     for candidate_number, source_time_index in enumerate(candidate_indices):
-        candidate_q = q_min[candidate_number]
+        candidate_q = q_mean[candidate_number]
         baseline_q = float(candidate_q[0])
         best_index = int(np.argmax(candidate_q))
-        baseline_rank = 1 + int(
-            np.sum(candidate_q > baseline_q + comparison_tolerance)
-        )
+        baseline_rank = 1 + int(np.sum(candidate_q > baseline_q + comparison_tolerance))
         candidates.append(
             {
                 "candidate_index": candidate_number,
                 "source_time_index": int(source_time_index),
-                "baseline_q_min": baseline_q,
+                "baseline_q_mean": baseline_q,
                 "baseline_rank": baseline_rank,
                 "baseline_is_best": baseline_rank == 1,
                 "best_variant": metadata[best_index].name,
                 "best_angle_degrees": metadata[best_index].angle_degrees,
-                "best_q_min": float(candidate_q[best_index]),
-                "q_min_by_variant": {
+                "best_q_mean": float(candidate_q[best_index]),
+                "q_mean_by_variant": {
                     item.name: float(candidate_q[item.index]) for item in metadata
                 },
             }
@@ -510,7 +508,9 @@ def _write_csv(
     q_values: np.ndarray,
     summary: Mapping[str, Any],
 ) -> None:
+    q_mean = q_values.mean(axis=-1)
     q_min = q_values.min(axis=-1)
+    q_columns = [f"q{index + 1}" for index in range(q_values.shape[-1])]
     candidate_summaries = summary["candidates"]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -521,20 +521,21 @@ def _write_csv(
                 "action_variant",
                 "rotation_angle_degrees",
                 "normalized_action_offset",
-                "q1",
-                "q2",
+                *q_columns,
+                "q_mean",
                 "q_min",
-                "q_min_minus_a0",
+                "q_mean_minus_a0",
                 "is_best_for_candidate",
                 "a0_rank",
             ]
         )
         for candidate_number, source_time_index in enumerate(candidate_indices):
-            baseline_q = float(q_min[candidate_number, 0])
-            best_q = float(q_min[candidate_number].max())
+            baseline_q = float(q_mean[candidate_number, 0])
+            best_q = float(q_mean[candidate_number].max())
             tolerance = float(summary["comparison_tolerance"])
             for item in metadata:
-                q_pair = q_values[candidate_number, item.index]
+                q_row = q_values[candidate_number, item.index]
+                current_mean = float(q_mean[candidate_number, item.index])
                 current_min = float(q_min[candidate_number, item.index])
                 writer.writerow(
                     [
@@ -543,11 +544,11 @@ def _write_csv(
                         item.name,
                         item.angle_degrees,
                         item.normalized_offset,
-                        float(q_pair[0]),
-                        float(q_pair[1]),
+                        *(float(value) for value in q_row),
+                        current_mean,
                         current_min,
-                        current_min - baseline_q,
-                        current_min >= best_q - tolerance,
+                        current_mean - baseline_q,
+                        current_mean >= best_q - tolerance,
                         candidate_summaries[candidate_number]["baseline_rank"],
                     ]
                 )
@@ -568,7 +569,7 @@ def _render_plot(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    q_min = q_values.min(axis=-1)
+    q_mean = q_values.mean(axis=-1)
     source_steps = np.asarray(candidate_indices)
     figure_width = max(10.0, min(18.0, 8.0 + len(candidate_indices) * 0.08))
     fig, axis = plt.subplots(figsize=(figure_width, 5.6), constrained_layout=True)
@@ -576,7 +577,7 @@ def _render_plot(
         is_baseline = item.index == 0
         axis.plot(
             source_steps,
-            q_min[:, item.index],
+            q_mean[:, item.index],
             marker="o" if is_baseline else ".",
             markersize=4.5 if is_baseline else 3.0,
             linewidth=2.2 if is_baseline else 1.2,
@@ -586,7 +587,7 @@ def _render_plot(
 
     axis.set(
         xlabel="Trajectory source step (candidate sampled every N steps)",
-        ylabel="min(Q1, Q2)",
+        ylabel="Q ensemble mean",
         title=(
             f"{source_name} | env={env_index} | "
             f"a0 best: {summary['baseline_best_count']}/"
@@ -599,9 +600,7 @@ def _render_plot(
     else:
         axis.set_xlim(source_steps[0], source_steps[-1])
     axis.set_ylim(_Q_Y_MIN, _Q_Y_MAX)
-    axis.set_yticks(
-        np.arange(_Q_Y_MIN, _Q_Y_MAX + _Q_Y_TICK_STEP / 2, _Q_Y_TICK_STEP)
-    )
+    axis.set_yticks(np.arange(_Q_Y_MIN, _Q_Y_MAX + _Q_Y_TICK_STEP / 2, _Q_Y_TICK_STEP))
     axis.grid(True, alpha=0.25)
     axis.legend(ncol=3, loc="best")
     fig.savefig(path, dpi=180)
@@ -742,10 +741,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         or args.normalized_units_per_radian <= 0
     ):
         parser.error("--normalized-units-per-radian must be finite and positive")
-    if (
-        not math.isfinite(args.comparison_tolerance)
-        or args.comparison_tolerance < 0
-    ):
+    if not math.isfinite(args.comparison_tolerance) or args.comparison_tolerance < 0:
         parser.error("--comparison-tolerance must be finite and non-negative")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
@@ -810,9 +806,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     env_index = (
         args.env_index
         if args.env_index is not None
-        else (
-            episode_selection.env_index if episode_selection is not None else 0
-        )
+        else (episode_selection.env_index if episode_selection is not None else 0)
     )
     if (
         episode_selection is not None
@@ -946,6 +940,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "rotation_action_dim": args.rotation_action_dim,
         "action_step": args.action_step,
         "normalized_units_per_radian": scale,
+        "num_q_heads": int(q_values.shape[-1]),
         "action_variants": [
             {
                 "name": item.name,
@@ -970,7 +965,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     print(f"Candidates: {summary['candidate_count']}")
     print(
-        "Unperturbed a0 has the highest min-Q for "
+        "Unperturbed a0 has the highest mean-Q for "
         f"{summary['baseline_best_count']}/{summary['candidate_count']} candidates "
         f"({summary['baseline_best_fraction']:.1%}); "
         f"mean rank={summary['baseline_mean_rank']:.3f}"

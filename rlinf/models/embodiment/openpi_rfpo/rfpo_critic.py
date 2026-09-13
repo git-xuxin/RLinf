@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Gemma3 decoder-only double-Q critic for RFPO."""
+"""Gemma3 decoder-only Q-network ensemble for RFPO."""
 
 from __future__ import annotations
 
@@ -260,13 +260,21 @@ class RFPOQNetwork(nn.Module):
         return self.q_head(hidden[:, -1]).float()
 
 
-class RFPODoubleQCritic(nn.Module):
-    """Two fully independent Q networks."""
+class RFPOEnsembleQCritic(nn.Module):
+    """A configurable ensemble of fully independent Q networks."""
 
-    def __init__(self, **network_kwargs) -> None:
+    def __init__(self, *, num_q_heads: int, **network_kwargs) -> None:
         super().__init__()
-        self.q1 = RFPOQNetwork(**network_kwargs)
-        self.q2 = RFPOQNetwork(**network_kwargs)
+        if (
+            isinstance(num_q_heads, bool)
+            or not isinstance(num_q_heads, int)
+            or num_q_heads <= 0
+        ):
+            raise ValueError("RFPO critic num_q_heads must be a positive integer.")
+        self.num_q_heads = num_q_heads
+        self.q_networks = nn.ModuleList(
+            RFPOQNetwork(**network_kwargs) for _ in range(num_q_heads)
+        )
 
     def forward(
         self,
@@ -277,23 +285,21 @@ class RFPODoubleQCritic(nn.Module):
         condition_mask: torch.Tensor | None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        q1 = self.q1(
-            actions,
-            state_embedding=state_embedding,
-            condition_tokens=condition_tokens,
-            condition_mask=condition_mask,
-            action_mask=action_mask,
+        return torch.cat(
+            [
+                q_network(
+                    actions,
+                    state_embedding=state_embedding,
+                    condition_tokens=condition_tokens,
+                    condition_mask=condition_mask,
+                    action_mask=action_mask,
+                )
+                for q_network in self.q_networks
+            ],
+            dim=-1,
         )
-        q2 = self.q2(
-            actions,
-            state_embedding=state_embedding,
-            condition_tokens=condition_tokens,
-            condition_mask=condition_mask,
-            action_mask=action_mask,
-        )
-        return torch.cat([q1, q2], dim=-1)
 
-    def target_copy(self) -> "RFPODoubleQCritic":
+    def target_copy(self) -> "RFPOEnsembleQCritic":
         target = copy.deepcopy(self)
         target.requires_grad_(False)
         return target

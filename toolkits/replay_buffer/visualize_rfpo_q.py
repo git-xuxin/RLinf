@@ -21,8 +21,8 @@ from observation zero through its first ``done`` is also kept when it is longer
 than the configured minimum. Suffixes are discarded and files are never joined.
 
 The plotted value is the replay-action value ``Q(s_t, a_t)``. The video and
-static plot show both critic heads and ``min(Q1, Q2)``, which is the value used
-by RFPO's actor objective.
+static plot show every critic head together with the ensemble mean used by
+RFPO's actor objective and the all-head minimum as a conservative diagnostic.
 
 Example: ``python toolkits/replay_buffer/visualize_rfpo_q.py --ckpt CKPT
 --trajectory-dir TRAJ_DIR --num-episodes 10``
@@ -49,7 +49,6 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf
-
 
 _WEIGHT_CANDIDATES = (
     Path("actor/model_state_dict/full_weights.pt"),
@@ -140,13 +139,10 @@ def default_output_dir(ckpt: str | Path) -> Path:
         )
 
     timestamp = "-".join(
-        timestamp_match.group(name)
-        for name in ("date", "hour", "minute", "second")
+        timestamp_match.group(name) for name in ("date", "hour", "minute", "second")
     )
     training_step = step_matches[-1].group("step")
-    directory_name = (
-        f"rfpo_q_visualizations_log_{timestamp}_step_{training_step}"
-    )
+    directory_name = f"rfpo_q_visualizations_log_{timestamp}_step_{training_step}"
     repository_root = Path(__file__).resolve().parents[2]
     return repository_root / directory_name
 
@@ -195,9 +191,7 @@ def _unwrap_state_dict(raw: Any) -> dict[str, torch.Tensor]:
         ):
             state = state[key]
             break
-    if not isinstance(state, Mapping) or not all(
-        isinstance(key, str) for key in state
-    ):
+    if not isinstance(state, Mapping) or not all(isinstance(key, str) for key in state):
         raise TypeError("Checkpoint does not contain a string-keyed model state dict.")
 
     normalized = {}
@@ -234,9 +228,7 @@ def build_rfpo_model(
 
     incompatible = model.load_state_dict(state_dict, strict=False)
     missing_critic = [
-        key
-        for key in incompatible.missing_keys
-        if key.startswith("online_critic.")
+        key for key in incompatible.missing_keys if key.startswith("online_critic.")
     ]
     if missing_critic:
         raise RuntimeError(
@@ -480,7 +472,7 @@ def evaluate_episode_q(
     device: torch.device,
     batch_size: int,
 ) -> np.ndarray:
-    """Evaluate both online critic heads on replay observations and actions."""
+    """Evaluate all online critic heads on replay observations and actions."""
     from rlinf.models.embodiment.base_policy import ForwardType
 
     curr_obs = payload["curr_obs"]
@@ -524,7 +516,9 @@ def evaluate_episode_q(
 
 
 def _image_to_uint8(image: torch.Tensor | np.ndarray, camera_index: int) -> np.ndarray:
-    array = image.detach().cpu().numpy() if torch.is_tensor(image) else np.asarray(image)
+    array = (
+        image.detach().cpu().numpy() if torch.is_tensor(image) else np.asarray(image)
+    )
     while array.ndim > 3:
         index = min(camera_index, array.shape[0] - 1)
         array = array[index]
@@ -542,9 +536,11 @@ def _image_to_uint8(image: torch.Tensor | np.ndarray, camera_index: int) -> np.n
         finite = array[np.isfinite(array)]
         if finite.size and finite.min() >= 0.0 and finite.max() <= 1.0:
             array = array * 255.0
-    return np.nan_to_num(array, nan=0.0, posinf=255.0, neginf=0.0).clip(
-        0, 255
-    ).astype(np.uint8)
+    return (
+        np.nan_to_num(array, nan=0.0, posinf=255.0, neginf=0.0)
+        .clip(0, 255)
+        .astype(np.uint8)
+    )
 
 
 def _episode_scalar_series(
@@ -582,14 +578,17 @@ def _write_episode_csv(
     truncations: np.ndarray,
     dones: np.ndarray,
 ) -> None:
+    q_mean = q_values.mean(axis=-1)
+    q_min = q_values.min(axis=-1)
+    q_columns = [f"q{index + 1}" for index in range(q_values.shape[-1])]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
                 "step",
                 "source_time_index",
-                "q1",
-                "q2",
+                *q_columns,
+                "q_mean",
                 "q_min",
                 "reward",
                 "termination",
@@ -597,7 +596,7 @@ def _write_episode_csv(
                 "done",
             ]
         )
-        for step, (q_pair, reward, termination, truncation, done) in enumerate(
+        for step, (q_row, reward, termination, truncation, done) in enumerate(
             zip(
                 q_values,
                 rewards,
@@ -611,9 +610,9 @@ def _write_episode_csv(
                 [
                     step,
                     spec.start + step,
-                    float(q_pair[0]),
-                    float(q_pair[1]),
-                    float(np.min(q_pair)),
+                    *(float(value) for value in q_row),
+                    float(q_mean[step]),
+                    float(q_min[step]),
                     float(reward),
                     bool(termination),
                     bool(truncation),
@@ -626,9 +625,7 @@ def _configure_q_axis(axis: Any, episode_length: int) -> None:
     """Apply the shared fixed Q-axis range and tick resolution."""
     axis.set_xlim(0, max(episode_length - 1, 1))
     axis.set_ylim(_Q_Y_MIN, _Q_Y_MAX)
-    axis.set_yticks(
-        np.arange(_Q_Y_MIN, _Q_Y_MAX + _Q_Y_TICK_STEP / 2, _Q_Y_TICK_STEP)
-    )
+    axis.set_yticks(np.arange(_Q_Y_MIN, _Q_Y_MAX + _Q_Y_TICK_STEP / 2, _Q_Y_TICK_STEP))
 
 
 def render_episode(
@@ -648,6 +645,7 @@ def render_episode(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    q_mean = q_values.mean(axis=1)
     q_min = q_values.min(axis=1)
     steps = np.arange(spec.length)
     curve_path = output_stem.with_name(f"{output_stem.name}_q.png")
@@ -655,9 +653,25 @@ def render_episode(
     video_path = output_stem.with_suffix(".mp4")
 
     fig, axis = plt.subplots(figsize=(9.0, 4.8), constrained_layout=True)
-    axis.plot(steps, q_values[:, 0], color="#2563eb", label="Q1", linewidth=1.6)
-    axis.plot(steps, q_values[:, 1], color="#ea580c", label="Q2", linewidth=1.6)
-    axis.plot(steps, q_min, color="#15803d", label="min(Q1, Q2)", linewidth=2.2)
+    colors = plt.colormaps["tab10"]
+    for q_index in range(q_values.shape[1]):
+        axis.plot(
+            steps,
+            q_values[:, q_index],
+            color=colors(q_index % colors.N),
+            label=f"Q{q_index + 1}",
+            linewidth=1.0,
+            alpha=0.65,
+        )
+    axis.plot(steps, q_mean, color="#111827", label="Q mean", linewidth=2.4)
+    axis.plot(
+        steps,
+        q_min,
+        color="#15803d",
+        label="Q min (all heads)",
+        linewidth=1.8,
+        linestyle="--",
+    )
     axis.set(xlabel="Episode observation", ylabel="Q(s, replay action)")
     _configure_q_axis(axis, spec.length)
     axis.grid(True, alpha=0.25)
@@ -680,11 +694,26 @@ def render_episode(
     )
     image_artist = image_axis.imshow(frames[0])
     image_axis.axis("off")
-    q_axis.plot(steps, q_values[:, 0], color="#2563eb", label="Q1", linewidth=1.5)
-    q_axis.plot(steps, q_values[:, 1], color="#ea580c", label="Q2", linewidth=1.5)
-    q_axis.plot(steps, q_min, color="#15803d", label="min(Q1, Q2)", linewidth=2.1)
+    for q_index in range(q_values.shape[1]):
+        q_axis.plot(
+            steps,
+            q_values[:, q_index],
+            color=colors(q_index % colors.N),
+            label=f"Q{q_index + 1}",
+            linewidth=0.9,
+            alpha=0.6,
+        )
+    q_axis.plot(steps, q_mean, color="#111827", label="Q mean", linewidth=2.3)
+    q_axis.plot(
+        steps,
+        q_min,
+        color="#15803d",
+        label="Q min (all heads)",
+        linewidth=1.7,
+        linestyle="--",
+    )
     cursor = q_axis.axvline(0, color="#b91c1c", linewidth=1.5)
-    point = q_axis.scatter([0], [q_min[0]], color="#b91c1c", s=36, zorder=5)
+    point = q_axis.scatter([0], [q_mean[0]], color="#b91c1c", s=36, zorder=5)
     q_axis.set(xlabel="Episode observation", ylabel="Q(s, replay action)")
     _configure_q_axis(q_axis, spec.length)
     q_axis.grid(True, alpha=0.25)
@@ -702,10 +731,10 @@ def render_episode(
             image_artist.set_data(frame)
             image_axis.set_title(
                 f"Observation {step + 1}/{spec.length}  |  "
-                f"min Q {q_min[step]:.4f}  |  reward {rewards[step]:.3f}"
+                f"mean Q {q_mean[step]:.4f}  |  reward {rewards[step]:.3f}"
             )
             cursor.set_xdata([step, step])
-            point.set_offsets(np.asarray([[step, q_min[step]]]))
+            point.set_offsets(np.asarray([[step, q_mean[step]]]))
             fig.canvas.draw()
             rendered = np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
             writer.append_data(rendered)
@@ -872,9 +901,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         q_values = evaluate_episode_q(
             model, cached_payload, spec, device, args.batch_size
         )
-        if q_values.shape != (spec.length, 2):
+        num_q_heads = int(model.config.critic["num_q_heads"])
+        if q_values.shape != (spec.length, num_q_heads):
             raise ValueError(
-                f"RFPO critic returned {q_values.shape}, expected {(spec.length, 2)}"
+                "RFPO critic returned "
+                f"{q_values.shape}, expected {(spec.length, num_q_heads)}"
             )
         rewards = _episode_scalar_series(cached_payload, spec, "rewards")
         terminations = _episode_scalar_series(
@@ -924,8 +955,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "terminated": terminated,
             "truncated": truncated,
             "outcome": outcome,
-            "q1_mean": float(q_values[:, 0].mean()),
-            "q2_mean": float(q_values[:, 1].mean()),
+            "q_head_means": {
+                f"q{q_index + 1}": float(q_values[:, q_index].mean())
+                for q_index in range(q_values.shape[1])
+            },
+            "q_mean_mean": float(q_values.mean(axis=1).mean()),
             "q_min_mean": float(q_values.min(axis=1).mean()),
             "video": video_path.name,
             "curve": curve_path.name,
@@ -948,7 +982,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "min_prefix_steps": args.min_prefix_steps,
         "produced_episodes": len(manifest_entries),
         "scan": scan_stats,
-        "q_definition": "online min(Q1,Q2) on stored normalized replay action",
+        "q_definition": (
+            "online ensemble mean on stored normalized replay action; "
+            "all-head minimum retained as a conservative diagnostic"
+        ),
         "episodes": manifest_entries,
     }
     manifest_path = output_dir / "manifest.json"

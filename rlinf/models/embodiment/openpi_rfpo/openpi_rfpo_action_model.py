@@ -32,7 +32,7 @@ from rlinf.models.embodiment.openpi.openpi_action_model import (
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
 from .rfpo_actor import RFPOResidualActor
-from .rfpo_critic import RFPODoubleQCritic
+from .rfpo_critic import RFPOEnsembleQCritic
 from .rfpo_sampler import RFPOGuidedSampler
 
 
@@ -65,6 +65,7 @@ def _default_actor_config() -> dict[str, Any]:
 def _default_critic_config() -> dict[str, Any]:
     """Return the RFPO Gemma3 critic defaults."""
     return {
+        "num_q_heads": 10,
         "hidden_size": 512,
         "intermediate_size": 1024,
         "num_hidden_layers": 6,
@@ -168,6 +169,13 @@ class OpenPiRFPOConfig(OpenPi0Config):
                 f"Unsupported RFPO critic options: {sorted(unknown_critic_keys)}."
             )
         critic_config = critic_defaults | critic_config
+        num_q_heads = critic_config["num_q_heads"]
+        if (
+            isinstance(num_q_heads, bool)
+            or not isinstance(num_q_heads, int)
+            or num_q_heads <= 0
+        ):
+            raise ValueError("RFPO critic num_q_heads must be a positive integer.")
         integer_options = (
             "hidden_size",
             "intermediate_size",
@@ -326,7 +334,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             prefix_dim=config.context_dim,
             **config.actor,
         )
-        self.online_critic = RFPODoubleQCritic(
+        self.online_critic = RFPOEnsembleQCritic(
             action_dim=config.rfpo_action_dim,
             state_dim=state_embedding_dim,
             context_dim=config.context_dim,
@@ -349,7 +357,7 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         return [
             *super()._no_split_modules,
             "RFPOResidualActor",
-            "RFPODoubleQCritic",
+            "RFPOEnsembleQCritic",
         ]
 
     def train(self, mode: bool = True):

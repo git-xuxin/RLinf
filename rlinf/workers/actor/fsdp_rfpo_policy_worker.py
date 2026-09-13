@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 import os
 from collections.abc import Mapping
-from numbers import Real
+from numbers import Integral, Real
 
 import numpy as np
 import torch
@@ -69,8 +69,63 @@ def parse_raw_mean_l2_coefficients(
     return tuple(coefficients)
 
 
+def validate_rfpo_critic_subsample_size(
+    critic_subsample_size: int, num_q_heads: int
+) -> int:
+    """Validate the number of distinct target Q networks sampled per update."""
+    if (
+        isinstance(critic_subsample_size, bool)
+        or not isinstance(critic_subsample_size, Integral)
+        or not 1 <= critic_subsample_size <= num_q_heads
+    ):
+        raise ValueError(
+            "RFPO critic_subsample_size must be an integer in "
+            f"[1, num_q_heads={num_q_heads}]."
+        )
+    return int(critic_subsample_size)
+
+
+def sample_rfpo_target_q_values(
+    q_values: torch.Tensor,
+    critic_subsample_size: int,
+    *,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample distinct target Q networks and return their minimum value."""
+    if q_values.ndim == 0 or q_values.shape[-1] == 0:
+        raise ValueError("RFPO target q_values must have a non-empty Q dimension.")
+    num_q_heads = q_values.shape[-1]
+    critic_subsample_size = validate_rfpo_critic_subsample_size(
+        critic_subsample_size, num_q_heads
+    )
+    sample_indices = torch.randperm(
+        num_q_heads,
+        generator=generator,
+        device=q_values.device,
+    )[:critic_subsample_size]
+    sampled_q_values = q_values.index_select(dim=-1, index=sample_indices)
+    return sampled_q_values.min(dim=-1, keepdim=True).values, sample_indices
+
+
+def mean_rfpo_actor_q_values(q_values: torch.Tensor) -> torch.Tensor:
+    """Aggregate all online Q networks for the RFPO actor objective."""
+    if q_values.ndim == 0 or q_values.shape[-1] == 0:
+        raise ValueError("RFPO actor q_values must have a non-empty Q dimension.")
+    return q_values.mean(dim=-1, keepdim=True)
+
+
+def compute_rfpo_critic_loss(
+    current_q_values: torch.Tensor, target_q_values: torch.Tensor
+) -> torch.Tensor:
+    """Fit every online Q network to the shared RFPO bootstrap target."""
+    return F.mse_loss(
+        current_q_values.float(),
+        target_q_values.expand_as(current_q_values).float(),
+    )
+
+
 def compute_rfpo_actor_loss(
-    q_min: torch.Tensor,
+    q_mean: torch.Tensor,
     internal_log_prob: torch.Tensor,
     alpha: torch.Tensor,
     raw_mean_group_mse_per_step: torch.Tensor,
@@ -78,12 +133,12 @@ def compute_rfpo_actor_loss(
     raw_mean_l2_coefficients: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute RFPO actor loss and its non-redundant logged components."""
-    actor_q_loss = -q_min.float().mean()
+    actor_q_loss = -q_mean.float().mean()
     actor_entropy_loss = (
         alpha.float() * internal_log_prob.float().unsqueeze(-1)
     ).mean()
     base_actor_loss = (
-        -q_min.float() + alpha.float() * internal_log_prob.float().unsqueeze(-1)
+        -q_mean.float() + alpha.float() * internal_log_prob.float().unsqueeze(-1)
     ).mean()
     raw_mean_l2_loss, raw_mean_group_mse, weighted_raw_mean_l2 = (
         compute_rfpo_raw_mean_l2(
@@ -156,6 +211,10 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         self.setup_model_and_optimizer()
         self.setup_sac_components()
+        num_q_heads = self.target_critic.num_q_heads
+        self.critic_subsample_size = validate_rfpo_critic_subsample_size(
+            self.cfg.algorithm.get("critic_subsample_size", 2), num_q_heads
+        )
         self.soft_update_target_critic(tau=1.0)
 
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
@@ -374,15 +433,16 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 tokenized_prompt=tokenized_prompt,
                 tokenized_prompt_mask=tokenized_prompt_mask,
             )
-            target_q_values = (
-                self.target_critic(
-                    next_output["actions"],
-                    state_embedding=next_output["critic_state_embedding"],
-                    condition_tokens=next_output["critic_condition_tokens"],
-                    condition_mask=next_output["critic_condition_mask"],
-                )
-                .min(dim=-1, keepdim=True)
-                .values
+            all_target_q_values = self.target_critic(
+                next_output["actions"],
+                state_embedding=next_output["critic_state_embedding"],
+                condition_tokens=next_output["critic_condition_tokens"],
+                condition_mask=next_output["critic_condition_mask"],
+            )
+            target_q_values, _ = sample_rfpo_target_q_values(
+                all_target_q_values,
+                self.critic_subsample_size,
+                generator=self.critic_sample_generator,
             )
             if self.cfg.algorithm.get("backup_entropy", True):
                 next_log_prob = next_output["internal_log_prob"].float().unsqueeze(-1)
@@ -400,14 +460,13 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             tokenized_prompt=tokenized_prompt,
             tokenized_prompt_mask=tokenized_prompt_mask,
         )
-        critic_loss = F.mse_loss(
-            current_q_values.float(), target.expand_as(current_q_values).float()
-        )
+        critic_loss = compute_rfpo_critic_loss(current_q_values, target)
         metrics = {
-            "q_data": current_q_values.min(dim=-1).values.mean().item(),
+            "q_data": current_q_values.mean().item(),
             "q_target": target.mean().item(),
-            "q_disagreement": (current_q_values[:, 0] - current_q_values[:, 1])
-            .abs()
+            "q_disagreement": (
+                current_q_values.amax(dim=-1) - current_q_values.amin(dim=-1)
+            )
             .mean()
             .item(),
         }
@@ -423,7 +482,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             evaluate_q=True,
             compute_pi0_baseline=True,
         )
-        q_min = output["q_values"].min(dim=-1, keepdim=True).values
+        q_mean = mean_rfpo_actor_q_values(output["q_values"])
         alpha = self.entropy_temp.compute_alpha().detach().float()
         (
             actor_loss,
@@ -432,7 +491,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             raw_mean_group_mse,
             weighted_raw_mean_l2,
         ) = compute_rfpo_actor_loss(
-            q_min,
+            q_mean,
             output["internal_log_prob"],
             alpha,
             output["raw_mean_group_mse_per_step"],
@@ -451,9 +510,15 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         }
         metrics.update(
             {
-                "q_pi": q_min.mean().item(),
+                "q_pi": q_mean.mean().item(),
                 "actor_loss/q": actor_q_loss.item(),
                 "actor_loss/entropy": actor_entropy_loss.item(),
+            }
+        )
+        metrics.update(
+            {
+                f"q_value_{q_index}": q_values.mean().item()
+                for q_index, q_values in enumerate(output["q_values"].unbind(dim=-1))
             }
         )
         for group_name, group_mse, weighted_loss in zip(
