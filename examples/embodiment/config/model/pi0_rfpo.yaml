@@ -10,39 +10,39 @@ rfpo:
   rfpo_action_dim: ${..action_dim}
 
   num_denoise_steps: ${..num_steps}
-  active_step_indices: [0, 1, 2, 3]
+  active_step_indices: [2, 3]  # [1, 2] [0, 1, 2, 3]
   differentiate_base_velocity: True
   internal_log_prob_reduction: "mean_active"
 
   actor:
     # Actor architecture: DiT.
-    hidden_size: 512
-    depth: 4
-    num_heads: 8
+    hidden_size: 256
+    depth: 3
+    num_heads: 2
     mlp_ratio: 2.0
-    condition_decoder_num_layers: 2
-    condition_decoder_num_heads: 8
-    condition_decoder_mlp_ratio: 2.0
+    condition_decoder_num_layers: 1
+    condition_decoder_num_heads: ${.num_heads}
+    condition_decoder_mlp_ratio: ${.mlp_ratio}
     timestep_frequency_embedding_size: 256
     dropout: 0.0
 
     # Use the raw DiT mean; set true to restore tanh(raw_mean) * mean_scale.
-    use_tanh_mean_scaling: false
+    use_tanh_mean_scaling: true
     # Used only when use_tanh_mean_scaling is true.
     mean_scale: 0.1
     # init_log_std is the midpoint of min_log_std and max_log_std.
-    min_log_std: -8.0
-    max_log_std: -4.0
+    min_log_std: -7.0
+    max_log_std: -5.0
 
   critic:
     # Critic architecture: Gemma3.
     num_q_heads: 10
-    hidden_size: 512
-    intermediate_size: 1024
+    hidden_size: 384
+    intermediate_size: 768
     num_hidden_layers: 3
-    num_attention_heads: 8
-    num_key_value_heads: 4
-    head_dim: 64
+    num_attention_heads: 2
+    num_key_value_heads: 1
+    head_dim: 192
     max_position_embeddings: 1024
     attention_dropout: 0.0
     hidden_activation: "gelu_pytorch_tanh"
@@ -50,7 +50,7 @@ rfpo:
     rms_norm_eps: 1.0e-6
     rope_theta: 1000000.0
     prefix_length: 816
-    mlp_hidden_dims: [256, 128]
+    mlp_hidden_dims: [128, 64]
     q_output_init_std: 1.0e-3
 
   context_dim: 2048
