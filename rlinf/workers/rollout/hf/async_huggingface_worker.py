@@ -17,6 +17,7 @@ import asyncio
 from omegaconf.omegaconf import DictConfig
 
 from rlinf.scheduler import Channel, Worker
+from rlinf.utils.rollout_metrics import RolloutMetricAccumulator
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
@@ -24,6 +25,7 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._generate_task: asyncio.Task = None
+        self._rollout_metrics = RolloutMetricAccumulator()
         self.staleness_threshold = cfg.algorithm.get("staleness_threshold", None)
         # set the decoupled rollout worker sync weight time
         self.sync_rollout_weight_time = (
@@ -42,6 +44,9 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
         self._weight_sync_apply_total = 0
         self._weight_sync_coalesced_total = 0
         self._weight_sync_request_total = 0
+
+    def _record_rollout_metrics(self, result: dict) -> None:
+        self._rollout_metrics.add(result.get("rollout_metrics", {}))
 
     @Worker.timer("rollout/generate")
     async def generate(
@@ -85,7 +90,11 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                     f"time/rollout/{k}": v for k, v in rollout_metrics.items()
                 }
                 metric_channel.put(
-                    {"rank": self._rank, "time": rollout_metrics},
+                    {
+                        "rank": self._rank,
+                        "time": rollout_metrics,
+                        "rollout": self._rollout_metrics.pop(),
+                    },
                     async_op=True,
                 )
 

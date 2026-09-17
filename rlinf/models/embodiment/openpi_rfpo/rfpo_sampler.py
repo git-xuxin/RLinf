@@ -66,6 +66,36 @@ def reduce_rfpo_action_groups(
     return torch.stack(reduced_groups, dim=-1)
 
 
+@torch.no_grad()
+def compute_rfpo_denoise_state_rms(
+    chains: torch.Tensor, *, action_chunk: int, action_dim: int
+) -> dict[str, torch.Tensor]:
+    """Return per-sample RMS for the initial noise and every denoised state.
+
+    ``chains`` has shape ``[batch, denoise_steps + 1, horizon, model_dim]``.
+    State zero is the initial noise; the final state is the normalized action.
+    Only the executed LIBERO action region contributes to each group RMS.
+    """
+    if chains.ndim != 4 or chains.shape[1] < 2:
+        raise ValueError("RFPO denoise chains must have shape [B, N + 1, H, D].")
+    if not 0 < action_chunk <= chains.shape[2]:
+        raise ValueError("RFPO metric action chunk must fit the model horizon.")
+    if action_dim != 7 or action_dim > chains.shape[3]:
+        raise ValueError("RFPO denoise metrics require seven LIBERO action dimensions.")
+    group_rms = reduce_rfpo_action_groups(
+        chains.detach()[:, :, :action_chunk, :action_dim],
+        "rms",
+        preserve_leading_dims=2,
+    )
+    return {
+        f"rollout/rfpo/denoise_state/step_{step}/{group}_rms": group_rms[
+            :, step, group_idx
+        ]
+        for step in range(group_rms.shape[1])
+        for group_idx, group in enumerate(RFPO_ACTION_GROUP_NAMES)
+    }
+
+
 def compute_rfpo_raw_mean_l2(
     raw_mean_group_mse_per_step: torch.Tensor,
     active_step_mask: torch.Tensor,

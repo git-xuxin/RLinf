@@ -669,6 +669,9 @@ class MultiStepRolloutWorker(Worker):
         gc.collect()
         self.torch_platform.empty_cache()
 
+    def _record_rollout_metrics(self, result: dict[str, Any]) -> None:
+        """Hook for async metrics from predictions sent for environment execution."""
+
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
@@ -696,6 +699,8 @@ class MultiStepRolloutWorker(Worker):
                     result,
                     final_obs=env_output.get("final_obs", None),
                 )
+                # Exclude the trailing bootstrap prediction and value-only calls.
+                self._record_rollout_metrics(result)
                 self.send_to(
                     group_name=self.cfg.env.group_name,
                     channel=output_channel,

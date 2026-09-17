@@ -33,7 +33,7 @@ from rlinf.utils.nested_dict_process import copy_dict_tensor
 
 from .rfpo_actor import RFPOResidualActor
 from .rfpo_critic import RFPOEnsembleQCritic
-from .rfpo_sampler import RFPOGuidedSampler
+from .rfpo_sampler import RFPOGuidedSampler, compute_rfpo_denoise_state_rms
 
 
 def _input_transform_compatible(value: Any) -> Any:
@@ -682,6 +682,16 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
         outputs = self.sample_actions(
             observation, mode=mode, compute_values=compute_values
         )
+        # Capture model-space states before any environment output transforms.
+        rollout_metrics = (
+            compute_rfpo_denoise_state_rms(
+                outputs["chains"],
+                action_chunk=self.config.rfpo_action_chunk,
+                action_dim=self.config.rfpo_action_dim,
+            )
+            if mode == "train"
+            else {}
+        )
         actions = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"]
@@ -709,5 +719,6 @@ class OpenPiRFPOActionModel(OpenPi0ForRLActionPrediction):
             "prev_logprobs": prev_logprobs,
             "prev_values": prev_values,
             "forward_inputs": forward_inputs,
+            "rollout_metrics": rollout_metrics,
         }
         return actions, result
