@@ -46,13 +46,13 @@ algorithm:
 
   backup_entropy: False
   critic_subsample_size: 2
-  critic_actor_ratio: 4
+  critic_actor_ratio: 2
 
   # Penalize the raw DiT mean before its optional output transform.
   raw_mean_l2_coefficients:
-    translation: 5e-5
-    rotation: 5e-5
-    gripper: 5e-5
+    translation: 1e-2
+    rotation: 1e-2
+    gripper: 1e-2
 
   bootstrap_type: standard
   gamma: 0.99
@@ -77,7 +77,7 @@ algorithm:
 
   target_update_freq: 1
   target_update_type: all
-  train_critic_before_actor_steps: 30
+  train_critic_before_actor_steps: 40
 
   filter_rewards: False
   rewards_lower_bound: 0.1
@@ -126,21 +126,22 @@ actor:
 
   model:
     model_path: "/path/to/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT" # https://huggingface.co/RLinf/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
-    num_action_chunks: 5
+    num_action_chunks: 20
     action_dim: 7
 
     openpi:
+      action_horizon: 20
       noise_method: "flow_ode"
 
   optim:
     clip_grad: 1.0
-    lr: 2.0e-05
+    lr: 5.0e-05
     lr_scheduler: constant
-    lr_warmup_steps: 50
+    lr_warmup_steps: 100
 
   critic_optim:
     clip_grad: 1.0
-    lr: 1.0e-04
+    lr: 5.0e-05
     lr_scheduler: torch_constant
 
   fsdp_config:

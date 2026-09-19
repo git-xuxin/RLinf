@@ -10,7 +10,7 @@ rfpo:
   rfpo_action_dim: ${..action_dim}
 
   num_denoise_steps: ${..num_steps}
-  active_step_indices: [2, 3]  # [1, 2] [0, 1, 2, 3]
+  active_step_indices: [0, 1, 2]  # [3]  # [0, 1, 2]  # [1, 2] [0, 1, 2, 3]
   differentiate_base_velocity: True
   internal_log_prob_reduction: "mean_active"
 
@@ -27,7 +27,7 @@ rfpo:
     dropout: 0.0
 
     # Use the raw DiT mean; set true to restore tanh(raw_mean) * mean_scale.
-    use_tanh_mean_scaling: true
+    use_tanh_mean_scaling: false
     # Used only when use_tanh_mean_scaling is true.
     mean_scale: 0.1
     # init_log_std is the midpoint of min_log_std and max_log_std.
