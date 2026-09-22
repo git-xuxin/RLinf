@@ -59,14 +59,13 @@ algorithm:
   tau: 0.05
 
   entropy_tuning:
-    alpha_type: fixed_alpha  # softplus, fixed_alpha
-    initial_alpha: 0.0  # 2.0e-6
-    # mean_active averages denoise steps after summing 5 chunks x 7 dimensions.
-    target_entropy: -150
+    alpha_type: fixed_alpha  # softplus
+    initial_alpha: 0.0  # 1.0e-5
+    target_entropy: -600
     optim:
-      lr: 3.0e-4
+      lr: 1.0e-4
       lr_scheduler: torch_constant
-      clip_grad: 10.0
+      clip_grad: 1.0
 
   replay_buffer:
     enable_cache: True
@@ -77,7 +76,7 @@ algorithm:
 
   target_update_freq: 1
   target_update_type: all
-  train_critic_before_actor_steps: 40
+  train_critic_before_actor_steps: 20
 
   filter_rewards: False
   rewards_lower_bound: 0.1
@@ -89,7 +88,7 @@ env:
 
   train:
     rollout_epoch: 1
-    total_num_envs: 32
+    total_num_envs: 16
     auto_reset: True
     ignore_terminations: False
     use_only_first_success: True
