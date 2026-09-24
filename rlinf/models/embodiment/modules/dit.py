@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-    Official DiT building blocks adapted to RFPO action tokens.
+Official DiT building blocks adapted to RFPO action tokens.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
 
 
 class TimestepEmbedder(nn.Module):
-    """Embed scalar diffusion timesteps as hidden-size vectors."""
+    """Embed normalized flow times with pi0.5 sinusoidal features and a DiT MLP."""
 
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
         super().__init__()
@@ -49,19 +49,24 @@ class TimestepEmbedder(nn.Module):
     def timestep_embedding(
         timesteps: torch.Tensor,
         embedding_dim: int,
-        max_period: int = 10_000,
+        min_period: float = 4e-3,
+        max_period: float = 4.0,
     ) -> torch.Tensor:
-        """Create the fractional sinusoidal embedding from the official DiT."""
+        """Encode flow times in [0, 1] using pi0.5's log-spaced periods.
+
+        Features are ordered as [sin(2*pi*t/period), cos(2*pi*t/period)].
+        Compute phases in float32 even when the actor uses a lower precision.
+        Odd dimensions retain DiT's trailing zero-padding convention.
+        """
         half = embedding_dim // 2
         if half == 0:
             raise ValueError("Timestep embedding dimension must be at least 2.")
-        frequencies = torch.exp(
-            -math.log(max_period)
-            * torch.arange(half, device=timesteps.device, dtype=torch.float32)
-            / half
+        fractions = torch.linspace(
+            0.0, 1.0, half, device=timesteps.device, dtype=torch.float32
         )
-        angles = timesteps[:, None].float() * frequencies[None]
-        embedding = torch.cat([torch.cos(angles), torch.sin(angles)], dim=-1)
+        periods = min_period * (max_period / min_period) ** fractions
+        angles = timesteps[:, None].float() * (2 * math.pi / periods)[None]
+        embedding = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
         if embedding_dim % 2:
             embedding = torch.cat(
                 [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
