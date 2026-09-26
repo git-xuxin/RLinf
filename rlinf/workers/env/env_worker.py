@@ -614,6 +614,13 @@ class EnvWorker(Worker):
                     final_value, np.ndarray
                 ):
                     merged_final_obs[key][done_mask] = final_value[done_mask]
+                elif isinstance(value, (list, tuple)) and isinstance(
+                    final_value, (list, tuple)
+                ):
+                    merged_value = list(value)
+                    for env_idx in np.flatnonzero(done_mask):
+                        merged_value[env_idx] = final_value[env_idx]
+                    merged_final_obs[key] = type(value)(merged_value)
 
         return merged_final_obs
 
