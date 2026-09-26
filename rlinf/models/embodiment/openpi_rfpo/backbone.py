@@ -77,6 +77,11 @@ class RFPOBackboneAdapter:
         return self.model.action_horizon, self.model.action_dim
 
     @property
+    def num_steps(self) -> int:
+        """Number of Euler steps, shared with native pi sampling."""
+        return self.model.num_steps
+
+    @property
     def env_action_shape(self) -> tuple[int, int]:
         """Executed action chunk and environment action width."""
         return self.model.action_chunk, self.model.action_env_dim

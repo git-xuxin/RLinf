@@ -9,13 +9,13 @@ actor:
     model_path: /mnt/public2/ysa/ckpt/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
     precision: bf16
     pi05: False
-    num_action_chunks: 5
+    num_action_chunks: 20
     action_dim: 7
     num_steps: 4
     openpi:
       task: eval
       config_name: pi0_libero
-      action_horizon: 50
+      action_horizon: 20
       action_chunk: ${..num_action_chunks}
       action_env_dim: ${..action_dim}
       num_steps: ${..num_steps}

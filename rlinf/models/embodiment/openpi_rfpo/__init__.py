@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 from rlinf.config import torch_dtype_from_precision
 
 from .policy import RFPOActor, RFPOCritic, RFPOPolicy
+from .rfpo_sampler import RFPOSampler
 
 
 def get_model(
@@ -33,8 +34,8 @@ def get_model(
 ) -> RFPOPolicy:
     """Build one side's small policy using dimensions supplied by its adapter.
 
-    ``action_dim`` selects the controlled action width, normally
-    ``adapter.env_action_shape[1]``. Feature/state widths come from the adapter's
+    ``action_dim`` is ``adapter.env_action_shape[1]``, the controlled and
+    executed action width. Feature/state widths come from the adapter's
     corresponding properties. No backbone object is retained by this factory.
     """
     model = RFPOPolicy(
@@ -51,6 +52,7 @@ def get_model(
             condition_dim=condition_dim,
             state_dim=state_dim,
         ),
+        RFPOSampler(**cfg.get("sampler", {})),
     )
     dtype = (
         torch_dtype

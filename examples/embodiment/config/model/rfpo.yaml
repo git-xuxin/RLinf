@@ -2,6 +2,10 @@ model_type: openpi_rfpo
 precision: fp32
 is_lora: False
 
+sampler:
+  rfpo_action_chunk: 20
+  active_step_indices: [0, 1, 2]  # support [0, 1, 2, 3]
+
 # Small networks only; the worker loads pi from rfpo_backbone_model.
 actor:
   hidden_size: 256

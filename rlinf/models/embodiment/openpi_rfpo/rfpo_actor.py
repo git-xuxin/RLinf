@@ -212,12 +212,14 @@ class RFPOActor(nn.Module):
         condition_mask: torch.Tensor,
         state: torch.Tensor,
         deterministic: bool = False,
+        noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return a reparameterized residual and elementwise Gaussian log probability.
 
         Velocity and outputs have shape [B, C, A]; action features are [B, C, E].
         State is normalized [B, S]. Prefix tokens/mask use their actual length.
         All distribution calculations use float32; log probability is unreduced.
+        Optional standard-normal noise has shape [B, C, A]; eval ignores it.
         """
         mean = self._predict_mean(
             base_velocity,
@@ -229,7 +231,11 @@ class RFPOActor(nn.Module):
         )
         log_std = self.log_std.float().expand_as(mean)
         std = log_std.exp()
-        delta_velocity = mean if deterministic else mean + std * torch.randn_like(mean)
+        if deterministic:
+            delta_velocity = mean
+        else:
+            noise = torch.randn_like(mean) if noise is None else noise.to(mean)
+            delta_velocity = mean + std * noise
         log_prob = -0.5 * (
             ((delta_velocity - mean) / std).square()
             + 2 * log_std
