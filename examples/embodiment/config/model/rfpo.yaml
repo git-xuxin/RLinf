@@ -1,0 +1,17 @@
+model_type: openpi_rfpo
+precision: fp32
+is_lora: False
+
+# Only small-network architecture belongs here. Implementations are pending.
+actor:
+  hidden_size: 256
+  num_dit_blocks: 3
+  num_heads: 2
+  mlp_ratio: 2.0
+
+critic:
+  hidden_size: 384
+  num_hidden_layers: 3
+  num_heads: 2
+  mlp_ratio: 2.0
+  num_q_heads: 10

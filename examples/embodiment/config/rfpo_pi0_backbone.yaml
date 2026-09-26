@@ -1,0 +1,33 @@
+# Model-boundary configuration for RFPO development/verification.
+defaults:
+  - model/rfpo@actor.model
+  - _self_
+
+actor:
+  rfpo_backbone_model:
+    model_type: openpi
+    model_path: /mnt/public2/ysa/ckpt/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    precision: bf16
+    pi05: False
+    num_action_chunks: 5
+    action_dim: 7
+    num_steps: 4
+    openpi:
+      task: eval
+      config_name: pi0_libero
+      action_horizon: 50
+      action_chunk: ${..num_action_chunks}
+      action_env_dim: ${..action_dim}
+      num_steps: ${..num_steps}
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 48
+      discrete_state_input: False
+      torch_compile: False
+    openpi_data:
+      norm_stats_path: ${..model_path}/physical-intelligence/libero/norm_stats.json
+
+rollout:
+  model: ${actor.model}
+  rfpo_backbone_model: ${actor.rfpo_backbone_model}
