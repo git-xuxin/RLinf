@@ -26,6 +26,7 @@ from rlinf.models.embodiment.openpi.modules.model import (
     preprocess_observation,
 )
 from rlinf.models.embodiment.openpi.tasks.eval import Pi0Eval
+from rlinf.models.embodiment.openpi.transforms.env import repack_env_obs
 
 
 def load_backbone_model(cfg: DictConfig, device: torch.device | str) -> Pi0Eval:
@@ -105,6 +106,40 @@ class RFPOBackboneAdapter:
     def preprocess(self, env_obs: dict[str, Any]) -> Observation:
         """Tokenize and normalize an env batch, then prepare images on the pi device."""
         observation = self.model.env_obs_to_observation(env_obs)
+        return preprocess_observation(observation, train=False)
+
+    @torch.no_grad()
+    def prepare_observation(
+        self, env_obs: dict[str, Any]
+    ) -> tuple[Observation, dict[str, torch.Tensor]]:
+        """Return the rollout pi input and its independently owned replay tensors.
+
+        Call before stepping/resetting the environment. Store the returned raw
+        observation and real prompt tokens in ``PolicyPart.obs`` or
+        ``EnvPart.next_obs``; each side of a transition owns its language input.
+        This only preprocesses observations, without evaluating pi.
+        """
+        repacked = repack_env_obs(
+            self.model.config_name,
+            env_obs,
+            select_state=self.model._select_configured_state,
+        )
+        replay_obs = {
+            key: torch.as_tensor(value).detach().cpu().clone().contiguous()
+            for key, value in repacked.items()
+            if key != "prompt"
+        }
+        processed = self.model.input_transform(repacked, transpose=False)
+        for key in ("tokenized_prompt", "tokenized_prompt_mask"):
+            replay_obs[key] = processed[key].detach().cpu().clone().contiguous()
+        observation = self.model._observation_dict_to_device(processed)
+        return preprocess_observation(observation, train=False), replay_obs
+
+    @torch.no_grad()
+    def preprocess_replay(self, replay_obs: dict[str, torch.Tensor]) -> Observation:
+        """Rebuild pi input through placeholder tokenization and real-token override."""
+        processed = self.model.input_transform(replay_obs, transpose=False)
+        observation = self.model._observation_dict_to_device(processed)
         return preprocess_observation(observation, train=False)
 
     @torch.no_grad()
