@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Architecture settings for the RFPO small actor and critic."""
+"""Network and Gaussian settings for the RFPO small actor and critic."""
 
 from dataclasses import dataclass
 
@@ -55,6 +55,7 @@ class RFPOActorConfig(_RFPOTransformerConfig):
 
     hidden_size: int = 256
     num_dit_blocks: int = 3
+    init_log_std: float = -6.0
 
 
 @dataclass(frozen=True)

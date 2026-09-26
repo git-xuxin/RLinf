@@ -22,9 +22,36 @@ from rlinf.config import torch_dtype_from_precision
 from .policy import RFPOActor, RFPOCritic, RFPOPolicy
 
 
-def get_model(cfg: DictConfig, torch_dtype: torch.dtype | None = None) -> RFPOPolicy:
-    """Build the actor/critic interface container from one side's model config."""
-    model = RFPOPolicy(RFPOActor(cfg.actor), RFPOCritic(cfg.critic))
+def get_model(
+    cfg: DictConfig,
+    torch_dtype: torch.dtype | None = None,
+    *,
+    action_dim: int,
+    action_feature_dim: int,
+    condition_dim: int,
+    state_dim: int,
+) -> RFPOPolicy:
+    """Build one side's small policy using dimensions supplied by its adapter.
+
+    ``action_dim`` selects the controlled action width, normally
+    ``adapter.env_action_shape[1]``. Feature/state widths come from the adapter's
+    corresponding properties. No backbone object is retained by this factory.
+    """
+    model = RFPOPolicy(
+        RFPOActor(
+            cfg.actor,
+            action_dim=action_dim,
+            action_feature_dim=action_feature_dim,
+            condition_dim=condition_dim,
+            state_dim=state_dim,
+        ),
+        RFPOCritic(
+            cfg.critic,
+            action_dim=action_dim,
+            condition_dim=condition_dim,
+            state_dim=state_dim,
+        ),
+    )
     dtype = (
         torch_dtype
         if torch_dtype is not None

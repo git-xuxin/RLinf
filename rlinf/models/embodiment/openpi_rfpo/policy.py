@@ -12,70 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Interfaces for the RFPO-specific DiT actor and Gemma3-style critic."""
+"""Container for RFPO trainable networks, owned separately from pi."""
 
 from typing import Literal
 
 import torch
-from omegaconf import DictConfig
 from torch import nn
 
-from .config import RFPOActorConfig, RFPOCriticConfig
-
-
-class RFPOActor(nn.Module):
-    """Residual velocity actor interface; network implementation is pending."""
-
-    def __init__(self, cfg: DictConfig):
-        super().__init__()
-        self.cfg = RFPOActorConfig(**cfg)
-
-    def forward(
-        self,
-        base_velocity: torch.Tensor,
-        timestep: torch.Tensor,
-        *,
-        action_features: torch.Tensor,
-        condition_tokens: torch.Tensor,
-        condition_mask: torch.Tensor,
-        state: torch.Tensor,
-        deterministic: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        """Return residual velocity and log probability for normalized actions.
-
-        ``action_features`` contains only action positions from the pi expert.
-        ``state`` is the normalized observation state, separate from these tokens.
-        Prefix length and feature widths come from the backbone adapter.
-        """
-        raise NotImplementedError("The RFPO DiT actor will be implemented separately.")
-
-
-class RFPOCritic(nn.Module):
-    """Action-chunk Q critic interface; network implementation is pending."""
-
-    def __init__(self, cfg: DictConfig):
-        super().__init__()
-        self.cfg = RFPOCriticConfig(**cfg)
-
-    def forward(
-        self,
-        actions: torch.Tensor,
-        *,
-        condition_tokens: torch.Tensor,
-        condition_mask: torch.Tensor,
-        state: torch.Tensor,
-        action_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Return ensemble Q values, preserving gradients through model-space actions."""
-        raise NotImplementedError(
-            "The RFPO Gemma3 critic will be implemented separately."
-        )
+from .rfpo_actor import RFPOActor
+from .rfpo_critic import RFPOCritic
 
 
 class RFPOPolicy(nn.Module):
     """Own only the small actor and critic, including both in weight synchronization."""
 
-    def __init__(self, actor: nn.Module, critic: nn.Module):
+    def __init__(self, actor: RFPOActor, critic: RFPOCritic) -> None:
         super().__init__()
         self.actor = actor
         self.critic = critic
