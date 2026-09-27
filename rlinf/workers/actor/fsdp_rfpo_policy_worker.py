@@ -15,8 +15,9 @@
 
 import copy
 
+import numpy as np
 import torch
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 from rlinf.models import get_model
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
@@ -26,12 +27,13 @@ from rlinf.models.embodiment.openpi_rfpo.backbone import (
     load_backbone_model,
 )
 from rlinf.scheduler import Worker
+from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
 
 class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
-    """RFPO loss computation; optimizer scheduling is handled separately."""
+    """Train the residual actor and critic while keeping pi frozen."""
 
     def init_worker(self):
         self.rfpo_backbone_model = load_backbone_model(
@@ -84,7 +86,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.entropy_temp.requires_grad_(False)
         self.build_lr_schedulers()
         self.grad_scaler = self.build_grad_scaler(
-            self.cfg.actor.fsdp_config.grad_scaler
+            **self.cfg.actor.fsdp_config.grad_scaler
         )
 
     @torch.no_grad()
@@ -154,10 +156,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
     @torch.no_grad()
     def compute_target(self, batch: dict) -> torch.Tensor:
         """Sample next actions with the online actor and bootstrap with target Qs."""
-        if self.cfg.algorithm.entropy_tuning.initial_alpha != 0.0:
-            raise NotImplementedError(
-                "RFPO entropy requires a future log_prob implementation."
-            )
         condition = batch["next_condition"]
         output = self.sample_actions(condition, mode="target")
         next_q_values = self.target_model(
@@ -195,41 +193,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         terminated = batch["terminations"].bool().any(dim=-1, keepdim=True)
         return chunk_reward + gamma**chunk_size * next_q.masked_fill(terminated, 0.0)
 
-    @torch.no_grad()
-    def consume_batch(self, batch: dict) -> torch.Tensor:
-        """Exercise learner inputs without gradients, losses, or optimizer steps."""
-        prepared = self.prepare_batch(batch)
-        condition = prepared["curr_condition"]
-        return self.model(
-            component="critic",
-            actions=prepared["actions"],
-            condition_tokens=condition.tokens,
-            condition_mask=condition.mask,
-            state=condition.observation.state,
-        )
-
-    @Worker.timer("run_training")
-    def run_training(self):
-        if not self.replay_buffer.is_ready(
-            self.cfg.algorithm.replay_buffer.min_buffer_size
-        ):
-            return {}
-        if self.enable_offload:
-            self.load_param_and_grad(self.device)
-        self.rfpo_backbone_model.to(self.device)
-        self.model.eval()
-        try:
-            batch = next(self.buffer_dataloader_iter)
-            for micro_batch in split_dict_to_chunk(batch, self.gradient_accumulation):
-                self.consume_batch(put_tensor_device(micro_batch, self.device))
-            return self.process_train_metrics({})
-        finally:
-            if self.enable_offload:
-                self.offload_param_and_grad()
-            Worker.torch_platform.synchronize()
-            torch.distributed.barrier()
-            Worker.torch_platform.empty_cache()
-
     @Worker.timer("forward_critic")
     def forward_critic(self, batch: dict) -> tuple[torch.Tensor, dict]:
         """Fit replay actions to one target; batch must come from prepare_batch."""
@@ -245,15 +208,14 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         critic_loss = F.mse_loss(
             q_values.float(), target_q_values.detach().float().expand_as(q_values)
         )
-        return critic_loss, {}
+        return critic_loss, {
+            "q_data": q_values.detach().float().mean().item(),
+            "q_target": target_q_values.float().mean().item(),
+        }
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch: dict) -> tuple[torch.Tensor, None, dict]:
         """Maximize online Q on the current actor's final normalized action chunk."""
-        if self.cfg.algorithm.entropy_tuning.initial_alpha != 0.0:
-            raise NotImplementedError(
-                "RFPO entropy requires a future log_prob implementation."
-            )
         condition = batch["curr_condition"]
         output = self.sample_actions(condition)
         q_values = self.model(
@@ -265,7 +227,124 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         qf_pi = q_values.float().mean(dim=-1, keepdim=True)
         actor_loss = -qf_pi.mean()
-        return actor_loss, None, {}
+        return actor_loss, None, {"q_pi": qf_pi.detach().mean().item()}
 
     def forward_alpha(self, batch):
         raise NotImplementedError("RFPO entropy tuning is disabled.")
+
+    @Worker.timer("update_one_epoch")
+    def update_one_epoch(self, train_actor: bool = True):
+        with self.worker_timer("sample"):
+            global_batch = next(self.buffer_dataloader_iter)
+
+        train_micro_batch_list = split_dict_to_chunk(
+            global_batch, self.gradient_accumulation
+        )
+        with self.worker_timer("prepare_batch"):
+            for i, batch in enumerate(train_micro_batch_list):
+                batch = put_tensor_device(batch, device=self.device)
+                train_micro_batch_list[i] = self.prepare_batch(batch)
+
+        self.optimizer.zero_grad()
+        self.qf_optimizer.zero_grad()
+        gbs_critic_loss = []
+        all_critic_metrics = {}
+        for idx, batch in enumerate(train_micro_batch_list):
+            with self.before_micro_batch(
+                self.model, is_last_micro_batch=idx + 1 == self.gradient_accumulation
+            ):
+                critic_loss, critic_metrics = self.forward_critic(batch)
+                critic_loss = critic_loss / self.gradient_accumulation
+                critic_loss.backward()
+            gbs_critic_loss.append(critic_loss.item() * self.gradient_accumulation)
+            append_to_dict(all_critic_metrics, critic_metrics)
+        all_critic_metrics = {
+            f"critic/{key}": np.mean(value) for key, value in all_critic_metrics.items()
+        }
+        # FSDP may materialize zero gradients for unused actor parameters.
+        self.optimizer.zero_grad()
+        qf_grad_norm = self.model.clip_grad_norm_(
+            max_norm=self.cfg.actor.critic_optim.clip_grad
+        )
+        self.qf_optimizer.step()
+        self.qf_lr_scheduler.step()
+        self.qf_optimizer.zero_grad()
+
+        metrics_data = {
+            "critic/loss": np.mean(gbs_critic_loss),
+            "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
+            "critic/grad_norm": qf_grad_norm,
+            **all_critic_metrics,
+        }
+
+        if self.update_step % self.critic_actor_ratio == 0 and train_actor:
+            gbs_actor_loss = []
+            all_actor_metrics = {}
+            for idx, batch in enumerate(train_micro_batch_list):
+                with self.before_micro_batch(
+                    self.model,
+                    is_last_micro_batch=idx + 1 == self.gradient_accumulation,
+                ):
+                    actor_loss, _, q_metrics = self.forward_actor(batch)
+                    actor_loss = actor_loss / self.gradient_accumulation
+                    actor_loss.backward()
+                gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
+                append_to_dict(all_actor_metrics, q_metrics)
+            all_actor_metrics = {
+                f"actor/{key}": np.mean(value)
+                for key, value in all_actor_metrics.items()
+            }
+            # Keep dQ/da; discard critic gradients before clipping only the actor.
+            self.qf_optimizer.zero_grad()
+            actor_grad_norm = self.model.clip_grad_norm_(
+                max_norm=self.cfg.actor.optim.clip_grad
+            )
+            self.optimizer.step()
+            self.lr_scheduler.step()
+            self.optimizer.zero_grad()
+
+            metrics_data.update(
+                {
+                    "actor/loss": np.mean(gbs_actor_loss),
+                    "actor/lr": self.optimizer.param_groups[0]["lr"],
+                    "actor/grad_norm": actor_grad_norm,
+                    **all_actor_metrics,
+                }
+            )
+
+        if self.update_step % self.cfg.algorithm.get("target_update_freq", 1) == 0:
+            self.soft_update_target_model()
+
+        return metrics_data
+
+    @Worker.timer("run_training")
+    def run_training(self):
+        min_buffer_size = self.cfg.algorithm.replay_buffer.min_buffer_size
+        if not self.replay_buffer.is_ready(min_buffer_size):
+            return {}
+        if self.enable_offload:
+            self.load_param_and_grad(self.device)
+            self.load_optimizer(self.device)
+        self.rfpo_backbone_model.to(self.device)
+
+        train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
+        train_actor_steps = max(min_buffer_size, train_actor_steps)
+        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+        self.model.train()
+        metrics = {}
+        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        try:
+            for _ in range(update_epoch):
+                metrics_data = self.update_one_epoch(train_actor=train_actor)
+                append_to_dict(metrics, metrics_data)
+                self.update_step += 1
+            return self.process_train_metrics(metrics)
+        finally:
+            self.optimizer.zero_grad()
+            self.qf_optimizer.zero_grad()
+            if self.enable_offload:
+                self.offload_optimizer()
+                self.offload_param_and_grad()
+            Worker.torch_platform.synchronize()
+            torch.distributed.barrier()
+            Worker.torch_platform.empty_cache()
