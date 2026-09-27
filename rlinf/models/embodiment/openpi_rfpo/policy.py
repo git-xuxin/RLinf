@@ -63,7 +63,7 @@ class RFPOPolicy(nn.Module):
 
     def forward(
         self, *, component: Literal["actor", "critic"], **kwargs
-    ) -> torch.Tensor | dict[str, torch.Tensor]:
+    ) -> torch.Tensor | dict[str, torch.Tensor | None]:
         if component == "actor":
             return self._sample_actions(**kwargs)
         if component == "critic":
@@ -79,7 +79,7 @@ class RFPOPolicy(nn.Module):
         noise: torch.Tensor | None = None,
         residual_noise: torch.Tensor | None = None,
         force_zero_residual: bool = False,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, torch.Tensor | None]:
         if mode not in ("train", "target", "rollout", "eval"):
             raise ValueError(f"Unknown RFPO sampling mode: {mode!r}")
         # Target actions come from the online actor, as in SAC/RLPD.
@@ -97,4 +97,5 @@ class RFPOPolicy(nn.Module):
             return {
                 "model_actions": model_actions,
                 "actions": model_actions[:, :chunk, :action_dim],
+                "log_prob": None,
             }

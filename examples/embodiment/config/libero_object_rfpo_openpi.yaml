@@ -43,6 +43,7 @@ algorithm:
   update_epoch: 1
   bootstrap_type: standard
   gamma: 0.99
+  critic_subsample_size: 2
   tau: 0.005
   target_update_type: all
   target_update_freq: 1

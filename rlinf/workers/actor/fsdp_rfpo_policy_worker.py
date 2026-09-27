@@ -13,7 +13,10 @@
 # limitations under the License.
 
 
+import copy
+
 import torch
+from torch.nn import functional as F
 
 from rlinf.models import get_model
 from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
@@ -28,7 +31,7 @@ from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
 
 class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
-    """RFPO framework integration; consume replay without RL updates for now."""
+    """RFPO loss computation; optimizer scheduling is handled separately."""
 
     def init_worker(self):
         self.rfpo_backbone_model = load_backbone_model(
@@ -46,12 +49,14 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
         module = self.model_provider_func()
+        if initialize_target:
+            target_module = copy.deepcopy(module.critic)
         # Sync the complete online small model, including persistent buffers.
         self.param_names_need_sync = list(module.state_dict())
         self.model = self._strategy.wrap_model(module, self._device_mesh)
         if initialize_target:
             self.target_model = self._strategy.wrap_model(
-                self.model_provider_func(), self._device_mesh
+                target_module, self._device_mesh
             )
             self.target_model.requires_grad_(False)
             self.target_model.eval()
@@ -81,6 +86,20 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.grad_scaler = self.build_grad_scaler(
             self.cfg.actor.fsdp_config.grad_scaler
         )
+
+    @torch.no_grad()
+    def soft_update_target_model(self, tau: float | None = None) -> None:
+        """Initialize or interpolate the target critic from the online critic."""
+        if tau is None:
+            tau = self.cfg.algorithm.tau
+        for online_param, target_param in zip(
+            self.model.critic.parameters(), self.target_model.parameters(), strict=True
+        ):
+            target_param.lerp_(online_param, tau)
+        for online_buffer, target_buffer in zip(
+            self.model.critic.buffers(), self.target_model.buffers(), strict=True
+        ):
+            target_buffer.copy_(online_buffer)
 
     def offload_param_and_grad(self, offload_grad: bool = False) -> None:
         if not self.is_weight_offloaded:
@@ -133,6 +152,50 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
 
     @torch.no_grad()
+    def compute_target(self, batch: dict) -> torch.Tensor:
+        """Sample next actions with the online actor and bootstrap with target Qs."""
+        if self.cfg.algorithm.entropy_tuning.initial_alpha != 0.0:
+            raise NotImplementedError(
+                "RFPO entropy requires a future log_prob implementation."
+            )
+        condition = batch["next_condition"]
+        output = self.sample_actions(condition, mode="target")
+        next_q_values = self.target_model(
+            actions=output["actions"],
+            condition_tokens=condition.tokens,
+            condition_mask=condition.mask,
+            state=condition.observation.state,
+        )
+        subsample_size = self.cfg.algorithm.get("critic_subsample_size", 2)
+        num_q_heads = next_q_values.shape[-1]
+        if not 1 <= subsample_size <= num_q_heads:
+            raise ValueError(
+                "RFPO critic_subsample_size must be between 1 and num_q_heads."
+            )
+        sample_idx = torch.randperm(
+            num_q_heads,
+            device=next_q_values.device,
+            generator=self.critic_sample_generator,
+        )[:subsample_size]
+        next_q = (
+            next_q_values.float()
+            .index_select(-1, sample_idx)
+            .min(dim=-1, keepdim=True)
+            .values
+        )
+
+        # Replay rewards exclude trajectory value bootstrap; all C steps executed.
+        rewards = batch["rewards"].float()
+        chunk_size = rewards.shape[-1]
+        gamma = self.cfg.algorithm.gamma
+        discounts = gamma ** torch.arange(
+            chunk_size, device=rewards.device, dtype=torch.float32
+        )
+        chunk_reward = (rewards * discounts).sum(dim=-1, keepdim=True)
+        terminated = batch["terminations"].bool().any(dim=-1, keepdim=True)
+        return chunk_reward + gamma**chunk_size * next_q.masked_fill(terminated, 0.0)
+
+    @torch.no_grad()
     def consume_batch(self, batch: dict) -> torch.Tensor:
         """Exercise learner inputs without gradients, losses, or optimizer steps."""
         prepared = self.prepare_batch(batch)
@@ -167,15 +230,42 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             torch.distributed.barrier()
             Worker.torch_platform.empty_cache()
 
-    def forward_critic(self, batch):
-        raise NotImplementedError(
-            "RFPO loss belongs to the algorithm-computation stage."
+    @Worker.timer("forward_critic")
+    def forward_critic(self, batch: dict) -> tuple[torch.Tensor, dict]:
+        """Fit replay actions to one target; batch must come from prepare_batch."""
+        target_q_values = self.compute_target(batch)
+        condition = batch["curr_condition"]
+        q_values = self.model(
+            component="critic",
+            actions=batch["actions"],
+            condition_tokens=condition.tokens,
+            condition_mask=condition.mask,
+            state=condition.observation.state,
         )
+        critic_loss = F.mse_loss(
+            q_values.float(), target_q_values.detach().float().expand_as(q_values)
+        )
+        return critic_loss, {}
 
-    def forward_actor(self, batch):
-        raise NotImplementedError(
-            "RFPO loss belongs to the algorithm-computation stage."
+    @Worker.timer("forward_actor")
+    def forward_actor(self, batch: dict) -> tuple[torch.Tensor, None, dict]:
+        """Maximize online Q on the current actor's final normalized action chunk."""
+        if self.cfg.algorithm.entropy_tuning.initial_alpha != 0.0:
+            raise NotImplementedError(
+                "RFPO entropy requires a future log_prob implementation."
+            )
+        condition = batch["curr_condition"]
+        output = self.sample_actions(condition)
+        q_values = self.model(
+            component="critic",
+            actions=output["actions"],
+            condition_tokens=condition.tokens,
+            condition_mask=condition.mask,
+            state=condition.observation.state,
         )
+        qf_pi = q_values.float().mean(dim=-1, keepdim=True)
+        actor_loss = -qf_pi.mean()
+        return actor_loss, None, {}
 
     def forward_alpha(self, batch):
         raise NotImplementedError("RFPO entropy tuning is disabled.")
