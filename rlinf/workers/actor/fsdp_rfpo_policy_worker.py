@@ -14,6 +14,7 @@
 
 
 import copy
+import os
 
 import numpy as np
 import torch
@@ -42,49 +43,63 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.rfpo_adapter = RFPOBackboneAdapter(self.rfpo_backbone_model)
         super().init_worker()
 
-    def model_provider_func(self):
+    def model_provider_func(self) -> torch.nn.Module:
         model_config = build_model_config(self.cfg.actor.model, self.rfpo_adapter)
         model = get_model(model_config)
         if self.cfg.runner.get("ckpt_path", None):
-            model.load_state_dict(torch.load(self.cfg.runner.ckpt_path))
+            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            model.load_state_dict(model_dict)
+
         return model
 
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
+        """Setup the small model, target critic, optimizers and schedulers."""
         module = self.model_provider_func()
         if initialize_target:
             target_module = copy.deepcopy(module.critic)
+
         # Sync the complete online small model, including persistent buffers.
         self.param_names_need_sync = list(module.state_dict())
-        self.model = self._strategy.wrap_model(module, self._device_mesh)
+
+        self.model = self._strategy.wrap_model(
+            model=module, device_mesh=self._device_mesh
+        )
         if initialize_target:
             self.target_model = self._strategy.wrap_model(
-                target_module, self._device_mesh
+                model=target_module, device_mesh=self._device_mesh
             )
             self.target_model.requires_grad_(False)
             self.target_model.eval()
             self.target_model_initialized = True
 
         self.use_dsrl = False
+        param_filters = {"critic": ["critic."]}
+        filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
         optimizers = self.build_optimizers(
             model=self.model,
             main_optim_config=self.cfg.actor.optim,
-            param_filters={"critic": ["critic."]},
-            filtered_optim_config={"critic": self.cfg.actor.critic_optim},
+            param_filters=param_filters,
+            filtered_optim_config=filtered_optim_config,
         )
-        self.optimizer, self.qf_optimizer = optimizers
-        entropy_cfg = self.cfg.algorithm.entropy_tuning
-        if entropy_cfg.alpha_type != "fixed_alpha" or entropy_cfg.initial_alpha != 0:
+        self.optimizer = optimizers[0]
+        self.qf_optimizer = optimizers[1]
+
+        alpha_type = self.cfg.algorithm.entropy_tuning.alpha_type
+        initial_alpha = self.cfg.algorithm.entropy_tuning.initial_alpha
+        if alpha_type != "fixed_alpha" or initial_alpha != 0:
             raise ValueError(
                 "RFPO currently requires fixed_alpha with initial_alpha=0."
             )
         self.entropy_temp = EntropyTemperature(
-            initial_alpha=0.0,
-            alpha_type="fixed_alpha",
+            initial_alpha=initial_alpha,
+            alpha_type=alpha_type,
             device=self.device,
             dtype=self.torch_dtype,
         )
         self.entropy_temp.requires_grad_(False)
+
         self.build_lr_schedulers()
+
         self.grad_scaler = self.build_grad_scaler(
             **self.cfg.actor.fsdp_config.grad_scaler
         )
@@ -102,32 +117,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.model.critic.buffers(), self.target_model.buffers(), strict=True
         ):
             target_buffer.copy_(online_buffer)
-
-    def offload_param_and_grad(self, offload_grad: bool = False) -> None:
-        if not self.is_weight_offloaded:
-            super().offload_param_and_grad(offload_grad)
-            if self.target_model is not None:
-                self._strategy.offload_param_and_grad(self.target_model, offload_grad)
-        self.rfpo_backbone_model.to("cpu")
-
-    def load_param_and_grad(self, device_id: int, load_grad: bool = False) -> None:
-        if self.is_weight_offloaded:
-            super().load_param_and_grad(device_id, load_grad)
-            if self.target_model is not None:
-                self._strategy.onload_param_and_grad(
-                    self.target_model, device_id, load_grad
-                )
-        # Weight synchronization only needs the small model; pi loads in the learner.
-
-    def offload_optimizer(self) -> None:
-        if not self.is_optimizer_offloaded:
-            super().offload_optimizer()
-            self._strategy.offload_optimizer(self.qf_optimizer)
-
-    def load_optimizer(self, device_id: int) -> None:
-        if self.is_optimizer_offloaded:
-            super().load_optimizer(device_id)
-            self._strategy.onload_optimizer(self.qf_optimizer, device_id)
 
     def prepare_batch(self, batch: dict) -> dict:
         """Rebuild both pi inputs and keep one complete normalized action chunk."""
@@ -158,25 +147,25 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         """Sample next actions with the online actor and bootstrap with target Qs."""
         condition = batch["next_condition"]
         output = self.sample_actions(condition, mode="target")
-        next_q_values = self.target_model(
+        all_qf_next_target = self.target_model(
             actions=output["actions"],
             condition_tokens=condition.tokens,
             condition_mask=condition.mask,
             state=condition.observation.state,
         )
         subsample_size = self.cfg.algorithm.get("critic_subsample_size", 2)
-        num_q_heads = next_q_values.shape[-1]
+        num_q_heads = all_qf_next_target.shape[-1]
         if not 1 <= subsample_size <= num_q_heads:
             raise ValueError(
                 "RFPO critic_subsample_size must be between 1 and num_q_heads."
             )
         sample_idx = torch.randperm(
             num_q_heads,
-            device=next_q_values.device,
+            device=all_qf_next_target.device,
             generator=self.critic_sample_generator,
         )[:subsample_size]
-        next_q = (
-            next_q_values.float()
+        qf_next_target = (
+            all_qf_next_target.float()
             .index_select(-1, sample_idx)
             .min(dim=-1, keepdim=True)
             .values
@@ -191,14 +180,16 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         chunk_reward = (rewards * discounts).sum(dim=-1, keepdim=True)
         terminated = batch["terminations"].bool().any(dim=-1, keepdim=True)
-        return chunk_reward + gamma**chunk_size * next_q.masked_fill(terminated, 0.0)
+        return chunk_reward + gamma**chunk_size * qf_next_target.masked_fill(
+            terminated, 0.0
+        )
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch: dict) -> tuple[torch.Tensor, dict]:
         """Fit replay actions to one target; batch must come from prepare_batch."""
         target_q_values = self.compute_target(batch)
         condition = batch["curr_condition"]
-        q_values = self.model(
+        all_data_q_values = self.model(
             component="critic",
             actions=batch["actions"],
             condition_tokens=condition.tokens,
@@ -206,10 +197,11 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             state=condition.observation.state,
         )
         critic_loss = F.mse_loss(
-            q_values.float(), target_q_values.detach().float().expand_as(q_values)
+            all_data_q_values.float(),
+            target_q_values.detach().float().expand_as(all_data_q_values),
         )
         return critic_loss, {
-            "q_data": q_values.detach().float().mean().item(),
+            "q_data": all_data_q_values.detach().float().mean().item(),
             "q_target": target_q_values.float().mean().item(),
         }
 
@@ -218,14 +210,14 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         """Maximize online Q on the current actor's final normalized action chunk."""
         condition = batch["curr_condition"]
         output = self.sample_actions(condition)
-        q_values = self.model(
+        all_qf_pi = self.model(
             component="critic",
             actions=output["actions"],
             condition_tokens=condition.tokens,
             condition_mask=condition.mask,
             state=condition.observation.state,
         )
-        qf_pi = q_values.float().mean(dim=-1, keepdim=True)
+        qf_pi = all_qf_pi.float().mean(dim=-1, keepdim=True)
         actor_loss = -qf_pi.mean()
         return actor_loss, None, {"q_pi": qf_pi.detach().mean().item()}
 
@@ -266,6 +258,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         qf_grad_norm = self.model.clip_grad_norm_(
             max_norm=self.cfg.actor.critic_optim.clip_grad
         )
+
         self.qf_optimizer.step()
         self.qf_lr_scheduler.step()
         self.qf_optimizer.zero_grad()
@@ -330,15 +323,17 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
         train_actor = self.replay_buffer.is_ready(train_actor_steps)
+
         self.model.train()
         metrics = {}
+
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         try:
             for _ in range(update_epoch):
                 metrics_data = self.update_one_epoch(train_actor=train_actor)
                 append_to_dict(metrics, metrics_data)
                 self.update_step += 1
-            return self.process_train_metrics(metrics)
+            mean_metric_dict = self.process_train_metrics(metrics)
         finally:
             self.optimizer.zero_grad()
             self.qf_optimizer.zero_grad()
@@ -348,3 +343,84 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             Worker.torch_platform.synchronize()
             torch.distributed.barrier()
             Worker.torch_platform.empty_cache()
+
+        return mean_metric_dict
+
+    def save_checkpoint(self, save_base_path: str, step: int) -> None:
+        """Save SAC components and the state that controls RFPO updates."""
+        restore_weight_offload = self.is_weight_offloaded
+        restore_optimizer_offload = self.is_optimizer_offloaded
+
+        try:
+            super().save_checkpoint(save_base_path, step)
+
+            worker_state = {
+                "update_step": self.update_step,
+                "critic_sample_rng": self.critic_sample_generator.get_state(),
+                "replay_rng": self.replay_buffer.random_generator.get_state(),
+            }
+            worker_state_save_path = os.path.join(
+                save_base_path, f"rfpo_state_rank_{self._rank}.pt"
+            )
+            torch.save(worker_state, worker_state_save_path)
+        finally:
+            if restore_optimizer_offload:
+                self.offload_optimizer()
+            if restore_weight_offload:
+                self.offload_param_and_grad()
+
+    def load_checkpoint(self, load_base_path: str) -> None:
+        """Restore training state on device, then restore the offload state."""
+        restore_weight_offload = self.is_weight_offloaded
+        restore_optimizer_offload = self.is_optimizer_offloaded
+
+        try:
+            if restore_weight_offload:
+                self.load_param_and_grad(self.device)
+            if restore_optimizer_offload:
+                self.load_optimizer(self.device)
+
+            super().load_checkpoint(load_base_path)
+
+            worker_state_load_path = os.path.join(
+                load_base_path, f"rfpo_state_rank_{self._rank}.pt"
+            )
+            worker_state = torch.load(
+                worker_state_load_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            self.update_step = worker_state["update_step"]
+            self.critic_sample_generator.set_state(worker_state["critic_sample_rng"])
+            self.replay_buffer.random_generator.set_state(worker_state["replay_rng"])
+        finally:
+            if restore_optimizer_offload:
+                self.offload_optimizer()
+            if restore_weight_offload:
+                self.offload_param_and_grad()
+
+    def offload_param_and_grad(self, offload_grad: bool = False) -> None:
+        if not self.is_weight_offloaded:
+            super().offload_param_and_grad(offload_grad)
+            if self.target_model is not None:
+                self._strategy.offload_param_and_grad(self.target_model, offload_grad)
+        self.rfpo_backbone_model.to("cpu")
+
+    def load_param_and_grad(self, device_id: int, load_grad: bool = False) -> None:
+        if self.is_weight_offloaded:
+            super().load_param_and_grad(device_id, load_grad)
+            if self.target_model is not None:
+                self._strategy.onload_param_and_grad(
+                    self.target_model, device_id, load_grad
+                )
+        # Weight synchronization only needs the small model; pi loads in the learner.
+
+    def offload_optimizer(self) -> None:
+        if not self.is_optimizer_offloaded:
+            super().offload_optimizer()
+            self._strategy.offload_optimizer(self.qf_optimizer)
+
+    def load_optimizer(self, device_id: int) -> None:
+        if self.is_optimizer_offloaded:
+            super().load_optimizer(device_id)
+            self._strategy.onload_optimizer(self.qf_optimizer, device_id)

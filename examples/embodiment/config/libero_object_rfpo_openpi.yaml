@@ -1,7 +1,7 @@
 defaults:
-  - rfpo_pi0_backbone
   - env/libero_object@env.train
   - env/libero_object@env.eval
+  - model/rfpo@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
@@ -26,13 +26,13 @@ runner:
     project_name: rlinf
     experiment_name: "libero_object_rfpo_openpi"
     logger_backends: ["tensorboard"]
-  max_epochs: 1
+  max_epochs: 1000
   max_steps: -1
   only_eval: False
-  val_check_interval: -1
-  save_interval: -1
-  resume_dir: null
-  ckpt_path: null
+  val_check_interval: 20
+  save_interval: 40
+  resume_dir: null  # checkpoints/global_step_<N>
+  ckpt_path: null  # actor/model_state_dict/full_weights.pt; weights only
 
 algorithm:
   group_size: 1
@@ -54,6 +54,7 @@ algorithm:
     alpha_type: fixed_alpha
     initial_alpha: 0.0
   replay_buffer:
+    enable_preload: False
     enable_cache: True
     cache_size: 100
     sample_window_size: 100
@@ -64,7 +65,7 @@ env:
   group_name: EnvGroup
   train:
     rollout_epoch: 1
-    total_num_envs: 2
+    total_num_envs: 16
     auto_reset: True
     ignore_terminations: False
     use_only_first_success: True
@@ -75,7 +76,7 @@ env:
       save_video: False
   eval:
     rollout_epoch: 1
-    total_num_envs: 2
+    total_num_envs: 40
     auto_reset: True
     ignore_terminations: False
     is_eval: True
@@ -93,13 +94,41 @@ rollout:
   enable_torch_compile: False
   enable_cuda_graph: False
 
+  model: ${actor.model}
+  rfpo_backbone_model: ${actor.rfpo_backbone_model}
+
 actor:
   group_name: ActorGroup
   training_backend: fsdp
-  micro_batch_size: 2
-  global_batch_size: 2
+  micro_batch_size: 16
+  global_batch_size: 64
   seed: 42
   enable_offload: False
+
+  rfpo_backbone_model:
+    model_type: openpi
+    model_path: /mnt/public2/ysa/ckpt/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    precision: bf16
+    pi05: False
+    num_action_chunks: 20
+    action_dim: 7
+    num_steps: 4
+    openpi:
+      task: eval
+      config_name: pi0_libero
+      action_horizon: 20
+      action_chunk: ${..num_action_chunks}
+      action_env_dim: ${..action_dim}
+      num_steps: ${..num_steps}
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 48
+      discrete_state_input: False
+      torch_compile: False
+    openpi_data:
+      norm_stats_path: ${..model_path}/physical-intelligence/libero/norm_stats.json
+
   optim:
     clip_grad: 10.0
     lr: 3.0e-4
@@ -109,6 +138,7 @@ actor:
     clip_grad: 10.0
     lr: 3.0e-4
     lr_scheduler: torch_constant
+
   fsdp_config:
     sharding_strategy: no_shard
     use_orig_params: True
