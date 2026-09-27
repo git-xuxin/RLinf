@@ -14,43 +14,53 @@
 
 """RFPO small policy factory; the worker loads OpenPI separately."""
 
+import copy
+from typing import TYPE_CHECKING
+
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, open_dict
 
 from rlinf.config import torch_dtype_from_precision
 
 from .policy import RFPOActor, RFPOCritic, RFPOPolicy
 from .rfpo_sampler import RFPOSampler
 
+if TYPE_CHECKING:
+    from .backbone import RFPOBackboneAdapter
+
+
+def build_model_config(cfg: DictConfig, adapter: "RFPOBackboneAdapter") -> DictConfig:
+    """Copy the small-model config with input dimensions from this worker's pi."""
+    model_config = copy.deepcopy(cfg)
+    with open_dict(model_config):
+        model_config.input_dims = {
+            "action_dim": adapter.env_action_shape[1],
+            "action_feature_dim": adapter.action_feature_dim,
+            "condition_dim": adapter.condition_dim,
+            "state_dim": adapter.state_dim,
+        }
+    return model_config
+
 
 def get_model(
     cfg: DictConfig,
     torch_dtype: torch.dtype | None = None,
-    *,
-    action_dim: int,
-    action_feature_dim: int,
-    condition_dim: int,
-    state_dim: int,
 ) -> RFPOPolicy:
-    """Build one side's small policy using dimensions supplied by its adapter.
-
-    ``action_dim`` is ``adapter.env_action_shape[1]``, the controlled and
-    executed action width. Feature/state widths come from the adapter's
-    corresponding properties. No backbone object is retained by this factory.
-    """
+    """Build the small policy from a config prepared by ``build_model_config``."""
+    dims = cfg.input_dims
     model = RFPOPolicy(
         RFPOActor(
             cfg.actor,
-            action_dim=action_dim,
-            action_feature_dim=action_feature_dim,
-            condition_dim=condition_dim,
-            state_dim=state_dim,
+            action_dim=dims.action_dim,
+            action_feature_dim=dims.action_feature_dim,
+            condition_dim=dims.condition_dim,
+            state_dim=dims.state_dim,
         ),
         RFPOCritic(
             cfg.critic,
-            action_dim=action_dim,
-            condition_dim=condition_dim,
-            state_dim=state_dim,
+            action_dim=dims.action_dim,
+            condition_dim=dims.condition_dim,
+            state_dim=dims.state_dim,
         ),
         RFPOSampler(**cfg.get("sampler", {})),
     )

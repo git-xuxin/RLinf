@@ -56,6 +56,14 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
         actor_worker_cls = EmbodiedSACFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_rfpo":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for embodied_rfpo."
+            )
+        from rlinf.workers.actor.fsdp_rfpo_policy_worker import EmbodiedRFPOFSDPPolicy
+
+        actor_worker_cls = EmbodiedRFPOFSDPPolicy
     elif cfg.algorithm.loss_type == "rlt_ac":
         if use_training_pipeline:
             raise ValueError(

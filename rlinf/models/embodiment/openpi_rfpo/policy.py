@@ -14,7 +14,7 @@
 
 """Container for RFPO trainable networks, owned separately from pi."""
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from torch import nn
@@ -37,6 +37,29 @@ class RFPOPolicy(nn.Module):
         self.actor = actor
         self.critic = critic
         self.sampler = sampler
+
+    @torch.no_grad()
+    def predict_action_batch(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        adapter: "RFPOBackboneAdapter",
+        mode: Literal["train", "eval"] = "train",
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Decode an environment chunk and retain its model-space replay action."""
+        observation, replay_obs = adapter.prepare_observation(env_obs)
+        condition = adapter.encode_condition(observation)
+        output = self(
+            component="actor",
+            adapter=adapter,
+            condition=condition,
+            mode="eval" if mode == "eval" else "rollout",
+        )
+        actions = adapter.decode_actions(output["model_actions"], condition)
+        return actions, {
+            "forward_inputs": {"action": output["actions"].flatten(1)},
+            "replay_obs": replay_obs,
+        }
 
     def forward(
         self, *, component: Literal["actor", "critic"], **kwargs

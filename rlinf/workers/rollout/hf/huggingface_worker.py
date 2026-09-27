@@ -88,6 +88,8 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
+        self.rfpo_backbone_model = None
+        self.rfpo_adapter = None
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -158,6 +160,21 @@ class MultiStepRolloutWorker(Worker):
         # (path, precision, and nested inference knobs). Eval-only is a no-op merge.
         rollout_model_config = OmegaConf.merge(self.model_cfg, self.cfg.rollout.model)
 
+        rfpo_backbone_config = self.cfg.rollout.get("rfpo_backbone_model")
+        if rfpo_backbone_config is not None:
+            from rlinf.models.embodiment.openpi_rfpo import build_model_config
+            from rlinf.models.embodiment.openpi_rfpo.backbone import (
+                RFPOBackboneAdapter,
+                load_backbone_model,
+            )
+
+            self.rfpo_backbone_model = load_backbone_model(
+                rfpo_backbone_config, self.device
+            )
+            self.rfpo_adapter = RFPOBackboneAdapter(self.rfpo_backbone_model)
+            rollout_model_config = build_model_config(
+                rollout_model_config, self.rfpo_adapter
+            )
         self.hf_model: BasePolicy = get_model(rollout_model_config)
 
         if self.cfg.runner.get("ckpt_path", None):
@@ -580,6 +597,10 @@ class MultiStepRolloutWorker(Worker):
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if self.rfpo_adapter is not None:
+            return self.hf_model.predict_action_batch(
+                env_obs=env_obs, adapter=self.rfpo_adapter, mode=mode
+            )
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
                 policy_model=self.hf_model,
@@ -733,8 +754,10 @@ class MultiStepRolloutWorker(Worker):
     ) -> None:
         next_obs = env_part.next_obs if env_part.next_obs is not None else policy_obs
         final_prev_values = None
+        if self.rfpo_adapter is not None and next_obs is not None:
+            _, next_obs = self.rfpo_adapter.prepare_observation(next_obs)
         # Terminal inference contributes values or transition features only.
-        if env_part.requires_inference:
+        if env_part.requires_inference and self.rfpo_adapter is None:
             if next_obs is None:
                 raise ValueError(
                     "Terminal inference requires a post-action observation."
@@ -876,6 +899,8 @@ class MultiStepRolloutWorker(Worker):
                 transition_obs = (
                     policy_input.obs if self.collect_raw_transition_obs else {}
                 )
+                if self.rfpo_adapter is not None and policy_input.requires_inference:
+                    transition_obs = result["replay_obs"]
                 if not policy_input.requires_inference:
                     trajectory_part = PolicyPart(
                         sources=policy_input.sources,
@@ -1008,6 +1033,8 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_cuda_graph:
             self.hf_model.release_cuda_graph()
         self.hf_model.to("cpu")
+        if self.rfpo_backbone_model is not None:
+            self.rfpo_backbone_model.to("cpu")
         if self.rlt_feature_model is not None:
             self.rlt_feature_model.to("cpu")
         if self.expert_model is not None:
@@ -1016,6 +1043,8 @@ class MultiStepRolloutWorker(Worker):
 
     def reload_model(self):
         self.hf_model.to(self.device)
+        if self.rfpo_backbone_model is not None:
+            self.rfpo_backbone_model.to(self.device)
         if self.rlt_feature_model is not None:
             self.rlt_feature_model.to(self.device)
         if self.expert_model is not None:

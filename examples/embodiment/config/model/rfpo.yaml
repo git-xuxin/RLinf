@@ -1,6 +1,8 @@
 model_type: openpi_rfpo
 precision: fp32
 is_lora: False
+num_action_chunks: 20
+action_dim: 7
 
 sampler:
   rfpo_action_chunk: 20
