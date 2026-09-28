@@ -19,7 +19,10 @@ import threading
 import torch
 
 from rlinf.scheduler import Worker
-from rlinf.utils.metric_utils import append_to_dict, compute_split_num
+from rlinf.utils.metric_utils import (
+    append_to_dict,
+    compute_split_num,
+)
 from rlinf.workers.actor.fsdp_rfpo_policy_worker import EmbodiedRFPOFSDPPolicy
 
 
@@ -88,16 +91,30 @@ class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
 
     @Worker.timer("run_training")
     async def run_training(self):
-        if self.enable_offload:
+        """RFPO training using replay buffer"""
+        if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
         self.rfpo_backbone_model.to(self.device)
 
-        min_buffer_size = self.cfg.algorithm.replay_buffer.min_buffer_size
+        # Check if replay buffer has enough samples
+        min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
         await self._wait_for_replay_buffer_ready(min_buffer_size)
 
         torch.distributed.barrier()
 
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        )
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        # Delay actor training until buffer has enough samples
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
         train_actor = await self.replay_buffer.is_ready_async(train_actor_steps)
@@ -116,13 +133,12 @@ class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
 
         self.optimizer.zero_grad()
         self.qf_optimizer.zero_grad()
-        if self.enable_offload:
+        if self.cfg.actor.get("enable_offload", False):
             self.offload_optimizer()
             self.offload_param_and_grad()
         Worker.torch_platform.synchronize()
         torch.distributed.barrier()
         Worker.torch_platform.empty_cache()
-
         return mean_metric_dict
 
     async def stop(self):

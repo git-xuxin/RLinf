@@ -81,11 +81,14 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
     """Train the residual actor and critic while keeping pi frozen."""
 
     def init_worker(self):
+        # Load the frozen pi backbone; the small model reads it through the adapter.
         self.rfpo_backbone_model = load_backbone_model(
             self.cfg.actor.rfpo_backbone_model, self.device
         )
         self.rfpo_adapter = RFPOBackboneAdapter(self.rfpo_backbone_model)
+        # Build model, replay buffer and SAC components on top of the adapter.
         super().init_worker()
+        # Group-wise penalties on the actor raw mean; zeros disable the penalty.
         self.raw_mean_l2_coefficients = torch.tensor(
             _parse_raw_mean_l2_coefficients(
                 self.cfg.algorithm.get("raw_mean_l2_coefficients", None)
@@ -308,12 +311,18 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self, train_actor: bool = True):
+        global_batch_size_per_rank = (
+            self.cfg.actor.global_batch_size // self._world_size
+        )
+
         with self.worker_timer("sample"):
             global_batch = next(self.buffer_dataloader_iter)
 
         train_micro_batch_list = split_dict_to_chunk(
-            global_batch, self.gradient_accumulation
+            global_batch, global_batch_size_per_rank // self.cfg.actor.micro_batch_size
         )
+
+        # move train_micro_batch_list to device and rebuild the pi conditions
         with self.worker_timer("prepare_batch"):
             for i, batch in enumerate(train_micro_batch_list):
                 batch = put_tensor_device(batch, device=self.device)
@@ -381,6 +390,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             actor_grad_norm = self.model.clip_grad_norm_(
                 max_norm=self.cfg.actor.optim.clip_grad
             )
+
             self.optimizer.step()
             self.lr_scheduler.step()
             self.optimizer.zero_grad()
@@ -395,45 +405,66 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 }
             )
 
-        if self.update_step % self.cfg.algorithm.get("target_update_freq", 1) == 0:
+        # Soft update target network
+        if (
+            self.target_model_initialized
+            and self.update_step % self.cfg.algorithm.get("target_update_freq", 1) == 0
+        ):
             self.soft_update_target_model()
 
         return metrics_data
 
     @Worker.timer("run_training")
     def run_training(self):
-        min_buffer_size = self.cfg.algorithm.replay_buffer.min_buffer_size
+        """RFPO training using replay buffer"""
+        # Check if replay buffer has enough samples
+        min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
         if not self.replay_buffer.is_ready(min_buffer_size):
+            self.log_on_first_rank(
+                f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
+            )
             return {}
-        if self.enable_offload:
+
+        if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
         self.rfpo_backbone_model.to(self.device)
 
+        # Delay actor training until buffer has enough samples
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
         train_actor = self.replay_buffer.is_ready(train_actor_steps)
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        )
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
 
         self.model.train()
         metrics = {}
 
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        try:
-            for _ in range(update_epoch):
-                metrics_data = self.update_one_epoch(train_actor=train_actor)
-                append_to_dict(metrics, metrics_data)
-                self.update_step += 1
-            mean_metric_dict = self.process_train_metrics(metrics)
-        finally:
-            self.optimizer.zero_grad()
-            self.qf_optimizer.zero_grad()
-            if self.enable_offload:
-                self.offload_optimizer()
-                self.offload_param_and_grad()
-            Worker.torch_platform.synchronize()
-            torch.distributed.barrier()
-            Worker.torch_platform.empty_cache()
+        for _ in range(update_epoch):
+            metrics_data = self.update_one_epoch(train_actor=train_actor)
+            append_to_dict(metrics, metrics_data)
+            self.update_step += 1
 
+        mean_metric_dict = self.process_train_metrics(metrics)
+
+        self.optimizer.zero_grad()
+        self.qf_optimizer.zero_grad()
+        if self.cfg.actor.get("enable_offload", False):
+            self.offload_optimizer()
+            self.offload_param_and_grad()
+        Worker.torch_platform.synchronize()
+        torch.distributed.barrier()
+        Worker.torch_platform.empty_cache()
         return mean_metric_dict
 
     def save_checkpoint(self, save_base_path: str, step: int) -> None:
@@ -441,53 +472,53 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         restore_weight_offload = self.is_weight_offloaded
         restore_optimizer_offload = self.is_optimizer_offloaded
 
-        try:
-            super().save_checkpoint(save_base_path, step)
+        super().save_checkpoint(save_base_path, step)
 
-            worker_state = {
-                "update_step": self.update_step,
-                "critic_sample_rng": self.critic_sample_generator.get_state(),
-                "replay_rng": self.replay_buffer.random_generator.get_state(),
-            }
-            worker_state_save_path = os.path.join(
-                save_base_path, f"rfpo_state_rank_{self._rank}.pt"
-            )
-            torch.save(worker_state, worker_state_save_path)
-        finally:
-            if restore_optimizer_offload:
-                self.offload_optimizer()
-            if restore_weight_offload:
-                self.offload_param_and_grad()
+        # save the state that controls RFPO updates
+        worker_state = {
+            "update_step": self.update_step,
+            "critic_sample_rng": self.critic_sample_generator.get_state(),
+            "replay_rng": self.replay_buffer.random_generator.get_state(),
+        }
+        worker_state_save_path = os.path.join(
+            save_base_path, f"rfpo_state_rank_{self._rank}.pt"
+        )
+        torch.save(worker_state, worker_state_save_path)
+
+        if restore_optimizer_offload:
+            self.offload_optimizer()
+        if restore_weight_offload:
+            self.offload_param_and_grad()
 
     def load_checkpoint(self, load_base_path: str) -> None:
         """Restore training state on device, then restore the offload state."""
         restore_weight_offload = self.is_weight_offloaded
         restore_optimizer_offload = self.is_optimizer_offloaded
 
-        try:
-            if restore_weight_offload:
-                self.load_param_and_grad(self.device)
-            if restore_optimizer_offload:
-                self.load_optimizer(self.device)
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+        if restore_optimizer_offload:
+            self.load_optimizer(self.device)
 
-            super().load_checkpoint(load_base_path)
+        super().load_checkpoint(load_base_path)
 
-            worker_state_load_path = os.path.join(
-                load_base_path, f"rfpo_state_rank_{self._rank}.pt"
-            )
-            worker_state = torch.load(
-                worker_state_load_path,
-                map_location="cpu",
-                weights_only=True,
-            )
-            self.update_step = worker_state["update_step"]
-            self.critic_sample_generator.set_state(worker_state["critic_sample_rng"])
-            self.replay_buffer.random_generator.set_state(worker_state["replay_rng"])
-        finally:
-            if restore_optimizer_offload:
-                self.offload_optimizer()
-            if restore_weight_offload:
-                self.offload_param_and_grad()
+        # load the state that controls RFPO updates
+        worker_state_load_path = os.path.join(
+            load_base_path, f"rfpo_state_rank_{self._rank}.pt"
+        )
+        worker_state = torch.load(
+            worker_state_load_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+        self.update_step = worker_state["update_step"]
+        self.critic_sample_generator.set_state(worker_state["critic_sample_rng"])
+        self.replay_buffer.random_generator.set_state(worker_state["replay_rng"])
+
+        if restore_optimizer_offload:
+            self.offload_optimizer()
+        if restore_weight_offload:
+            self.offload_param_and_grad()
 
     def offload_param_and_grad(self, offload_grad: bool = False) -> None:
         if not self.is_weight_offloaded:
