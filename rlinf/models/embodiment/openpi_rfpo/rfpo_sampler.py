@@ -20,6 +20,13 @@ from typing import TYPE_CHECKING
 import torch
 from torch.nn import functional as F
 
+from .metrics import (
+    RFPO_ACTION_GROUPS,
+    RFPOStepStats,
+    group_rms,
+    parallel_vertical_group_rms,
+)
+
 if TYPE_CHECKING:
     from .backbone import RFPOBackboneAdapter, RFPOCondition
     from .rfpo_actor import RFPOActor
@@ -42,14 +49,19 @@ class RFPOSampler:
         residual_noise: torch.Tensor | None = None,
         deterministic: bool = False,
         force_zero_residual: bool = False,
-    ) -> torch.Tensor:
-        """Return final model-space actions [B, H, D], preserving input gradients.
+        collect_step_stats: bool = False,
+    ) -> tuple[torch.Tensor, RFPOStepStats | None]:
+        """Return final actions [B, H, D] and optional denoising diagnostics.
 
         ``noise`` is the initial [B, H, D] standard-normal sample. Optional
         ``residual_noise`` is [N, B, C, A], indexed by the absolute denoising
         step, including inactive steps. C is rfpo_action_chunk and A is the
         adapter's environment action width. Neither noise tensor is modified.
         The caller controls autograd and whether to use residual means.
+
+        With ``collect_step_stats`` the second return value holds per-sample
+        per-step diagnostics under ``no_grad`` (``None`` otherwise); the caller
+        owns their reduction and logging.
         """
         horizon, model_dim = adapter.action_shape
         env_chunk, action_dim = adapter.env_action_shape
@@ -84,10 +96,18 @@ class RFPOSampler:
         x_t = noise.to(device=device, dtype=torch.float32)
         dt = -1.0 / num_steps
         t = 1.0
+        base_velocity_steps: list[torch.Tensor] = []
+        delta_velocity_steps: list[torch.Tensor] = []
+        delta_log_std_steps: list[torch.Tensor] = []
+        delta_parallel_steps: list[torch.Tensor] = []
+        delta_vertical_steps: list[torch.Tensor] = []
+        action_noise_steps: list[torch.Tensor] = []
+        active_step_mask = torch.zeros(num_steps, dtype=torch.bool, device=device)
         for step in range(num_steps):
             timestep = torch.full((batch_size,), t, device=device, dtype=torch.float32)
             base = adapter.velocity(condition, x_t, timestep)
             velocity = base.velocity
+            output = None
             if not force_zero_residual and step in self.active_step_indices:
                 output = actor(
                     velocity[:, :chunk, :action_dim],
@@ -106,4 +126,43 @@ class RFPOSampler:
                 velocity = velocity + residual
             x_t = x_t + dt * velocity
             t += dt
-        return x_t
+
+            # Diagnostics: the base field and noisy action exist on every
+            # step, while the delta family only exists where pi is guided.
+            if collect_step_stats:
+                with torch.no_grad():
+                    active_base = base.velocity[:, :chunk, :action_dim]
+                    base_velocity_steps.append(group_rms(active_base))
+                    if output is None:
+                        zero_group_rms = torch.zeros(
+                            (batch_size, len(RFPO_ACTION_GROUPS)), device=device
+                        )
+                        delta_velocity_steps.append(zero_group_rms.clone())
+                        delta_log_std_steps.append(zero_group_rms.clone())
+                        delta_parallel_steps.append(zero_group_rms.clone())
+                        delta_vertical_steps.append(zero_group_rms.clone())
+                    else:
+                        active_delta = output["delta_velocity"]
+                        delta_velocity_steps.append(group_rms(active_delta))
+                        delta_log_std_steps.append(group_rms(output["log_std"].float()))
+                        parallel, vertical = parallel_vertical_group_rms(
+                            active_delta, active_base
+                        )
+                        delta_parallel_steps.append(parallel)
+                        delta_vertical_steps.append(vertical)
+                    action_noise_steps.append(
+                        x_t[:, :chunk, :action_dim].float().mean(dim=1)
+                    )
+                    active_step_mask[step] = output is not None
+        step_stats = None
+        if collect_step_stats:
+            step_stats = RFPOStepStats(
+                base_velocity_group_rms=torch.stack(base_velocity_steps),
+                delta_velocity_group_rms=torch.stack(delta_velocity_steps),
+                delta_log_std_group_rms=torch.stack(delta_log_std_steps),
+                delta_parallel_group_rms=torch.stack(delta_parallel_steps),
+                delta_vertical_group_rms=torch.stack(delta_vertical_steps),
+                action_noise_dim_mean=torch.stack(action_noise_steps),
+                active_step_mask=active_step_mask,
+            )
+        return x_t, step_stats

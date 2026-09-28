@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 from torch import nn
 
+from .metrics import RFPOStepStats
 from .rfpo_actor import RFPOActor
 from .rfpo_critic import RFPOCritic
 from .rfpo_sampler import RFPOSampler
@@ -63,7 +64,7 @@ class RFPOPolicy(nn.Module):
 
     def forward(
         self, *, component: Literal["actor", "critic"], **kwargs
-    ) -> torch.Tensor | dict[str, torch.Tensor | None]:
+    ) -> torch.Tensor | dict[str, torch.Tensor | RFPOStepStats | None]:
         if component == "actor":
             return self._sample_actions(**kwargs)
         if component == "critic":
@@ -79,12 +80,13 @@ class RFPOPolicy(nn.Module):
         noise: torch.Tensor | None = None,
         residual_noise: torch.Tensor | None = None,
         force_zero_residual: bool = False,
-    ) -> dict[str, torch.Tensor | None]:
+        collect_step_stats: bool = False,
+    ) -> dict[str, torch.Tensor | RFPOStepStats | None]:
         if mode not in ("train", "target", "rollout", "eval"):
             raise ValueError(f"Unknown RFPO sampling mode: {mode!r}")
         # Target actions come from the online actor, as in SAC/RLPD.
         with torch.set_grad_enabled(mode == "train" and torch.is_grad_enabled()):
-            model_actions = self.sampler.sample(
+            model_actions, step_stats = self.sampler.sample(
                 self.actor,
                 adapter=adapter,
                 condition=condition,
@@ -92,10 +94,12 @@ class RFPOPolicy(nn.Module):
                 residual_noise=residual_noise,
                 deterministic=mode == "eval",
                 force_zero_residual=force_zero_residual,
+                collect_step_stats=collect_step_stats,
             )
             chunk, action_dim = adapter.env_action_shape
             return {
                 "model_actions": model_actions,
                 "actions": model_actions[:, :chunk, :action_dim],
                 "log_prob": None,
+                "step_stats": step_stats,
             }

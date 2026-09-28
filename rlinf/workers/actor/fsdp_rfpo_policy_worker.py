@@ -27,6 +27,7 @@ from rlinf.models.embodiment.openpi_rfpo.backbone import (
     RFPOBackboneAdapter,
     load_backbone_model,
 )
+from rlinf.models.embodiment.openpi_rfpo.metrics import denoise_step_metrics
 from rlinf.scheduler import Worker
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
@@ -206,10 +207,15 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         }
 
     @Worker.timer("forward_actor")
-    def forward_actor(self, batch: dict) -> tuple[torch.Tensor, None, dict]:
-        """Maximize online Q on the current actor's final normalized action chunk."""
+    def forward_actor(self, batch: dict) -> tuple[torch.Tensor, None, dict, dict]:
+        """Maximize online Q on the current actor's final normalized action chunk.
+
+        The fourth return value carries the sampler's per-denoise-step velocity
+        diagnostics, reduced to scalar ``denoise_step_*`` metrics; the caller
+        adds the ``rfpo/`` namespace.
+        """
         condition = batch["curr_condition"]
-        output = self.sample_actions(condition)
+        output = self.sample_actions(condition, collect_step_stats=True)
         all_qf_pi = self.model(
             component="critic",
             actions=output["actions"],
@@ -219,7 +225,12 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         qf_pi = all_qf_pi.float().mean(dim=-1, keepdim=True)
         actor_loss = -qf_pi.mean()
-        return actor_loss, None, {"q_pi": qf_pi.detach().mean().item()}
+        return (
+            actor_loss,
+            None,
+            {"q_pi": qf_pi.detach().mean().item()},
+            denoise_step_metrics(output["step_stats"]),
+        )
 
     def forward_alpha(self, batch):
         raise NotImplementedError("RFPO entropy tuning is disabled.")
@@ -273,19 +284,26 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
             gbs_actor_loss = []
             all_actor_metrics = {}
+            all_rfpo_metrics = {}
             for idx, batch in enumerate(train_micro_batch_list):
                 with self.before_micro_batch(
                     self.model,
                     is_last_micro_batch=idx + 1 == self.gradient_accumulation,
                 ):
-                    actor_loss, _, q_metrics = self.forward_actor(batch)
+                    actor_loss, _, actor_metrics, rfpo_metrics = self.forward_actor(
+                        batch
+                    )
                     actor_loss = actor_loss / self.gradient_accumulation
                     actor_loss.backward()
                 gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
-                append_to_dict(all_actor_metrics, q_metrics)
+                append_to_dict(all_actor_metrics, actor_metrics)
+                append_to_dict(all_rfpo_metrics, rfpo_metrics)
             all_actor_metrics = {
                 f"actor/{key}": np.mean(value)
                 for key, value in all_actor_metrics.items()
+            }
+            all_rfpo_metrics = {
+                f"rfpo/{key}": np.mean(value) for key, value in all_rfpo_metrics.items()
             }
             # Keep dQ/da; discard critic gradients before clipping only the actor.
             self.qf_optimizer.zero_grad()
@@ -302,6 +320,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                     "actor/lr": self.optimizer.param_groups[0]["lr"],
                     "actor/grad_norm": actor_grad_norm,
                     **all_actor_metrics,
+                    **all_rfpo_metrics,
                 }
             )
 
