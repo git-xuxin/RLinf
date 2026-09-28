@@ -24,7 +24,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_rfpo_openpi"
+    experiment_name: "libero_object_async_rfpo_openpi"
     logger_backends: ["tensorboard"]
   max_epochs: 1000
   max_steps: -1
