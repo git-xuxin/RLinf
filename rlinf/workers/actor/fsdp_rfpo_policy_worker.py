@@ -14,7 +14,10 @@
 
 
 import copy
+import math
 import os
+from collections.abc import Mapping
+from numbers import Real
 
 import numpy as np
 import torch
@@ -27,11 +30,51 @@ from rlinf.models.embodiment.openpi_rfpo.backbone import (
     RFPOBackboneAdapter,
     load_backbone_model,
 )
-from rlinf.models.embodiment.openpi_rfpo.metrics import denoise_step_metrics
+from rlinf.models.embodiment.openpi_rfpo.metrics import (
+    RFPO_ACTION_GROUP_NAMES,
+    denoise_step_metrics,
+)
+from rlinf.models.embodiment.openpi_rfpo.rfpo_sampler import compute_raw_mean_l2
 from rlinf.scheduler import Worker
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
+
+
+def _parse_raw_mean_l2_coefficients(
+    config: Mapping | None,
+) -> tuple[float, float, float]:
+    """Validate ``algorithm.raw_mean_l2_coefficients`` in action-group order.
+
+    A missing mapping disables the penalty; it must otherwise name only the
+    action groups and give each a finite, non-negative weight.
+    """
+    if config is None:
+        return (0.0, 0.0, 0.0)
+    if not isinstance(config, Mapping):
+        raise ValueError("raw_mean_l2_coefficients must be a mapping.")
+
+    unknown_groups = set(config) - set(RFPO_ACTION_GROUP_NAMES)
+    if unknown_groups:
+        raise ValueError(
+            f"Unsupported raw_mean_l2_coefficients groups: {sorted(unknown_groups)}."
+        )
+
+    coefficients = []
+    for group_name in RFPO_ACTION_GROUP_NAMES:
+        value = config.get(group_name, 0.0)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(float(value))
+            or value < 0
+        ):
+            raise ValueError(
+                "RFPO raw_mean_l2_coefficients entry "
+                f"'{group_name}' must be finite and non-negative."
+            )
+        coefficients.append(float(value))
+    return tuple(coefficients)
 
 
 class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
@@ -43,6 +86,13 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         self.rfpo_adapter = RFPOBackboneAdapter(self.rfpo_backbone_model)
         super().init_worker()
+        self.raw_mean_l2_coefficients = torch.tensor(
+            _parse_raw_mean_l2_coefficients(
+                self.cfg.algorithm.get("raw_mean_l2_coefficients", None)
+            ),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
     def model_provider_func(self) -> torch.nn.Module:
         model_config = build_model_config(self.cfg.actor.model, self.rfpo_adapter)
@@ -208,11 +258,17 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch: dict) -> tuple[torch.Tensor, None, dict, dict]:
-        """Maximize online Q on the current actor's final normalized action chunk.
+        """Maximize online Q and bound the raw residual mean on guided steps.
 
-        The fourth return value carries the sampler's per-denoise-step velocity
-        diagnostics, reduced to scalar ``denoise_step_*`` metrics; the caller
-        adds the ``rfpo/`` namespace.
+        The actor objective is the mean online Q of the current final
+        normalized action chunk. ``raw_mean_l2`` adds the coefficient-weighted
+        group MSE of the actor raw mean on every guided step, which limits how
+        far each delta velocity drifts from zero and narrows exploration;
+        all-zero coefficients add a zero term and keep the behavior unchanged.
+
+        The fourth return value carries the sampler's per-denoise-step
+        velocity diagnostics plus the raw-mean L2 group metrics, reduced to
+        scalars; the caller adds the ``rfpo/`` namespace.
         """
         condition = batch["curr_condition"]
         output = self.sample_actions(condition, collect_step_stats=True)
@@ -224,12 +280,27 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             state=condition.observation.state,
         )
         qf_pi = all_qf_pi.float().mean(dim=-1, keepdim=True)
-        actor_loss = -qf_pi.mean()
+        raw_mean_l2_loss, raw_mean_group_mse, weighted_raw_mean_l2 = (
+            compute_raw_mean_l2(
+                output["raw_mean_group_mse"], self.raw_mean_l2_coefficients
+            )
+        )
+        actor_loss = -qf_pi.mean() + raw_mean_l2_loss
+        rfpo_metrics = denoise_step_metrics(output["step_stats"])
+        rfpo_metrics["actor_loss/q"] = -qf_pi.detach().mean().item()
+        rfpo_metrics.update(
+            {
+                f"actor_loss/raw_mean_l2/{group_name}": weighted_term.item()
+                for group_name, weighted_term in zip(
+                    RFPO_ACTION_GROUP_NAMES, weighted_raw_mean_l2, strict=True
+                )
+            }
+        )
         return (
             actor_loss,
             None,
             {"q_pi": qf_pi.detach().mean().item()},
-            denoise_step_metrics(output["step_stats"]),
+            rfpo_metrics,
         )
 
     def forward_alpha(self, batch):

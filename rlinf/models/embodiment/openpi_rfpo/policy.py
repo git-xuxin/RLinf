@@ -86,7 +86,7 @@ class RFPOPolicy(nn.Module):
             raise ValueError(f"Unknown RFPO sampling mode: {mode!r}")
         # Target actions come from the online actor, as in SAC/RLPD.
         with torch.set_grad_enabled(mode == "train" and torch.is_grad_enabled()):
-            model_actions, step_stats = self.sampler.sample(
+            model_actions, step_stats, raw_mean_group_mse = self.sampler.sample(
                 self.actor,
                 adapter=adapter,
                 condition=condition,
@@ -102,4 +102,5 @@ class RFPOPolicy(nn.Module):
                 "actions": model_actions[:, :chunk, :action_dim],
                 "log_prob": None,
                 "step_stats": step_stats,
+                "raw_mean_group_mse": raw_mean_group_mse,
             }

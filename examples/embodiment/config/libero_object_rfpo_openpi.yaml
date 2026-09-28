@@ -47,6 +47,13 @@ algorithm:
   gamma: 0.99
   critic_subsample_size: 2
   tau: 0.05
+
+  # Penalize the raw actor mean per action group to bound each delta velocity.
+  raw_mean_l2_coefficients:
+    translation: 1.0e-2
+    rotation: 1.0e-2
+    gripper: 1.0e-2
+
   target_update_type: all
   target_update_freq: 1
   backup_entropy: False

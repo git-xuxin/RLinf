@@ -55,13 +55,14 @@ def _check_action_width(values: torch.Tensor) -> None:
         )
 
 
-def group_rms(values: torch.Tensor) -> torch.Tensor:
-    """Root-mean-square per action group of the per-position group norm.
+def group_mean_square(values: torch.Tensor) -> torch.Tensor:
+    """Mean square per action group of the per-position group norm.
 
     ``values`` is [batch, ..., 7]; the result is [batch, 3]. Each group sums
     its member dimensions into one squared norm per position before the
     position mean, so the group width never divides the result; groups with
-    different physical scales still never mix.
+    different physical scales still never mix. The raw-mean L2 penalty uses
+    this reduction on the actor mean.
     """
     _check_action_width(values)
     position_dims = tuple(range(1, values.ndim - 1))
@@ -70,8 +71,17 @@ def group_rms(values: torch.Tensor) -> torch.Tensor:
         squared_norm = values[..., group_slice].float().square().sum(dim=-1)
         if position_dims:
             squared_norm = squared_norm.mean(dim=position_dims)
-        groups.append(squared_norm.sqrt())
+        groups.append(squared_norm)
     return torch.stack(groups, dim=-1)
+
+
+def group_rms(values: torch.Tensor) -> torch.Tensor:
+    """Root-mean-square per action group of the per-position group norm.
+
+    Equivalent to ``group_mean_square(values).sqrt()``; see that function
+    for the reduction convention.
+    """
+    return group_mean_square(values).sqrt()
 
 
 def parallel_vertical_group_rms(

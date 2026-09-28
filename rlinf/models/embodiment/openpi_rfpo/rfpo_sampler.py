@@ -23,6 +23,7 @@ from torch.nn import functional as F
 from .metrics import (
     RFPO_ACTION_GROUPS,
     RFPOStepStats,
+    group_mean_square,
     group_rms,
     parallel_vertical_group_rms,
 )
@@ -30,6 +31,43 @@ from .metrics import (
 if TYPE_CHECKING:
     from .backbone import RFPOBackboneAdapter, RFPOCondition
     from .rfpo_actor import RFPOActor
+
+
+def compute_raw_mean_l2(
+    raw_mean_group_mse: torch.Tensor, coefficients: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reduce the per-guided-step raw-mean group MSE into an actor-loss term.
+
+    ``raw_mean_group_mse`` is ``RFPOSampler.sample``'s third return value:
+    [steps, batch, groups], with one ``group_mean_square`` row per step where
+    the residual actor ran. ``coefficients`` holds one non-negative weight per
+    action group in translation, rotation, gripper order. Each group's MSE
+    averages over the guided steps and the batch, so the penalty stays
+    comparable across runs; the total sums the weighted group terms.
+
+    Returns the scalar loss, the unweighted group MSE [groups], and the
+    weighted group terms [groups].
+    """
+    group_count = len(RFPO_ACTION_GROUPS)
+    if raw_mean_group_mse.ndim != 3 or raw_mean_group_mse.shape[-1] != group_count:
+        raise ValueError(
+            f"RFPO raw-mean group MSE must have shape [steps, batch, {group_count}]."
+        )
+    if coefficients.shape != (group_count,):
+        raise ValueError(
+            f"RFPO raw_mean_l2 coefficients must have shape [{group_count}]."
+        )
+    if raw_mean_group_mse.shape[0] == 0:
+        return (
+            raw_mean_group_mse.new_zeros(()),
+            raw_mean_group_mse.new_zeros((group_count,)),
+            raw_mean_group_mse.new_zeros((group_count,)),
+        )
+    group_mse = raw_mean_group_mse.float().mean(dim=(0, 1))
+    weighted_group_terms = group_mse * coefficients.to(
+        device=group_mse.device, dtype=group_mse.dtype
+    )
+    return weighted_group_terms.sum(), group_mse, weighted_group_terms
 
 
 @dataclass(frozen=True)
@@ -50,8 +88,8 @@ class RFPOSampler:
         deterministic: bool = False,
         force_zero_residual: bool = False,
         collect_step_stats: bool = False,
-    ) -> tuple[torch.Tensor, RFPOStepStats | None]:
-        """Return final actions [B, H, D] and optional denoising diagnostics.
+    ) -> tuple[torch.Tensor, RFPOStepStats | None, torch.Tensor]:
+        """Return final actions [B, H, D] with optional denoising diagnostics.
 
         ``noise`` is the initial [B, H, D] standard-normal sample. Optional
         ``residual_noise`` is [N, B, C, A], indexed by the absolute denoising
@@ -61,7 +99,10 @@ class RFPOSampler:
 
         With ``collect_step_stats`` the second return value holds per-sample
         per-step diagnostics under ``no_grad`` (``None`` otherwise); the caller
-        owns their reduction and logging.
+        owns their reduction and logging. The third return value is the
+        raw-mean group MSE [guided_steps, B, groups] of the actor mean on
+        every guided step, ordered by step; it stays in the autograd graph,
+        and ``compute_raw_mean_l2`` turns it into the actor-loss penalty.
         """
         horizon, model_dim = adapter.action_shape
         env_chunk, action_dim = adapter.env_action_shape
@@ -71,6 +112,8 @@ class RFPOSampler:
             raise ValueError("Action chunks must be positive and fit action_horizon.")
         if not 0 < action_dim <= model_dim:
             raise ValueError("Environment action width must fit the pi action width.")
+        if not self.active_step_indices:
+            raise ValueError("Residual step indices must select at least one step.")
         if num_steps <= 0 or any(
             step < 0 or step >= num_steps for step in self.active_step_indices
         ):
@@ -102,6 +145,7 @@ class RFPOSampler:
         delta_parallel_steps: list[torch.Tensor] = []
         delta_vertical_steps: list[torch.Tensor] = []
         action_noise_steps: list[torch.Tensor] = []
+        raw_mean_group_mse_steps: list[torch.Tensor] = []
         active_step_mask = torch.zeros(num_steps, dtype=torch.bool, device=device)
         for step in range(num_steps):
             timestep = torch.full((batch_size,), t, device=device, dtype=torch.float32)
@@ -124,6 +168,10 @@ class RFPOSampler:
                     (0, model_dim - action_dim, 0, horizon - chunk),
                 )
                 velocity = velocity + residual
+                # The mean head is linear, so the actor mean is already the raw
+                # mean that raw_mean_l2 penalties regularize; keep its group MSE
+                # per guided step in the autograd graph for the actor loss.
+                raw_mean_group_mse_steps.append(group_mean_square(output["mean"]))
             x_t = x_t + dt * velocity
             t += dt
 
@@ -165,4 +213,12 @@ class RFPOSampler:
                 action_noise_dim_mean=torch.stack(action_noise_steps),
                 active_step_mask=active_step_mask,
             )
-        return x_t, step_stats
+        if raw_mean_group_mse_steps:
+            raw_mean_group_mse = torch.stack(raw_mean_group_mse_steps)
+        else:
+            raw_mean_group_mse = torch.zeros(
+                (0, batch_size, len(RFPO_ACTION_GROUPS)),
+                device=device,
+                dtype=torch.float32,
+            )
+        return x_t, step_stats, raw_mean_group_mse
