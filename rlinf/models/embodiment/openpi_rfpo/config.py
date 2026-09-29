@@ -51,10 +51,11 @@ class _RFPOTransformerConfig:
 
 @dataclass(frozen=True)
 class RFPOActorConfig(_RFPOTransformerConfig):
-    """DiT actor architecture; num_dit_blocks counts the residual DiT blocks."""
+    """DiT actor architecture."""
 
     hidden_size: int = 256
     num_dit_blocks: int = 3
+    num_decoder_layers: int = 1
     init_log_std: float = -6.0
 
 

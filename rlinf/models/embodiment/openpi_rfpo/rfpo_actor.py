@@ -119,7 +119,7 @@ class RFPOActor(nn.Module):
                 batch_first=True,
                 norm_first=False,
             ),
-            num_layers=1,
+            num_layers=self.cfg.num_decoder_layers,
             norm=nn.LayerNorm(width, eps=1e-6),
         )
         self.blocks = nn.ModuleList(

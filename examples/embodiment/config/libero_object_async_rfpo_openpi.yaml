@@ -127,7 +127,7 @@ actor:
     openpi:
       task: eval
       config_name: pi0_libero
-      action_horizon: 20
+      action_horizon: ${..num_action_chunks}
       action_chunk: ${..num_action_chunks}
       action_env_dim: ${..action_dim}
       num_steps: ${..num_steps}
@@ -142,13 +142,13 @@ actor:
 
   optim:
     clip_grad: 1.0
-    lr: 3.0e-4
+    lr: 1.0e-05
     lr_scheduler: constant
-    lr_warmup_steps: 100
+    lr_warmup_steps: 50
 
   critic_optim:
     clip_grad: 1.0
-    lr: 3.0e-4
+    lr: 1.0e-05
     lr_scheduler: torch_constant
 
   fsdp_config:
