@@ -259,6 +259,17 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             "q_target": target_q_values.float().mean().item(),
         }
 
+    def _all_ranks_buffer_ready(self, min_size: int) -> bool:
+        """Return True only when every actor rank's replay buffer reaches min_size.
+        """
+        local_ready = torch.tensor(
+            [int(self.replay_buffer.is_ready(min_size))],
+            device=self.device,
+            dtype=torch.int32,
+        )
+        torch.distributed.all_reduce(local_ready, op=torch.distributed.ReduceOp.MIN)
+        return local_ready.item() == 1
+
     @Worker.timer("forward_actor")
     def forward_actor(self, batch: dict) -> tuple[torch.Tensor, None, dict, dict]:
         """Maximize online Q and bound the raw residual mean on guided steps.
@@ -430,10 +441,10 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.load_optimizer(self.device)
         self.rfpo_backbone_model.to(self.device)
 
-        # Delay actor training until buffer has enough samples
+        # Delay actor training until every rank's buffer has enough samples
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
-        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+        train_actor = self._all_ranks_buffer_ready(train_actor_steps)
 
         assert (
             self.cfg.actor.global_batch_size

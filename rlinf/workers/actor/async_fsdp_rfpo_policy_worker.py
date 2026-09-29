@@ -114,10 +114,11 @@ class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
             // self._world_size
         )
 
-        # Delay actor training until buffer has enough samples
+        # Delay actor training until every rank's buffer has enough samples
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
-        train_actor = await self.replay_buffer.is_ready_async(train_actor_steps)
+        self._drain_received_trajectories()
+        train_actor = self._all_ranks_buffer_ready(train_actor_steps)
 
         self.model.train()
         metrics = {}
