@@ -205,7 +205,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             actions=output["actions"],
             condition_tokens=condition.tokens,
             condition_mask=condition.mask,
-            state=condition.observation.state,
+            state_embedding=condition.state_embedding,
         )
         subsample_size = self.cfg.algorithm.get("critic_subsample_size", 2)
         num_q_heads = all_qf_next_target.shape[-1]
@@ -248,7 +248,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             actions=batch["actions"],
             condition_tokens=condition.tokens,
             condition_mask=condition.mask,
-            state=condition.observation.state,
+            state_embedding=condition.state_embedding,
         )
         critic_loss = F.mse_loss(
             all_data_q_values.float(),
@@ -291,7 +291,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             actions=output["actions"],
             condition_tokens=condition.tokens,
             condition_mask=condition.mask,
-            state=condition.observation.state,
+            state_embedding=condition.state_embedding,
         )
         qf_pi = all_qf_pi.float().mean(dim=-1, keepdim=True)
         raw_mean_l2_loss, raw_mean_group_mse, weighted_raw_mean_l2 = (

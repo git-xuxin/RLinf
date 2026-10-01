@@ -84,17 +84,25 @@ class RFPOQNetwork(nn.Module):
         *,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor,
-        state: torch.Tensor,
+        state_embedding: torch.Tensor,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return [B, 1] Q values; retain gradients through normalized actions."""
+        """Return [B, 1] Q values; retain gradients through normalized actions.
+
+        ``state_embedding`` is pi's ``state_proj`` output with shape [B, 1, S].
+        """
         batch_size, action_chunk = actions.shape[:2]
         dtype = self.action_proj.weight.dtype
+        if state_embedding.shape != (batch_size, 1, self.state_proj.in_features):
+            raise ValueError(
+                "RFPO critic state embedding must have shape [B, 1, "
+                f"{self.state_proj.in_features}], got {tuple(state_embedding.shape)}."
+            )
         tokens = torch.cat(
             [
                 self.action_proj(actions.to(dtype=dtype)),
                 self.condition_proj(condition_tokens.detach().to(dtype=dtype)),
-                self.state_proj(state.detach().to(dtype=dtype))[:, None],
+                self.state_proj(state_embedding.detach().to(dtype=dtype)),
                 self.value_token.expand(batch_size, -1, -1),
             ],
             dim=1,
@@ -154,7 +162,7 @@ class RFPOCritic(nn.Module):
         *,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor,
-        state: torch.Tensor,
+        state_embedding: torch.Tensor,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return [B, num_q_heads] without reducing the independent Q estimates."""
@@ -164,7 +172,7 @@ class RFPOCritic(nn.Module):
                     actions,
                     condition_tokens=condition_tokens,
                     condition_mask=condition_mask,
-                    state=state,
+                    state_embedding=state_embedding,
                     action_mask=action_mask,
                 )
                 for network in self.q_networks

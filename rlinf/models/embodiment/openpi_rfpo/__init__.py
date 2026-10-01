@@ -35,7 +35,7 @@ def build_model_config(cfg: DictConfig, adapter: "RFPOBackboneAdapter") -> DictC
     with open_dict(model_config):
         model_config.input_dims = {
             "action_dim": adapter.env_action_shape[1],
-            "action_feature_dim": adapter.action_feature_dim,
+            "suffix_dim": adapter.suffix_dim,
             "condition_dim": adapter.condition_dim,
             "state_dim": adapter.state_dim,
         }
@@ -52,9 +52,8 @@ def get_model(
         RFPOActor(
             cfg.actor,
             action_dim=dims.action_dim,
-            action_feature_dim=dims.action_feature_dim,
+            suffix_dim=dims.suffix_dim,
             condition_dim=dims.condition_dim,
-            state_dim=dims.state_dim,
         ),
         RFPOCritic(
             cfg.critic,

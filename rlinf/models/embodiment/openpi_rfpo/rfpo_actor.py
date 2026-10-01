@@ -96,16 +96,16 @@ class RFPOActor(nn.Module):
         cfg: DictConfig,
         *,
         action_dim: int,
-        action_feature_dim: int,
+        suffix_dim: int,
         condition_dim: int,
-        state_dim: int,
     ) -> None:
         super().__init__()
         self.cfg = RFPOActorConfig(**cfg)
         width = self.cfg.hidden_size
+        # The three projections are intentionally separate: they adapt distinct
+        # token sources (residual region, pi's suffix input, pi's prefix cache).
         self.velocity_input = nn.Linear(action_dim, width)
-        self.action_feature_input = nn.Linear(action_feature_dim, width)
-        self.state_input = nn.Linear(state_dim, width)
+        self.suffix_input = nn.Linear(suffix_dim, width)
         self.condition_input = nn.Linear(condition_dim, width)
         self.cls_token = nn.Parameter(torch.empty(1, 1, width))
         self.timestep_embedder = RFPOTimestepEmbedder(width)
@@ -156,12 +156,21 @@ class RFPOActor(nn.Module):
         base_velocity: torch.Tensor,
         timestep: torch.Tensor,
         *,
-        action_features: torch.Tensor,
+        suffix_embedding: torch.Tensor,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor,
-        state: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, action_chunk = base_velocity.shape[:2]
+        if suffix_embedding.shape != (
+            batch_size,
+            action_chunk + 1,
+            self.suffix_input.in_features,
+        ):
+            raise ValueError(
+                "RFPO suffix embedding must have shape "
+                f"[B, {action_chunk + 1}, {self.suffix_input.in_features}], got "
+                f"{tuple(suffix_embedding.shape)}."
+            )
         dtype = self.velocity_input.weight.dtype
         velocity_tokens = self.velocity_input(base_velocity.to(dtype=dtype))
         velocity_tokens = (
@@ -171,21 +180,16 @@ class RFPOActor(nn.Module):
             ).to(dtype=dtype)[None]
         )
 
-        # State is explicit: the adapter's expert features contain actions only.
-        queries = torch.cat(
-            [
-                self.state_input(state.detach().to(dtype=dtype))[:, None],
-                self.action_feature_input(action_features.to(dtype=dtype)),
-            ],
-            dim=1,
-        )
-        queries = (
-            queries
+        suffix_tokens = self.suffix_input(suffix_embedding.to(dtype=dtype))
+        suffix_tokens = (
+            suffix_tokens
             + _position_embedding(
-                queries.shape[1], self.cfg.hidden_size, queries.device
+                action_chunk + 1, self.cfg.hidden_size, suffix_embedding.device
             ).to(dtype=dtype)[None]
         )
-        queries = torch.cat([queries, self.cls_token.expand(batch_size, -1, -1)], dim=1)
+        queries = torch.cat(
+            [suffix_tokens, self.cls_token.expand(batch_size, -1, -1)], dim=1
+        )
         memory = self.condition_input(condition_tokens.detach().to(dtype=dtype))
         decoded = self.condition_decoder(
             tgt=queries,
@@ -207,27 +211,26 @@ class RFPOActor(nn.Module):
         base_velocity: torch.Tensor,
         timestep: torch.Tensor,
         *,
-        action_features: torch.Tensor,
+        suffix_embedding: torch.Tensor,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor,
-        state: torch.Tensor,
         deterministic: bool = False,
         noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return a reparameterized residual and elementwise Gaussian log probability.
 
-        Velocity and outputs have shape [B, C, A]; action features are [B, C, E].
-        State is normalized [B, S]. Prefix tokens/mask use their actual length.
-        All distribution calculations use float32; log probability is unreduced.
+        Velocity and outputs have shape [B, C, A]. The suffix embedding is
+        pi's input suffix token sequence [B, C+1, E] (state, then action+time
+        tokens); prefix tokens/mask use their actual length. All distribution
+        calculations use float32; log probability is unreduced.
         Optional standard-normal noise has shape [B, C, A]; eval ignores it.
         """
         mean = self._predict_mean(
             base_velocity,
             timestep,
-            action_features=action_features,
+            suffix_embedding=suffix_embedding,
             condition_tokens=condition_tokens,
             condition_mask=condition_mask,
-            state=state,
         )
         log_std = self.log_std.float().expand_as(mean)
         std = log_std.exp()

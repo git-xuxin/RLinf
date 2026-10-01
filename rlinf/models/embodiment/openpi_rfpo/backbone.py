@@ -45,24 +45,21 @@ def load_backbone_model(cfg: DictConfig, device: torch.device | str) -> Pi0Eval:
 
 @dataclass
 class RFPOCondition:
-    """Prepared observation and frozen prefix features/cache for one observation batch."""
+    """Prepared observation and frozen prefix/state features/cache for one batch.
+
+    ``state_embedding`` is pi's ``state_proj`` output ``[B, 1, S]``; the critic
+    consumes it instead of the raw normalized state.
+    """
 
     observation: Observation
     tokens: torch.Tensor
     mask: torch.Tensor
     kv_cache: tuple
-
-
-@dataclass
-class RFPOVelocity:
-    """Full model-space velocity and action-only expert features for one ODE step."""
-
-    velocity: torch.Tensor
-    action_features: torch.Tensor
+    state_embedding: torch.Tensor
 
 
 class RFPOBackboneAdapter:
-    """Expose pi preprocessing, condition encoding, velocity, and action decoding.
+    """Expose pi preprocessing, condition/suffix encoding, velocity, and decoding.
 
     The worker owns this adapter and its model separately from ``RFPOPolicy``.
     Rollout callers use ``torch.no_grad()`` around velocity evaluation; actor
@@ -70,6 +67,8 @@ class RFPOBackboneAdapter:
     """
 
     def __init__(self, model: Pi0Eval):
+        if not hasattr(model, "state_proj"):
+            raise ValueError("RFPO requires a pi backbone that exposes state_proj.")
         self.model = model
 
     @property
@@ -93,14 +92,14 @@ class RFPOBackboneAdapter:
         return self.model.llm.configs[0].width
 
     @property
-    def action_feature_dim(self) -> int:
-        """Action expert feature width for small model construction."""
-        return self.model.action_out_proj.in_features
+    def suffix_dim(self) -> int:
+        """pi suffix token width (state + action + time) for small model construction."""
+        return self.model.state_proj.out_features
 
     @property
     def state_dim(self) -> int:
-        """Normalized, padded state width."""
-        return self.model.action_dim
+        """pi state embedding width for small model construction."""
+        return self.model.state_proj.out_features
 
     @torch.no_grad()
     def preprocess(self, env_obs: dict[str, Any]) -> Observation:
@@ -146,14 +145,37 @@ class RFPOBackboneAdapter:
     def encode_condition(self, observation: Observation) -> RFPOCondition:
         """Encode a preprocessed observation once and retain its actual prefix mask."""
         tokens, mask, kv_cache = self.model.build_prefix_cache(observation)
-        return RFPOCondition(observation, tokens, mask, kv_cache)
+        state_dtype = self.model.state_proj.weight.dtype
+        state_embedding = self.model.state_proj(
+            observation.state.to(dtype=state_dtype)
+        )[:, None]
+        return RFPOCondition(observation, tokens, mask, kv_cache, state_embedding)
+
+    def embed_suffix(
+        self,
+        condition: RFPOCondition,
+        noisy_actions: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return pi's input suffix embedding (state + action + time tokens).
+
+        Inputs have shapes ``[B, *action_shape]`` and ``[B]``. The residual
+        actor consumes this pre-attention embedding; pi is frozen, so any
+        gradient reaching it stops at the actor's own projection.
+        """
+        device = condition.observation.state.device
+        return self.model.embed_suffix(
+            condition.observation,
+            noisy_actions.to(device=device, dtype=torch.float32),
+            timestep.to(device=device, dtype=torch.float32),
+        )[0]
 
     def velocity(
         self,
         condition: RFPOCondition,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> RFPOVelocity:
+    ) -> torch.Tensor:
         """Evaluate v(x_t, t) without a sampler or an input-gradient barrier.
 
         Inputs have shapes ``[B, *action_shape]`` and ``[B]``. OpenPI owns suffix
@@ -168,9 +190,7 @@ class RFPOBackboneAdapter:
             condition.kv_cache,
             condition.mask,
         )
-        return RFPOVelocity(
-            self.model.velocity_from_suffix(action_features), action_features
-        )
+        return self.model.velocity_from_suffix(action_features)
 
     @torch.no_grad()
     def decode_actions(

@@ -149,17 +149,17 @@ class RFPOSampler:
         active_step_mask = torch.zeros(num_steps, dtype=torch.bool, device=device)
         for step in range(num_steps):
             timestep = torch.full((batch_size,), t, device=device, dtype=torch.float32)
-            base = adapter.velocity(condition, x_t, timestep)
-            velocity = base.velocity
+            base_velocity = adapter.velocity(condition, x_t, timestep)
+            velocity = base_velocity
             output = None
             if not force_zero_residual and step in self.active_step_indices:
+                suffix_embedding = adapter.embed_suffix(condition, x_t, timestep)
                 output = actor(
                     velocity[:, :chunk, :action_dim],
                     timestep,
-                    action_features=base.action_features[:, :chunk],
+                    suffix_embedding=suffix_embedding[:, : chunk + 1],
                     condition_tokens=condition.tokens,
                     condition_mask=condition.mask,
-                    state=condition.observation.state,
                     deterministic=deterministic,
                     noise=None if residual_noise is None else residual_noise[step],
                 )
@@ -179,7 +179,7 @@ class RFPOSampler:
             # step, while the delta family only exists where pi is guided.
             if collect_step_stats:
                 with torch.no_grad():
-                    active_base = base.velocity[:, :chunk, :action_dim]
+                    active_base = base_velocity[:, :chunk, :action_dim]
                     base_velocity_steps.append(group_rms(active_base))
                     if output is None:
                         zero_group_rms = torch.zeros(
