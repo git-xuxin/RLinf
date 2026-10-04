@@ -121,8 +121,8 @@ class RFPOSampler:
                 "Residual step indices must fit the positive pi step count."
             )
 
-        batch_size = condition.observation.state.shape[0]
-        device = condition.observation.state.device
+        batch_size = condition.tokens.shape[0]
+        device = condition.tokens.device
         shape = (batch_size, horizon, model_dim)
         if noise is None:
             noise = torch.randn(shape, device=device, dtype=torch.float32)
@@ -157,7 +157,9 @@ class RFPOSampler:
                 output = actor(
                     velocity[:, :chunk, :action_dim],
                     timestep,
-                    suffix_embedding=suffix_embedding[:, : chunk + 1],
+                    suffix_embedding=suffix_embedding[
+                        :, : chunk + int(adapter.suffix_has_state)
+                    ],
                     condition_tokens=condition.tokens,
                     condition_mask=condition.mask,
                     deterministic=deterministic,

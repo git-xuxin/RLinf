@@ -98,9 +98,11 @@ class RFPOActor(nn.Module):
         action_dim: int,
         suffix_dim: int,
         condition_dim: int,
+        suffix_has_state: bool = True,
     ) -> None:
         super().__init__()
         self.cfg = RFPOActorConfig(**cfg)
+        self.suffix_has_state = suffix_has_state
         width = self.cfg.hidden_size
         # The three projections are intentionally separate: they adapt distinct
         # token sources (residual region, pi's suffix input, pi's prefix cache).
@@ -161,14 +163,15 @@ class RFPOActor(nn.Module):
         condition_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch_size, action_chunk = base_velocity.shape[:2]
+        suffix_length = action_chunk + int(self.suffix_has_state)
         if suffix_embedding.shape != (
             batch_size,
-            action_chunk + 1,
+            suffix_length,
             self.suffix_input.in_features,
         ):
             raise ValueError(
                 "RFPO suffix embedding must have shape "
-                f"[B, {action_chunk + 1}, {self.suffix_input.in_features}], got "
+                f"[B, {suffix_length}, {self.suffix_input.in_features}], got "
                 f"{tuple(suffix_embedding.shape)}."
             )
         dtype = self.velocity_input.weight.dtype
@@ -184,7 +187,7 @@ class RFPOActor(nn.Module):
         suffix_tokens = (
             suffix_tokens
             + _position_embedding(
-                action_chunk + 1, self.cfg.hidden_size, suffix_embedding.device
+                suffix_length, self.cfg.hidden_size, suffix_embedding.device
             ).to(dtype=dtype)[None]
         )
         queries = torch.cat(
@@ -220,8 +223,9 @@ class RFPOActor(nn.Module):
         """Return a reparameterized residual and elementwise Gaussian log probability.
 
         Velocity and outputs have shape [B, C, A]. The suffix embedding is
-        pi's input suffix token sequence [B, C+1, E] (state, then action+time
-        tokens); prefix tokens/mask use their actual length. All distribution
+        pi's input suffix: [B, C+1, E] for Pi0 (state, then action+time) or
+        [B, C, E] for Pi05 (actions only). Prefix tokens/mask use their actual
+        length. The DiT timestep condition is shared by both variants. Distribution
         calculations use float32; log probability is unreduced.
         Optional standard-normal noise has shape [B, C, A]; eval ignores it.
         """

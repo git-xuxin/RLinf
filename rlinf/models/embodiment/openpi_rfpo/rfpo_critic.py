@@ -31,12 +31,14 @@ class RFPOQNetwork(nn.Module):
         *,
         action_dim: int,
         condition_dim: int,
-        state_dim: int,
+        state_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.action_proj = nn.Linear(action_dim, cfg.hidden_size)
         self.condition_proj = nn.Linear(condition_dim, cfg.hidden_size)
-        self.state_proj = nn.Linear(state_dim, cfg.hidden_size)
+        self.state_proj = (
+            nn.Linear(state_dim, cfg.hidden_size) if state_dim is not None else None
+        )
         self.value_token = nn.Parameter(torch.empty(1, 1, cfg.hidden_size))
 
         config = Gemma3TextConfig(
@@ -84,29 +86,38 @@ class RFPOQNetwork(nn.Module):
         *,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor,
-        state_embedding: torch.Tensor,
+        state_embedding: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return [B, 1] Q values; retain gradients through normalized actions.
 
-        ``state_embedding`` is pi's ``state_proj`` output with shape [B, 1, S].
+        Pi0 requires ``state_embedding`` with shape [B, 1, S]. Pi05 uses
+        prefix conditioning only and does not construct a state projection.
         """
         batch_size, action_chunk = actions.shape[:2]
         dtype = self.action_proj.weight.dtype
-        if state_embedding.shape != (batch_size, 1, self.state_proj.in_features):
-            raise ValueError(
-                "RFPO critic state embedding must have shape [B, 1, "
-                f"{self.state_proj.in_features}], got {tuple(state_embedding.shape)}."
+        token_parts = [
+            self.action_proj(actions.to(dtype=dtype)),
+            self.condition_proj(condition_tokens.detach().to(dtype=dtype)),
+        ]
+        if self.state_proj is not None:
+            if state_embedding is None or state_embedding.shape != (
+                batch_size,
+                1,
+                self.state_proj.in_features,
+            ):
+                raise ValueError(
+                    "RFPO critic state embedding must have shape [B, 1, "
+                    f"{self.state_proj.in_features}], got "
+                    f"{None if state_embedding is None else tuple(state_embedding.shape)}."
+                )
+            token_parts.append(
+                self.state_proj(state_embedding.detach().to(dtype=dtype))
             )
-        tokens = torch.cat(
-            [
-                self.action_proj(actions.to(dtype=dtype)),
-                self.condition_proj(condition_tokens.detach().to(dtype=dtype)),
-                self.state_proj(state_embedding.detach().to(dtype=dtype)),
-                self.value_token.expand(batch_size, -1, -1),
-            ],
-            dim=1,
-        )
+        elif state_embedding is not None:
+            raise ValueError("RFPO Pi05 critic takes state only through prefix tokens.")
+        token_parts.append(self.value_token.expand(batch_size, -1, -1))
+        tokens = torch.cat(token_parts, dim=1)
         if action_mask is None:
             action_mask = torch.ones(
                 (batch_size, action_chunk), dtype=torch.bool, device=actions.device
@@ -115,7 +126,11 @@ class RFPOQNetwork(nn.Module):
             [
                 action_mask.to(device=actions.device, dtype=torch.bool),
                 condition_mask.to(device=actions.device, dtype=torch.bool),
-                torch.ones((batch_size, 2), dtype=torch.bool, device=actions.device),
+                torch.ones(
+                    (batch_size, 1 + int(self.state_proj is not None)),
+                    dtype=torch.bool,
+                    device=actions.device,
+                ),
             ],
             dim=1,
         )
@@ -142,7 +157,7 @@ class RFPOCritic(nn.Module):
         *,
         action_dim: int,
         condition_dim: int,
-        state_dim: int,
+        state_dim: int | None = None,
     ) -> None:
         super().__init__()
         self.cfg = RFPOCriticConfig(**cfg)
@@ -162,7 +177,7 @@ class RFPOCritic(nn.Module):
         *,
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor,
-        state_embedding: torch.Tensor,
+        state_embedding: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return [B, num_q_heads] without reducing the independent Q estimates."""

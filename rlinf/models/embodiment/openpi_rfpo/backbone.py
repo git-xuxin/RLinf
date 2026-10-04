@@ -47,15 +47,15 @@ def load_backbone_model(cfg: DictConfig, device: torch.device | str) -> Pi0Eval:
 class RFPOCondition:
     """Prepared observation and frozen prefix/state features/cache for one batch.
 
-    ``state_embedding`` is pi's ``state_proj`` output ``[B, 1, S]``; the critic
-    consumes it instead of the raw normalized state.
+    For Pi0, ``state_embedding`` is ``state_proj`` output ``[B, 1, S]``.
+    Pi05 carries any state conditioning in the prefix and leaves it absent.
     """
 
     observation: Observation
     tokens: torch.Tensor
     mask: torch.Tensor
     kv_cache: tuple
-    state_embedding: torch.Tensor
+    state_embedding: torch.Tensor | None = None
 
 
 class RFPOBackboneAdapter:
@@ -67,8 +67,6 @@ class RFPOBackboneAdapter:
     """
 
     def __init__(self, model: Pi0Eval):
-        if not hasattr(model, "state_proj"):
-            raise ValueError("RFPO requires a pi backbone that exposes state_proj.")
         self.model = model
 
     @property
@@ -93,13 +91,18 @@ class RFPOBackboneAdapter:
 
     @property
     def suffix_dim(self) -> int:
-        """pi suffix token width (state + action + time) for small model construction."""
-        return self.model.state_proj.out_features
+        """pi action-expert token width for small model construction."""
+        return self.model.action_in_proj.out_features
 
     @property
-    def state_dim(self) -> int:
-        """pi state embedding width for small model construction."""
-        return self.model.state_proj.out_features
+    def suffix_has_state(self) -> bool:
+        """Whether pi prepends a continuous state token to its action tokens."""
+        return not self.model.pi05
+
+    @property
+    def state_dim(self) -> int | None:
+        """Continuous state embedding width, absent for Pi05."""
+        return self.model.state_proj.out_features if self.suffix_has_state else None
 
     @torch.no_grad()
     def preprocess(self, env_obs: dict[str, Any]) -> Observation:
@@ -145,10 +148,12 @@ class RFPOBackboneAdapter:
     def encode_condition(self, observation: Observation) -> RFPOCondition:
         """Encode a preprocessed observation once and retain its actual prefix mask."""
         tokens, mask, kv_cache = self.model.build_prefix_cache(observation)
-        state_dtype = self.model.state_proj.weight.dtype
-        state_embedding = self.model.state_proj(
-            observation.state.to(dtype=state_dtype)
-        )[:, None]
+        state_embedding = None
+        if self.suffix_has_state:
+            state_dtype = self.model.state_proj.weight.dtype
+            state_embedding = self.model.state_proj(
+                observation.state.to(dtype=state_dtype)
+            )[:, None]
         return RFPOCondition(observation, tokens, mask, kv_cache, state_embedding)
 
     def embed_suffix(
@@ -157,13 +162,15 @@ class RFPOBackboneAdapter:
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
     ) -> torch.Tensor:
-        """Return pi's input suffix embedding (state + action + time tokens).
+        """Return pi's input suffix embedding before attention.
 
         Inputs have shapes ``[B, *action_shape]`` and ``[B]``. The residual
-        actor consumes this pre-attention embedding; pi is frozen, so any
-        gradient reaching it stops at the actor's own projection.
+        actor receives Pi0's state and time-mixed action tokens or Pi05's
+        action-only tokens. Pi05's separate AdaRMS time condition is used by
+        ``velocity``, not added to these tokens. Frozen projections retain
+        gradients with respect to noisy actions during actor training.
         """
-        device = condition.observation.state.device
+        device = condition.tokens.device
         return self.model.embed_suffix(
             condition.observation,
             noisy_actions.to(device=device, dtype=torch.float32),
@@ -182,7 +189,7 @@ class RFPOBackboneAdapter:
         layout/masking, including whether it contains a state token. Integration
         uses ``x_next = x_t + dt * (velocity + residual_velocity)``, with dt < 0.
         """
-        device = condition.observation.state.device
+        device = condition.tokens.device
         action_features = self.model.run_suffix(
             condition.observation,
             noisy_actions.to(device=device, dtype=torch.float32),
