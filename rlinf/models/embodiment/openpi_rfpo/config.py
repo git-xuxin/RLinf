@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Network and Gaussian settings for the RFPO small actor and critic."""
+"""RFPO network and residual Gaussian settings."""
 
 from dataclasses import dataclass
 
@@ -61,7 +61,7 @@ class RFPOActorConfig(_RFPOTransformerConfig):
 
 @dataclass(frozen=True)
 class RFPOCriticConfig(_RFPOTransformerConfig):
-    """Gemma3-style critic architecture with multi-head attention."""
+    """Configuration for the ensemble of Gemma3 Q networks."""
 
     hidden_size: int = 384
     num_hidden_layers: int = 3

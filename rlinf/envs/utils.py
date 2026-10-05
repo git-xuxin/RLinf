@@ -121,19 +121,9 @@ def to_tensor(
 def zero_rewards_after_first_success(
     rewards: torch.Tensor, successes: torch.Tensor
 ) -> torch.Tensor:
-    """Zero rewards strictly after the first success in each action chunk.
+    """Zero rewards after each chunk's first success, keeping the success reward.
 
-    Args:
-        rewards: Per-step rewards with the action-chunk dimension last.
-        successes: Boolean success indicators with the same shape as ``rewards``.
-
-    Returns:
-        A copy preserving rewards through the first success, or all rewards if
-        there is no success. Each call treats chunks independently; no success
-        state carries over from a previous chunk. Dtype and device are preserved.
-
-    Raises:
-        ValueError: If the shapes differ or there is no action-chunk dimension.
+    Inputs share shape [..., chunk_steps]; chunks are processed independently.
     """
     if rewards.shape != successes.shape:
         raise ValueError(

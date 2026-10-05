@@ -6,9 +6,9 @@ action_dim: 7
 
 sampler:
   rfpo_action_chunk: ${..num_action_chunks}
-  active_step_indices: [0, 1, 2]  # support [0, 1, 2, 3]
+  active_step_indices: [0, 1, 2]  # Zero-based pi denoising steps with residual guidance.
 
-# Small networks only; the worker loads pi from rfpo_backbone_model.
+# Trainable networks; each worker loads frozen pi from rfpo_backbone_model.
 actor:
   hidden_size: 256
   num_dit_blocks: 3

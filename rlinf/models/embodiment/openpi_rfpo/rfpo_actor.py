@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DiT blocks modified for RFPO residual velocities and OpenPI conditioning."""
+"""DiT residual velocity actor conditioned on frozen OpenPI features."""
 
 import math
 
@@ -89,7 +89,7 @@ class RFPODiTBlock(nn.Module):
 
 
 class RFPOActor(nn.Module):
-    """Condition decoder and DiT over a caller-selected action region."""
+    """Predict Gaussian residual velocities for the guided action chunk."""
 
     def __init__(
         self,
@@ -104,8 +104,6 @@ class RFPOActor(nn.Module):
         self.cfg = RFPOActorConfig(**cfg)
         self.suffix_has_state = suffix_has_state
         width = self.cfg.hidden_size
-        # The three projections are intentionally separate: they adapt distinct
-        # token sources (residual region, pi's suffix input, pi's prefix cache).
         self.velocity_input = nn.Linear(action_dim, width)
         self.suffix_input = nn.Linear(suffix_dim, width)
         self.condition_input = nn.Linear(condition_dim, width)
@@ -130,7 +128,7 @@ class RFPOActor(nn.Module):
         self.final_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
         self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, 2 * width))
         self.mean_head = nn.Linear(width, action_dim)
-        # Independent of DiT; shared across states and action positions.
+        # One log std per action dimension, shared across observations and steps.
         self.log_std = nn.Parameter(
             torch.full((1, 1, action_dim), self.cfg.init_log_std, dtype=torch.float32)
         )
@@ -201,6 +199,7 @@ class RFPOActor(nn.Module):
                 device=memory.device, dtype=torch.bool
             ),
         )
+        # The CLS token summarizes suffix and prefix features for DiT conditioning.
         condition = decoded[:, -1] + self.timestep_embedder(timestep)
         for block in self.blocks:
             velocity_tokens = block(velocity_tokens, condition)
@@ -220,15 +219,7 @@ class RFPOActor(nn.Module):
         deterministic: bool = False,
         noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Return a reparameterized residual and elementwise Gaussian log probability.
-
-        Velocity and outputs have shape [B, C, A]. The suffix embedding is
-        pi's input suffix: [B, C+1, E] for Pi0 (state, then action+time) or
-        [B, C, E] for Pi05 (actions only). Prefix tokens/mask use their actual
-        length. The DiT timestep condition is shared by both variants. Distribution
-        calculations use float32; log probability is unreduced.
-        Optional standard-normal noise has shape [B, C, A]; eval ignores it.
-        """
+        """Return Gaussian residuals and distribution statistics [B, C, A]."""
         mean = self._predict_mean(
             base_velocity,
             timestep,

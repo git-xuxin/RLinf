@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen OpenPI loading and RFPO's boundary to the pi denoising model."""
+"""Frozen OpenPI features and velocities for RFPO denoising."""
 
 from dataclasses import dataclass
 from typing import Any
@@ -30,11 +30,7 @@ from rlinf.models.embodiment.openpi.transforms.env import repack_env_obs
 
 
 def load_backbone_model(cfg: DictConfig, device: torch.device | str) -> Pi0Eval:
-    """Load one worker's pi with the existing eval loader and freeze every parameter.
-
-    Pass ``actor.rfpo_backbone_model`` or ``rollout.rfpo_backbone_model``.
-    Device placement preserves the loader's selective bf16/fp32 parameter dtypes.
-    """
+    """Load frozen pi while preserving OpenPI's parameter dtypes."""
     if cfg.openpi.task != "eval":
         raise ValueError("RFPO backbone loading requires openpi.task='eval' (ODE).")
     model = get_model(cfg)
@@ -45,10 +41,9 @@ def load_backbone_model(cfg: DictConfig, device: torch.device | str) -> Pi0Eval:
 
 @dataclass
 class RFPOCondition:
-    """Prepared observation and frozen prefix/state features/cache for one batch.
+    """Observation, frozen prefix features, and KV cache for one batch.
 
-    For Pi0, ``state_embedding`` is ``state_proj`` output ``[B, 1, S]``.
-    Pi05 carries any state conditioning in the prefix and leaves it absent.
+    ``state_embedding`` is Pi0's projected state [B, 1, S], or None for Pi05.
     """
 
     observation: Observation
@@ -59,12 +54,7 @@ class RFPOCondition:
 
 
 class RFPOBackboneAdapter:
-    """Expose pi preprocessing, condition/suffix encoding, velocity, and decoding.
-
-    The worker owns this adapter and its model separately from ``RFPOPolicy``.
-    Rollout callers use ``torch.no_grad()`` around velocity evaluation; actor
-    callers may differentiate it with respect to the current noisy actions.
-    """
+    """Worker-owned frozen pi adapter with action gradients for actor training."""
 
     def __init__(self, model: Pi0Eval):
         self.model = model
@@ -91,7 +81,7 @@ class RFPOBackboneAdapter:
 
     @property
     def suffix_dim(self) -> int:
-        """pi action-expert token width for small model construction."""
+        """Pi action-expert token width for the residual actor."""
         return self.model.action_in_proj.out_features
 
     @property
@@ -114,13 +104,7 @@ class RFPOBackboneAdapter:
     def prepare_observation(
         self, env_obs: dict[str, Any]
     ) -> tuple[Observation, dict[str, torch.Tensor]]:
-        """Return the rollout pi input and its independently owned replay tensors.
-
-        Call before stepping/resetting the environment. Store the returned raw
-        observation and real prompt tokens in ``PolicyPart.obs`` or
-        ``EnvPart.next_obs``; each side of a transition owns its language input.
-        This only preprocesses observations, without evaluating pi.
-        """
+        """Return pi input and raw CPU replay observations with prompt tokens."""
         repacked = repack_env_obs(
             self.model.config_name,
             env_obs,
@@ -139,14 +123,14 @@ class RFPOBackboneAdapter:
 
     @torch.no_grad()
     def preprocess_replay(self, replay_obs: dict[str, torch.Tensor]) -> Observation:
-        """Rebuild pi input through placeholder tokenization and real-token override."""
+        """Normalize replay observations while preserving stored prompt tokens."""
         processed = self.model.input_transform(replay_obs, transpose=False)
         observation = self.model._observation_dict_to_device(processed)
         return preprocess_observation(observation, train=False)
 
     @torch.no_grad()
     def encode_condition(self, observation: Observation) -> RFPOCondition:
-        """Encode a preprocessed observation once and retain its actual prefix mask."""
+        """Cache prefix features, their validity mask, and optional Pi0 state."""
         tokens, mask, kv_cache = self.model.build_prefix_cache(observation)
         state_embedding = None
         if self.suffix_has_state:
@@ -162,14 +146,7 @@ class RFPOBackboneAdapter:
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
     ) -> torch.Tensor:
-        """Return pi's input suffix embedding before attention.
-
-        Inputs have shapes ``[B, *action_shape]`` and ``[B]``. The residual
-        actor receives Pi0's state and time-mixed action tokens or Pi05's
-        action-only tokens. Pi05's separate AdaRMS time condition is used by
-        ``velocity``, not added to these tokens. Frozen projections retain
-        gradients with respect to noisy actions during actor training.
-        """
+        """Return pre-attention tokens: Pi0 state/action-time or Pi05 actions."""
         device = condition.tokens.device
         return self.model.embed_suffix(
             condition.observation,
@@ -183,12 +160,7 @@ class RFPOBackboneAdapter:
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
     ) -> torch.Tensor:
-        """Evaluate v(x_t, t) without a sampler or an input-gradient barrier.
-
-        Inputs have shapes ``[B, *action_shape]`` and ``[B]``. OpenPI owns suffix
-        layout/masking, including whether it contains a state token. Integration
-        uses ``x_next = x_t + dt * (velocity + residual_velocity)``, with dt < 0.
-        """
+        """Evaluate frozen pi velocity while retaining noisy-action gradients."""
         device = condition.tokens.device
         action_features = self.model.run_suffix(
             condition.observation,
@@ -203,9 +175,5 @@ class RFPOBackboneAdapter:
     def decode_actions(
         self, model_actions: torch.Tensor, condition: RFPOCondition
     ) -> torch.Tensor:
-        """Unnormalize and decode a full denoised chunk into environment actions.
-
-        This environment boundary uses the loader's output transforms and does
-        not preserve action gradients. Critic training uses model-space actions.
-        """
+        """Decode model-space actions for the environment without gradients."""
         return self.model.decode_actions(model_actions, condition.observation.state)

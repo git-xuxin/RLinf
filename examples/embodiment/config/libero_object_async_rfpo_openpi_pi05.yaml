@@ -42,13 +42,13 @@ algorithm:
   loss_agg_func: token-mean
   update_epoch: 8
   critic_actor_ratio: 2
-  train_actor_steps: 40  # minimum replay trajectories before actor updates
+  train_actor_steps: 40  # Replay trajectory threshold per rank for actor updates.
   bootstrap_type: standard
   gamma: 0.99
   critic_subsample_size: 2
   tau: 0.05
 
-  # Penalize the raw actor mean per action group to bound each delta velocity.
+  # L2 weights for residual means, averaged over guided steps and action positions.
   raw_mean_l2_coefficients:
     translation: 1.0e-3
     rotation: 1.0e-3

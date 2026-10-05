@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RFPO-specific Gemma3 critic with continuous inputs and bidirectional MHA."""
+"""RFPO Q ensemble with continuous inputs and bidirectional Gemma3 attention."""
 
 import torch
 from omegaconf import DictConfig
@@ -89,10 +89,9 @@ class RFPOQNetwork(nn.Module):
         state_embedding: torch.Tensor | None = None,
         action_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return [B, 1] Q values; retain gradients through normalized actions.
+        """Score normalized action chunks [B, C, A] and return Q values [B, 1].
 
-        Pi0 requires ``state_embedding`` with shape [B, 1, S]. Pi05 uses
-        prefix conditioning only and does not construct a state projection.
+        Retain action gradients; Pi0 also takes projected state [B, 1, S].
         """
         batch_size, action_chunk = actions.shape[:2]
         dtype = self.action_proj.weight.dtype
@@ -140,7 +139,7 @@ class RFPOQNetwork(nn.Module):
         ).masked_fill(~valid_mask[:, None, None, :], torch.finfo(dtype).min)
         hidden = self.transformer(
             inputs_embeds=tokens,
-            # A mask mapping bypasses Gemma3's causal-mask construction.
+            # Supply a padding-only mask to allow bidirectional attention.
             attention_mask={"full_attention": attention_mask},
             position_ids=position_ids,
             use_cache=False,
@@ -149,7 +148,7 @@ class RFPOQNetwork(nn.Module):
 
 
 class RFPOCritic(nn.Module):
-    """Ensemble of independent Gemma3-style Q networks for RFPO."""
+    """Ensemble of independent Gemma3 Q networks for RFPO."""
 
     def __init__(
         self,

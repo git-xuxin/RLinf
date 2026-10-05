@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Container for RFPO trainable networks, owned separately from pi."""
+"""RFPO actor and critic with residual-guided action sampling."""
 
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 
 class RFPOPolicy(nn.Module):
-    """Own only the small actor and critic, including both in weight synchronization."""
+    """Trainable residual actor and critic; the worker owns the frozen pi model."""
 
     def __init__(
         self, actor: RFPOActor, critic: RFPOCritic, sampler: RFPOSampler
@@ -47,7 +47,7 @@ class RFPOPolicy(nn.Module):
         adapter: "RFPOBackboneAdapter",
         mode: Literal["train", "eval"] = "train",
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Decode an environment chunk and retain its model-space replay action."""
+        """Return decoded environment actions and normalized replay actions."""
         observation, replay_obs = adapter.prepare_observation(env_obs)
         condition = adapter.encode_condition(observation)
         output = self(
@@ -65,6 +65,7 @@ class RFPOPolicy(nn.Module):
     def forward(
         self, *, component: Literal["actor", "critic"], **kwargs
     ) -> torch.Tensor | dict[str, torch.Tensor | RFPOStepStats | None]:
+        """Dispatch action sampling or Q-value evaluation."""
         if component == "actor":
             return self._sample_actions(**kwargs)
         if component == "critic":
@@ -84,7 +85,6 @@ class RFPOPolicy(nn.Module):
     ) -> dict[str, torch.Tensor | RFPOStepStats | None]:
         if mode not in ("train", "target", "rollout", "eval"):
             raise ValueError(f"Unknown RFPO sampling mode: {mode!r}")
-        # Target actions come from the online actor, as in SAC/RLPD.
         with torch.set_grad_enabled(mode == "train" and torch.is_grad_enabled()):
             model_actions, step_stats, raw_mean_group_mse = self.sampler.sample(
                 self.actor,
@@ -100,6 +100,7 @@ class RFPOPolicy(nn.Module):
             return {
                 "model_actions": model_actions,
                 "actions": model_actions[:, :chunk, :action_dim],
+                # Residual log probabilities are not final-action log probabilities.
                 "log_prob": None,
                 "step_stats": step_stats,
                 "raw_mean_group_mse": raw_mean_group_mse,

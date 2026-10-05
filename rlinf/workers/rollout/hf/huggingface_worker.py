@@ -162,6 +162,7 @@ class MultiStepRolloutWorker(Worker):
 
         rfpo_backbone_config = self.cfg.rollout.get("rfpo_backbone_model")
         if rfpo_backbone_config is not None:
+            # The frozen backbone is separate from the synchronized RFPO policy.
             from rlinf.models.embodiment.openpi_rfpo import build_model_config
             from rlinf.models.embodiment.openpi_rfpo.backbone import (
                 RFPOBackboneAdapter,
@@ -755,6 +756,7 @@ class MultiStepRolloutWorker(Worker):
         next_obs = env_part.next_obs if env_part.next_obs is not None else policy_obs
         final_prev_values = None
         if self.rfpo_adapter is not None and next_obs is not None:
+            # Preserve next_obs's own prompt tokens, including terminal observations.
             _, next_obs = self.rfpo_adapter.prepare_observation(next_obs)
         # Terminal inference contributes values or transition features only.
         if env_part.requires_inference and self.rfpo_adapter is None:

@@ -983,6 +983,7 @@ class LiberoEnv(gym.Env):
         )  # [num_envs, chunk_steps]
 
         if self.use_only_first_success:
+            # Keep the first success reward before collapsing terminations to chunk end.
             chunk_rewards = zero_rewards_after_first_success(
                 chunk_rewards, raw_chunk_terminations
             )

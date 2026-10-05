@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RFPO small policy factory; the worker loads OpenPI separately."""
+"""RFPO actor-critic factory; the worker loads frozen OpenPI separately."""
 
 import copy
 from typing import TYPE_CHECKING
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 
 def build_model_config(cfg: DictConfig, adapter: "RFPOBackboneAdapter") -> DictConfig:
-    """Copy the small-model config with input dimensions from this worker's pi."""
+    """Copy the RFPO config and set input dimensions from the loaded pi model."""
     model_config = copy.deepcopy(cfg)
     with open_dict(model_config):
         model_config.input_dims = {
@@ -47,7 +47,7 @@ def get_model(
     cfg: DictConfig,
     torch_dtype: torch.dtype | None = None,
 ) -> RFPOPolicy:
-    """Build the small policy from a config prepared by ``build_model_config``."""
+    """Build the RFPO policy from a config prepared by ``build_model_config``."""
     dims = cfg.input_dims
     model = RFPOPolicy(
         RFPOActor(

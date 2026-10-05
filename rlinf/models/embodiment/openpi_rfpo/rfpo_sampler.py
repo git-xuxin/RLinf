@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared residual-velocity Euler sampler, called inside RFPOPolicy.forward."""
+"""Euler denoising with learned residual velocities."""
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -36,17 +36,9 @@ if TYPE_CHECKING:
 def compute_raw_mean_l2(
     raw_mean_group_mse: torch.Tensor, coefficients: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Reduce the per-guided-step raw-mean group MSE into an actor-loss term.
+    """Return weighted L2 loss, group MSE, and weighted group terms.
 
-    ``raw_mean_group_mse`` is ``RFPOSampler.sample``'s third return value:
-    [steps, batch, groups], with one ``group_mean_square`` row per step where
-    the residual actor ran. ``coefficients`` holds one non-negative weight per
-    action group in translation, rotation, gripper order. Each group's MSE
-    averages over the guided steps and the batch, so the penalty stays
-    comparable across runs; the total sums the weighted group terms.
-
-    Returns the scalar loss, the unweighted group MSE [groups], and the
-    weighted group terms [groups].
+    Average [guided_steps, batch, 3] over steps and batch before weighting.
     """
     group_count = len(RFPO_ACTION_GROUPS)
     if raw_mean_group_mse.ndim != 3 or raw_mean_group_mse.shape[-1] != group_count:
@@ -72,7 +64,7 @@ def compute_raw_mean_l2(
 
 @dataclass(frozen=True)
 class RFPOSampler:
-    """Integrate full pi actions while controlling a selected environment region."""
+    """Add residual velocities on selected denoising steps and action positions."""
 
     rfpo_action_chunk: int = 20
     active_step_indices: tuple[int, ...] = (0, 1, 2)
@@ -89,20 +81,10 @@ class RFPOSampler:
         force_zero_residual: bool = False,
         collect_step_stats: bool = False,
     ) -> tuple[torch.Tensor, RFPOStepStats | None, torch.Tensor]:
-        """Return final actions [B, H, D] with optional denoising diagnostics.
+        """Return model actions, optional step statistics, and residual-mean group MSE.
 
-        ``noise`` is the initial [B, H, D] standard-normal sample. Optional
-        ``residual_noise`` is [N, B, C, A], indexed by the absolute denoising
-        step, including inactive steps. C is rfpo_action_chunk and A is the
-        adapter's environment action width. Neither noise tensor is modified.
-        The caller controls autograd and whether to use residual means.
-
-        With ``collect_step_stats`` the second return value holds per-sample
-        per-step diagnostics under ``no_grad`` (``None`` otherwise); the caller
-        owns their reduction and logging. The third return value is the
-        raw-mean group MSE [guided_steps, B, groups] of the actor mean on
-        every guided step, ordered by step; it stays in the autograd graph,
-        and ``compute_raw_mean_l2`` turns it into the actor-loss penalty.
+        Residual noise [steps, batch, chunk, action_dim] uses absolute step indices.
+        Deterministic mode uses residual means; omitted initial noise is sampled.
         """
         horizon, model_dim = adapter.action_shape
         env_chunk, action_dim = adapter.env_action_shape
@@ -137,6 +119,7 @@ class RFPOSampler:
             raise ValueError("Residual noise must have shape [N, B, C, A].")
 
         x_t = noise.to(device=device, dtype=torch.float32)
+        # Integrate from t=1 (noise) to t=0 (actions).
         dt = -1.0 / num_steps
         t = 1.0
         base_velocity_steps: list[torch.Tensor] = []
@@ -165,20 +148,17 @@ class RFPOSampler:
                     deterministic=deterministic,
                     noise=None if residual_noise is None else residual_noise[step],
                 )
+                # Add residuals only to the guided chunk's environment dimensions.
                 residual = F.pad(
                     output["delta_velocity"],
                     (0, model_dim - action_dim, 0, horizon - chunk),
                 )
                 velocity = velocity + residual
-                # The mean head is linear, so the actor mean is already the raw
-                # mean that raw_mean_l2 penalties regularize; keep its group MSE
-                # per guided step in the autograd graph for the actor loss.
+                # Regularize the unsquashed mean, preserving its training graph.
                 raw_mean_group_mse_steps.append(group_mean_square(output["mean"]))
             x_t = x_t + dt * velocity
             t += dt
 
-            # Diagnostics: the base field and noisy action exist on every
-            # step, while the delta family only exists where pi is guided.
             if collect_step_stats:
                 with torch.no_grad():
                     active_base = base_velocity[:, :chunk, :action_dim]

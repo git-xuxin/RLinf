@@ -30,12 +30,9 @@ _ACTION_WIDTH = RFPO_ACTION_GROUPS[-1][1].stop
 
 @dataclass(frozen=True)
 class RFPOStepStats:
-    """Per-sample denoising diagnostics with the denoise-step axis first.
+    """Per-step group statistics [steps, batch, groups].
 
-    Grouped tensors have shape [steps, batch, groups] in translation,
-    rotation, gripper order; the action-noise mean has shape
-    [steps, batch, action_dim]. Delta-family rows are zero on steps where the
-    residual actor did not run; ``active_step_mask`` flags those steps.
+    Action means use [steps, batch, action_dim]; inactive deltas are zero.
     """
 
     base_velocity_group_rms: torch.Tensor
@@ -43,7 +40,7 @@ class RFPOStepStats:
     delta_log_std_group_rms: torch.Tensor
     delta_parallel_group_rms: torch.Tensor
     delta_vertical_group_rms: torch.Tensor
-    action_noise_dim_mean: torch.Tensor
+    action_noise_dim_mean: torch.Tensor  # Post-update actions averaged over positions.
     active_step_mask: torch.Tensor
 
 
@@ -56,13 +53,9 @@ def _check_action_width(values: torch.Tensor) -> None:
 
 
 def group_mean_square(values: torch.Tensor) -> torch.Tensor:
-    """Mean square per action group of the per-position group norm.
+    """Return group mean squared norms [batch, 3] from values [batch, ..., 7].
 
-    ``values`` is [batch, ..., 7]; the result is [batch, 3]. Each group sums
-    its member dimensions into one squared norm per position before the
-    position mean, so the group width never divides the result; groups with
-    different physical scales still never mix. The raw-mean L2 penalty uses
-    this reduction on the actor mean.
+    Sum squared components within each group, then average over positions.
     """
     _check_action_width(values)
     position_dims = tuple(range(1, values.ndim - 1))
@@ -76,26 +69,16 @@ def group_mean_square(values: torch.Tensor) -> torch.Tensor:
 
 
 def group_rms(values: torch.Tensor) -> torch.Tensor:
-    """Root-mean-square per action group of the per-position group norm.
-
-    Equivalent to ``group_mean_square(values).sqrt()``; see that function
-    for the reduction convention.
-    """
+    """Return the square root of each group's mean squared norm."""
     return group_mean_square(values).sqrt()
 
 
 def parallel_vertical_group_rms(
     delta_velocity: torch.Tensor, base_velocity: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-group rms of delta's scalar projection on base and its remainder.
+    """Return RMS parallel and perpendicular residual norms per action group.
 
-    Both inputs are [batch, ..., 7]; each result is [batch, 3]. Within each
-    group and position, the parallel part is the scalar projection of delta
-    onto the base unit vector and the perpendicular part is the norm of the
-    remainder, so the two results satisfy
-    ``group_rms(delta_velocity) ** 2 == parallel ** 2 + vertical ** 2`` per
-    group. A zero base direction has no projection, so the whole delta counts
-    as perpendicular.
+    A zero base assigns the whole residual to the perpendicular component.
     """
     _check_action_width(delta_velocity)
     _check_action_width(base_velocity)
@@ -108,8 +91,6 @@ def parallel_vertical_group_rms(
         delta = delta_velocity[..., group_slice].float()
         base = base_velocity[..., group_slice].float()
         base_norm = base.norm(dim=-1, keepdim=True)
-        # Clamping keeps a vanished base direction a zero unit vector instead
-        # of producing NaNs; the delta then stays entirely perpendicular.
         unit_base = base / base_norm.clamp_min(torch.finfo(base.dtype).eps)
         parallel_scalar = (delta * unit_base).sum(dim=-1)
         vertical_norm = (delta - parallel_scalar.unsqueeze(-1) * unit_base).norm(dim=-1)
@@ -124,15 +105,9 @@ def parallel_vertical_group_rms(
 
 
 def denoise_step_metrics(stats: RFPOStepStats) -> dict[str, float]:
-    """Average per-sample stats into ``denoise_step_*`` scalar metrics.
+    """Average denoising statistics; emit residual metrics only on active steps.
 
-    Velocity-family keys carry an ``_rms`` suffix and use the
-    ``denoise_step_{step}/{name}/{group}_rms`` layout. ``velocity/base`` and
-    ``action_noise`` exist on every step; the delta family only exists on
-    active steps. ``denoise_step_{step}/action_noise/dim_{dim}`` records the
-    per-dimension mean noisy action after each step's update. Callers add the
-    ``rfpo/`` namespace. Values move to the CPU once here, so the returned
-    mapping holds plain floats.
+    Group metrics average per-sample RMS values, including log std.
     """
     step_count = int(stats.active_step_mask.shape[0])
     active_steps = stats.active_step_mask.tolist()

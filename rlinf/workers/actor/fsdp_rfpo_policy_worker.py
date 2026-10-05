@@ -44,11 +44,7 @@ from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 def _parse_raw_mean_l2_coefficients(
     config: Mapping | None,
 ) -> tuple[float, float, float]:
-    """Validate ``algorithm.raw_mean_l2_coefficients`` in action-group order.
-
-    A missing mapping disables the penalty; it must otherwise name only the
-    action groups and give each a finite, non-negative weight.
-    """
+    """Parse non-negative L2 weights; missing action groups default to zero."""
     if config is None:
         return (0.0, 0.0, 0.0)
     if not isinstance(config, Mapping):
@@ -81,14 +77,12 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
     """Train the residual actor and critic while keeping pi frozen."""
 
     def init_worker(self):
-        # Load the frozen pi backbone; the small model reads it through the adapter.
+        # Load pi before model construction; it stays outside the FSDP policy.
         self.rfpo_backbone_model = load_backbone_model(
             self.cfg.actor.rfpo_backbone_model, self.device
         )
         self.rfpo_adapter = RFPOBackboneAdapter(self.rfpo_backbone_model)
-        # Build model, replay buffer and SAC components on top of the adapter.
         super().init_worker()
-        # Group-wise penalties on the actor raw mean; zeros disable the penalty.
         self.raw_mean_l2_coefficients = torch.tensor(
             _parse_raw_mean_l2_coefficients(
                 self.cfg.algorithm.get("raw_mean_l2_coefficients", None)
@@ -107,12 +101,12 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         return model
 
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
-        """Setup the small model, target critic, optimizers and schedulers."""
+        """Set up the RFPO policy, target critic, optimizers, and schedulers."""
         module = self.model_provider_func()
         if initialize_target:
             target_module = copy.deepcopy(module.critic)
 
-        # Sync the complete online small model, including persistent buffers.
+        # Sync both online networks and their persistent buffers, excluding pi.
         self.param_names_need_sync = list(module.state_dict())
 
         self.model = self._strategy.wrap_model(
@@ -160,7 +154,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     @torch.no_grad()
     def soft_update_target_model(self, tau: float | None = None) -> None:
-        """Initialize or interpolate the target critic from the online critic."""
+        """Polyak-average target critic parameters and copy online critic buffers."""
         if tau is None:
             tau = self.cfg.algorithm.tau
         for online_param, target_param in zip(
@@ -173,7 +167,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             target_buffer.copy_(online_buffer)
 
     def prepare_batch(self, batch: dict) -> dict:
-        """Rebuild both pi inputs and keep one complete normalized action chunk."""
+        """Encode current/next observations and reshape normalized replay actions."""
         chunk, action_dim = self.rfpo_adapter.env_action_shape
         return {
             **batch,
@@ -225,7 +219,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             .values
         )
 
-        # Replay rewards exclude trajectory value bootstrap; all C steps executed.
+        # Discount the full executed chunk; only terminations suppress bootstrapping.
         rewards = batch["rewards"].float()
         chunk_size = rewards.shape[-1]
         gamma = self.cfg.algorithm.gamma
@@ -240,7 +234,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     @Worker.timer("forward_critic")
     def forward_critic(self, batch: dict) -> tuple[torch.Tensor, dict]:
-        """Fit replay actions to one target; batch must come from prepare_batch."""
+        """Fit every Q network to the same target for normalized replay actions."""
         target_q_values = self.compute_target(batch)
         condition = batch["curr_condition"]
         all_data_q_values = self.model(
@@ -260,8 +254,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         }
 
     def _all_ranks_buffer_ready(self, min_size: int) -> bool:
-        """Return True only when every actor rank's replay buffer reaches min_size.
-        """
+        """Check that every actor rank has at least ``min_size`` trajectories."""
         local_ready = torch.tensor(
             [int(self.replay_buffer.is_ready(min_size))],
             device=self.device,
@@ -272,17 +265,9 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch: dict) -> tuple[torch.Tensor, None, dict, dict]:
-        """Maximize online Q and bound the raw residual mean on guided steps.
+        """Minimize negative mean Q plus the residual-mean L2 penalty.
 
-        The actor objective is the mean online Q of the current final
-        normalized action chunk. ``raw_mean_l2`` adds the coefficient-weighted
-        group MSE of the actor raw mean on every guided step, which limits how
-        far each delta velocity drifts from zero and narrows exploration;
-        all-zero coefficients add a zero term and keep the behavior unchanged.
-
-        The fourth return value carries the sampler's per-denoise-step
-        velocity diagnostics plus the raw-mean L2 group metrics, reduced to
-        scalars; the caller adds the ``rfpo/`` namespace.
+        L2 regularizes the mean only; gradients pass through frozen pi to the actor.
         """
         condition = batch["curr_condition"]
         output = self.sample_actions(condition, collect_step_stats=True)
@@ -333,7 +318,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             global_batch, global_batch_size_per_rank // self.cfg.actor.micro_batch_size
         )
 
-        # move train_micro_batch_list to device and rebuild the pi conditions
+        # Reuse frozen observation features across critic and actor updates.
         with self.worker_timer("prepare_batch"):
             for i, batch in enumerate(train_micro_batch_list):
                 batch = put_tensor_device(batch, device=self.device)
@@ -416,7 +401,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 }
             )
 
-        # Soft update target network
+        # Soft update the target critic.
         if (
             self.target_model_initialized
             and self.update_step % self.cfg.algorithm.get("target_update_freq", 1) == 0
@@ -427,8 +412,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
     @Worker.timer("run_training")
     def run_training(self):
-        """RFPO training using replay buffer"""
-        # Check if replay buffer has enough samples
+        """Run RFPO updates when the local replay buffer is ready."""
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
         if not self.replay_buffer.is_ready(min_buffer_size):
             self.log_on_first_rank(
@@ -441,7 +425,7 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.load_optimizer(self.device)
         self.rfpo_backbone_model.to(self.device)
 
-        # Delay actor training until every rank's buffer has enough samples
+        # All ranks must take the same actor-update branch for FSDP collectives.
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
         train_actor = self._all_ranks_buffer_ready(train_actor_steps)
@@ -479,13 +463,12 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         return mean_metric_dict
 
     def save_checkpoint(self, save_base_path: str, step: int) -> None:
-        """Save SAC components and the state that controls RFPO updates."""
+        """Save training state, RFPO update count, and sampling RNG states."""
         restore_weight_offload = self.is_weight_offloaded
         restore_optimizer_offload = self.is_optimizer_offloaded
 
         super().save_checkpoint(save_base_path, step)
 
-        # save the state that controls RFPO updates
         worker_state = {
             "update_step": self.update_step,
             "critic_sample_rng": self.critic_sample_generator.get_state(),
@@ -513,7 +496,6 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
 
         super().load_checkpoint(load_base_path)
 
-        # load the state that controls RFPO updates
         worker_state_load_path = os.path.join(
             load_base_path, f"rfpo_state_rank_{self._rank}.pt"
         )
@@ -539,13 +521,13 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.rfpo_backbone_model.to("cpu")
 
     def load_param_and_grad(self, device_id: int, load_grad: bool = False) -> None:
+        """Reload online and target networks; pi is moved in ``run_training``."""
         if self.is_weight_offloaded:
             super().load_param_and_grad(device_id, load_grad)
             if self.target_model is not None:
                 self._strategy.onload_param_and_grad(
                     self.target_model, device_id, load_grad
                 )
-        # Weight synchronization only needs the small model; pi loads in the learner.
 
     def offload_optimizer(self) -> None:
         if not self.is_optimizer_offloaded:

@@ -617,6 +617,7 @@ class EnvWorker(Worker):
                 elif isinstance(value, (list, tuple)) and isinstance(
                     final_value, (list, tuple)
                 ):
+                    # Keep terminal task descriptions aligned with terminal observations.
                     merged_value = list(value)
                     for env_idx in np.flatnonzero(done_mask):
                         merged_value[env_idx] = final_value[env_idx]

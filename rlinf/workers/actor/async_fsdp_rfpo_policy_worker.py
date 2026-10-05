@@ -27,9 +27,12 @@ from rlinf.workers.actor.fsdp_rfpo_policy_worker import EmbodiedRFPOFSDPPolicy
 
 
 class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
+    """Train RFPO while receiving rollout trajectories in a background thread."""
+
     should_stop = False
 
     async def recv_rollout_trajectories(self, input_channel):
+        """Start receiving trajectories; training drains the queue into replay."""
         if getattr(self, "_recv_queue", None) is None:
             self._recv_queue = queue.Queue()
         if (
@@ -91,13 +94,12 @@ class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
 
     @Worker.timer("run_training")
     async def run_training(self):
-        """RFPO training using replay buffer"""
+        """Wait for replay data and run RFPO updates."""
         if self.cfg.actor.get("enable_offload", False):
             self.load_param_and_grad(self.device)
             self.load_optimizer(self.device)
         self.rfpo_backbone_model.to(self.device)
 
-        # Check if replay buffer has enough samples
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
         await self._wait_for_replay_buffer_ready(min_buffer_size)
 
@@ -114,7 +116,7 @@ class AsyncEmbodiedRFPOFSDPPolicy(EmbodiedRFPOFSDPPolicy):
             // self._world_size
         )
 
-        # Delay actor training until every rank's buffer has enough samples
+        # All ranks must take the same actor-update branch for FSDP collectives.
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
         self._drain_received_trajectories()
