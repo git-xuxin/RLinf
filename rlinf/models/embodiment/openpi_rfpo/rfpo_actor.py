@@ -89,7 +89,7 @@ class RFPODiTBlock(nn.Module):
 
 
 class RFPOActor(nn.Module):
-    """Predict Gaussian residual velocities for the guided action chunk."""
+    """Predict residual velocity means, optionally with learned Gaussian noise."""
 
     def __init__(
         self,
@@ -129,9 +129,12 @@ class RFPOActor(nn.Module):
         self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, 2 * width))
         self.mean_head = nn.Linear(width, action_dim)
         # One log std per action dimension, shared across observations and steps.
-        self.log_std = nn.Parameter(
-            torch.full((1, 1, action_dim), self.cfg.init_log_std, dtype=torch.float32)
-        )
+        if not self.cfg.deterministic:
+            self.log_std = nn.Parameter(
+                torch.full(
+                    (1, 1, action_dim), self.cfg.init_log_std, dtype=torch.float32
+                )
+            )
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
@@ -219,7 +222,7 @@ class RFPOActor(nn.Module):
         deterministic: bool = False,
         noise: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Return Gaussian residuals and distribution statistics [B, C, A]."""
+        """Return residuals [B, C, A] and optional Gaussian statistics."""
         mean = self._predict_mean(
             base_velocity,
             timestep,
@@ -227,6 +230,8 @@ class RFPOActor(nn.Module):
             condition_tokens=condition_tokens,
             condition_mask=condition_mask,
         )
+        if self.cfg.deterministic:
+            return {"delta_velocity": mean, "mean": mean}
         log_std = self.log_std.float().expand_as(mean)
         std = log_std.exp()
         if deterministic:

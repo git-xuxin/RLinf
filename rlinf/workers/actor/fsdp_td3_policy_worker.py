@@ -219,9 +219,6 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer.")
-        num_q_heads = self.cfg.actor.model.get("num_q_heads", 2)
-        if not 1 <= self.critic_subsample_size <= num_q_heads:
-            raise ValueError("critic_subsample_size must be between 1 and num_q_heads.")
         if not 0.0 <= self.cfg.algorithm.tau <= 1.0:
             raise ValueError("tau must be between 0 and 1.")
         for name in ("target_noise_std", "target_noise_clip"):
@@ -306,6 +303,8 @@ class EmbodiedTD3FSDPPolicy(EmbodiedFSDPActor):
         all_qf_next_target = self.target_model(
             forward_type=ForwardType.TD3_Q, obs=next_obs, actions=next_state_actions
         )
+        if not 1 <= self.critic_subsample_size <= all_qf_next_target.shape[-1]:
+            raise ValueError("critic_subsample_size must be between 1 and num_q_heads.")
         sample_idx = torch.randperm(
             all_qf_next_target.shape[-1],
             generator=self.critic_sample_generator,

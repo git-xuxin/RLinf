@@ -68,6 +68,7 @@ class RFPOSampler:
 
     rfpo_action_chunk: int = 20
     active_step_indices: tuple[int, ...] = (0, 1, 2)
+    exploration_noise_std: float = 0.0
 
     def sample(
         self,
@@ -77,6 +78,8 @@ class RFPOSampler:
         condition: "RFPOCondition",
         noise: torch.Tensor | None = None,
         residual_noise: torch.Tensor | None = None,
+        noise_std: float = 0.0,
+        noise_clip: float | None = None,
         deterministic: bool = False,
         force_zero_residual: bool = False,
         collect_step_stats: bool = False,
@@ -85,11 +88,18 @@ class RFPOSampler:
 
         Residual noise [steps, batch, chunk, action_dim] uses absolute step indices.
         Deterministic mode uses residual means; omitted initial noise is sampled.
+        TD3 scales residual noise in velocity units and clips only the noise.
         """
         horizon, model_dim = adapter.action_shape
         env_chunk, action_dim = adapter.env_action_shape
         chunk = self.rfpo_action_chunk
         num_steps = adapter.num_steps
+        if noise_std < 0 or self.exploration_noise_std < 0:
+            raise ValueError(
+                "RFPO velocity noise standard deviations must be nonnegative."
+            )
+        if noise_clip is not None and noise_clip < 0:
+            raise ValueError("RFPO velocity noise clip must be nonnegative.")
         if not (0 < env_chunk <= horizon and 0 < chunk <= horizon):
             raise ValueError("Action chunks must be positive and fit action_horizon.")
         if not 0 < action_dim <= model_dim:
@@ -148,6 +158,16 @@ class RFPOSampler:
                     deterministic=deterministic,
                     noise=None if residual_noise is None else residual_noise[step],
                 )
+                if actor.cfg.deterministic and noise_std > 0:
+                    mean = output["mean"]
+                    epsilon = (
+                        torch.randn_like(mean)
+                        if residual_noise is None
+                        else residual_noise[step].to(mean)
+                    ) * noise_std
+                    if noise_clip is not None:
+                        epsilon = epsilon.clamp(-noise_clip, noise_clip)
+                    output["delta_velocity"] = mean + epsilon
                 # Add residuals only to the guided chunk's environment dimensions.
                 residual = F.pad(
                     output["delta_velocity"],
@@ -168,13 +188,17 @@ class RFPOSampler:
                             (batch_size, len(RFPO_ACTION_GROUPS)), device=device
                         )
                         delta_velocity_steps.append(zero_group_rms.clone())
-                        delta_log_std_steps.append(zero_group_rms.clone())
+                        if not actor.cfg.deterministic:
+                            delta_log_std_steps.append(zero_group_rms.clone())
                         delta_parallel_steps.append(zero_group_rms.clone())
                         delta_vertical_steps.append(zero_group_rms.clone())
                     else:
                         active_delta = output["delta_velocity"]
                         delta_velocity_steps.append(group_rms(active_delta))
-                        delta_log_std_steps.append(group_rms(output["log_std"].float()))
+                        if "log_std" in output:
+                            delta_log_std_steps.append(
+                                group_rms(output["log_std"].float())
+                            )
                         parallel, vertical = parallel_vertical_group_rms(
                             active_delta, active_base
                         )
@@ -189,7 +213,9 @@ class RFPOSampler:
             step_stats = RFPOStepStats(
                 base_velocity_group_rms=torch.stack(base_velocity_steps),
                 delta_velocity_group_rms=torch.stack(delta_velocity_steps),
-                delta_log_std_group_rms=torch.stack(delta_log_std_steps),
+                delta_log_std_group_rms=(
+                    torch.stack(delta_log_std_steps) if delta_log_std_steps else None
+                ),
                 delta_parallel_group_rms=torch.stack(delta_parallel_steps),
                 delta_vertical_group_rms=torch.stack(delta_vertical_steps),
                 action_noise_dim_mean=torch.stack(action_noise_steps),

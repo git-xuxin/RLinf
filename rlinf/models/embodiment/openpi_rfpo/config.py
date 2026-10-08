@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RFPO network and residual Gaussian settings."""
+"""RFPO network and residual actor settings."""
 
 from dataclasses import dataclass
 
@@ -57,6 +57,7 @@ class RFPOActorConfig(_RFPOTransformerConfig):
     num_dit_blocks: int = 3
     num_decoder_layers: int = 1
     init_log_std: float = -6.0
+    deterministic: bool = False
 
 
 @dataclass(frozen=True)

@@ -80,11 +80,16 @@ class RFPOPolicy(nn.Module):
         mode: Literal["train", "target", "rollout", "eval"] = "train",
         noise: torch.Tensor | None = None,
         residual_noise: torch.Tensor | None = None,
+        noise_std: float = 0.0,
+        noise_clip: float | None = None,
         force_zero_residual: bool = False,
         collect_step_stats: bool = False,
     ) -> dict[str, torch.Tensor | RFPOStepStats | None]:
         if mode not in ("train", "target", "rollout", "eval"):
             raise ValueError(f"Unknown RFPO sampling mode: {mode!r}")
+        if mode != "target":
+            noise_std = self.sampler.exploration_noise_std if mode == "rollout" else 0.0
+            noise_clip = None
         with torch.set_grad_enabled(mode == "train" and torch.is_grad_enabled()):
             model_actions, step_stats, raw_mean_group_mse = self.sampler.sample(
                 self.actor,
@@ -92,6 +97,8 @@ class RFPOPolicy(nn.Module):
                 condition=condition,
                 noise=noise,
                 residual_noise=residual_noise,
+                noise_std=noise_std,
+                noise_clip=noise_clip,
                 deterministic=mode == "eval",
                 force_zero_residual=force_zero_residual,
                 collect_step_stats=collect_step_stats,

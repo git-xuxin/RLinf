@@ -37,7 +37,7 @@ class RFPOStepStats:
 
     base_velocity_group_rms: torch.Tensor
     delta_velocity_group_rms: torch.Tensor
-    delta_log_std_group_rms: torch.Tensor
+    delta_log_std_group_rms: torch.Tensor | None
     delta_parallel_group_rms: torch.Tensor
     delta_vertical_group_rms: torch.Tensor
     action_noise_dim_mean: torch.Tensor  # Post-update actions averaged over positions.
@@ -121,6 +121,8 @@ def denoise_step_metrics(stats: RFPOStepStats) -> dict[str, float]:
     group_count = len(RFPO_ACTION_GROUP_NAMES)
     metrics: dict[str, float] = {}
     for name, values, active_only in grouped_specs:
+        if values is None:
+            continue
         if values.ndim != 3 or values.shape[0] != step_count:
             raise ValueError(f"RFPO {name} stats must be [steps, batch, groups].")
         if values.shape[-1] != group_count:
