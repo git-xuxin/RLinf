@@ -70,6 +70,9 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             add_value_head=cfg.add_value_head,
             add_q_head=cfg.get("add_q_head", False),
             q_head_type=cfg.get("q_head_type", "default"),
+            deterministic=cfg.get("deterministic", False),
+            num_q_heads=cfg.get("num_q_heads", 2),
+            exploration_noise_std=cfg.get("exploration_noise_std", 0.1),
         )
 
     return model

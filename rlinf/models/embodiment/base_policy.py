@@ -21,6 +21,8 @@ class ForwardType(Enum):
     SFT = "sft"
     SAC = "sac"
     SAC_Q = "sac_q"
+    TD3 = "td3"
+    TD3_Q = "td3_q"
     CROSSQ = "crossq"
     CROSSQ_Q = "crossq_q"
     IQL_ACTOR = "iql_actor"
@@ -58,6 +60,12 @@ class BasePolicy(ABC):
         raise NotImplementedError
 
     def sac_q_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def td3_forward(self, **kwargs):
+        raise NotImplementedError
+
+    def td3_q_forward(self, **kwargs):
         raise NotImplementedError
 
     def crossq_forward(self, **kwargs):

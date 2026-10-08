@@ -35,12 +35,23 @@ class MLPPolicy(nn.Module, BasePolicy):
         q_head_type="default",
         value_granularity="action_level",
         critic_obs_dim=None,
+        deterministic=False,
+        num_q_heads=2,
+        exploration_noise_std=0.1,
     ):
         super().__init__()
         self.obs_dim = obs_dim
         self.critic_obs_dim = critic_obs_dim or obs_dim
         self.action_dim = action_dim
         self.num_action_chunks = num_action_chunks
+        self.deterministic = deterministic
+        self.exploration_noise_std = exploration_noise_std
+        if deterministic and (not add_q_head or q_head_type != "default"):
+            raise ValueError("Deterministic MLP requires default Q heads.")
+        if num_q_heads < 1 or exploration_noise_std < 0:
+            raise ValueError(
+                "num_q_heads must be positive and exploration_noise_std nonnegative."
+            )
         self.torch_compile_enabled = False
         # default setting
         self.independent_std = True
@@ -54,6 +65,8 @@ class MLPPolicy(nn.Module, BasePolicy):
         output_dim = (
             1 if self.value_granularity == "chunk_level" else self.num_action_chunks
         )
+        if deterministic:
+            output_dim = 1
 
         if add_value_head:
             self.value_head = ValueHead(
@@ -71,7 +84,7 @@ class MLPPolicy(nn.Module, BasePolicy):
                 self.q_head = MultiQHead(
                     hidden_size=self.critic_obs_dim,
                     hidden_dims=[256, 256, 256],
-                    num_q_heads=2,
+                    num_q_heads=num_q_heads,
                     output_dim=output_dim,
                     action_feature_dim=action_dim * self.num_action_chunks,
                 )
@@ -99,12 +112,18 @@ class MLPPolicy(nn.Module, BasePolicy):
         self.actor_mean = layer_init(
             nn.Linear(256, self.num_action_chunks * action_dim), std=0.01 * np.sqrt(2)
         )
-        if self.independent_std:
-            self.actor_logstd = nn.Parameter(
-                torch.ones(1, self.num_action_chunks * action_dim) * -0.5
-            )
-        else:
-            self.actor_logstd = nn.Linear(256, self.num_action_chunks * action_dim)
+        if self.deterministic:
+            # Keep unused actor parameters outside the root FSDP critic-only pass.
+            self._no_split_names = ["backbone", "actor_mean"]
+            self.backbone._fsdp_wrap_name = "backbone"
+            self.actor_mean._fsdp_wrap_name = "actor_mean"
+        if not self.deterministic:
+            if self.independent_std:
+                self.actor_logstd = nn.Parameter(
+                    torch.ones(1, self.num_action_chunks * action_dim) * -0.5
+                )
+            else:
+                self.actor_logstd = nn.Linear(256, self.num_action_chunks * action_dim)
 
         if action_scale is not None:
             l, h = action_scale
@@ -150,6 +169,10 @@ class MLPPolicy(nn.Module, BasePolicy):
             return self.sac_forward(**kwargs)
         elif forward_type == ForwardType.SAC_Q:
             return self.sac_q_forward(**kwargs)
+        elif forward_type == ForwardType.TD3:
+            return self.td3_forward(**kwargs)
+        elif forward_type == ForwardType.TD3_Q:
+            return self.td3_q_forward(**kwargs)
         elif forward_type == ForwardType.CROSSQ:
             return self.crossq_forward(**kwargs)
         elif forward_type == ForwardType.CROSSQ_Q:
@@ -235,6 +258,21 @@ class MLPPolicy(nn.Module, BasePolicy):
                 raise NotImplementedError
         return output_dict
 
+    def td3_forward(self, obs, noise_std=0.0, noise_clip=None, **kwargs):
+        """Return bounded mean actions, optionally with action-space noise."""
+        feat = self.backbone(obs["states"])
+        action_mean = self.actor_mean(feat)
+        action = torch.tanh(action_mean) * self.action_scale + self.action_bias
+        if noise_std > 0:
+            noise = torch.randn_like(action) * noise_std
+            if noise_clip is not None:
+                noise = noise.clamp(-noise_clip, noise_clip)
+            action = action + noise
+        return action.clamp(
+            self.action_bias - self.action_scale,
+            self.action_bias + self.action_scale,
+        )
+
     def _sample_actions(
         self, states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -304,6 +342,20 @@ class MLPPolicy(nn.Module, BasePolicy):
     ):
         env_obs = self.preprocess_env_obs(env_obs=env_obs)
 
+        if self.deterministic:
+            if mode not in ("train", "eval"):
+                raise ValueError(f"Unsupported rollout mode: {mode}")
+            action = self.td3_forward(
+                env_obs,
+                noise_std=self.exploration_noise_std if mode == "train" else 0.0,
+            )
+            forward_inputs = {"action": action, "model_action": action}
+            if return_obs:
+                forward_inputs["states"] = env_obs["states"]
+            return action.reshape(-1, self.num_action_chunks, self.action_dim), {
+                "forward_inputs": forward_inputs,
+            }
+
         action, chunk_actions, chunk_logprobs, chunk_values = self._generate_actions(
             env_obs["states"], mode=mode, calculate_values=calculate_values
         )
@@ -320,6 +372,9 @@ class MLPPolicy(nn.Module, BasePolicy):
         return chunk_actions, result
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
+        return self.q_head(obs["states"], actions)
+
+    def td3_q_forward(self, obs, actions, **kwargs):
         return self.q_head(obs["states"], actions)
 
     def crossq_q_forward(
