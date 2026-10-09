@@ -7,6 +7,8 @@ action_dim: 7
 sampler:
   rfpo_action_chunk: ${..num_action_chunks}
   active_step_indices: [0, 1, 2]  # Zero-based pi denoising steps with residual guidance.
+  # TD3 training rollout noise in residual velocity units; 0 disables it.
+  exploration_noise_std: 0.0
 
 # Trainable networks; each worker loads frozen pi from rfpo_backbone_model.
 actor:
@@ -15,7 +17,8 @@ actor:
   num_decoder_layers: 1
   num_heads: 2
   mlp_ratio: 2.0
-  init_log_std: -6.0
+  init_log_std: -6.0  # Initial learned log std when deterministic is False.
+  deterministic: False  # True: TD3 mean-only actor; False: SAC Gaussian actor.
 
 critic:
   hidden_size: 384

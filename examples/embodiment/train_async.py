@@ -55,10 +55,20 @@ def main(cfg) -> None:
         actor_worker_cls = AsyncEmbodiedSACFSDPPolicy
     elif cfg.algorithm.loss_type == "embodied_rfpo":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
-        from rlinf.workers.actor.async_fsdp_rfpo_policy_worker import AsyncEmbodiedRFPOFSDPPolicy
+        from rlinf.workers.actor.async_fsdp_rfpo_policy_worker import (
+            AsyncEmbodiedRFPOFSDPPolicy,
+        )
 
         runner_cls = AsyncEmbodiedRunner
         actor_worker_cls = AsyncEmbodiedRFPOFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_rfpo_td3":
+        from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
+        from rlinf.workers.actor.async_fsdp_rfpo_td3_policy_worker import (
+            AsyncEmbodiedRFPOTD3FSDPPolicy,
+        )
+
+        runner_cls = AsyncEmbodiedRunner
+        actor_worker_cls = AsyncEmbodiedRFPOTD3FSDPPolicy
     elif cfg.algorithm.loss_type == "rlt_ac":
         from rlinf.runners.async_embodied_runner import AsyncEmbodiedRunner
         from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import AsyncRLTACFSDPPolicy
