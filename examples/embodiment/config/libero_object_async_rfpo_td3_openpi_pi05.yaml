@@ -24,9 +24,9 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_object_rfpo_td3_openpi_pi05"
+    experiment_name: "libero_object_async_rfpo_td3_openpi_pi05"
     logger_backends: ["tensorboard"]
-  max_epochs: 1000
+  max_epochs: 2000
   max_steps: -1
   only_eval: False
   val_check_interval: -1
