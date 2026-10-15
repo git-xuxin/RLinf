@@ -50,14 +50,14 @@ algorithm:
 
   # L2 weights for residual means, averaged over guided steps and action positions.
   raw_mean_l2_coefficients:
-    translation: 1.0e-3
-    rotation: 1.0e-3
-    gripper: 1.0e-3
+    translation: 2.0e-4
+    rotation: 2.0e-4
+    gripper: 2.0e-4
 
-  target_update_freq: 1
-  target_actor_update_freq: 1
-  target_noise_std: 0.01
-  target_noise_clip: 0.02
+  target_update_freq: 2
+  target_actor_update_freq: 2
+  target_noise_std: 0.2
+  target_noise_clip: 0.5
   replay_buffer:
     enable_cache: True
     cache_size: 100
@@ -76,7 +76,8 @@ env:
     use_rel_reward: False
     max_episode_steps: 240
     max_steps_per_rollout_epoch: 240
-    specific_reset_id: 0
+    specific_reset_id: null
+    task_id_filter: [0]
     use_ordered_reset_state_ids: False
     video_cfg:
       save_video: False
@@ -86,7 +87,8 @@ env:
     auto_reset: True
     ignore_terminations: False
     is_eval: True
-    specific_reset_id: 0
+    specific_reset_id: null
+    task_id_filter: [0]
     use_ordered_reset_state_ids: True
     use_fixed_reset_state_ids: True
     video_cfg:
@@ -118,7 +120,7 @@ actor:
     actor:
       deterministic: True
     sampler:
-      exploration_noise_std: 0.01
+      exploration_noise_std: 0.2
 
   rfpo_backbone_model:
     model_type: openpi
@@ -146,13 +148,13 @@ actor:
 
   optim:
     clip_grad: 1.0
-    lr: 1.0e-05
+    lr: 5.0e-05
     lr_scheduler: constant
     lr_warmup_steps: 50
 
   critic_optim:
     clip_grad: 1.0
-    lr: 1.0e-05
+    lr: 5.0e-05
     lr_scheduler: torch_constant
 
   fsdp_config:
