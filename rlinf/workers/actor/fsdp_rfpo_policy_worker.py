@@ -14,10 +14,7 @@
 
 
 import copy
-import math
 import os
-from collections.abc import Mapping
-from numbers import Real
 
 import numpy as np
 import torch
@@ -34,43 +31,15 @@ from rlinf.models.embodiment.openpi_rfpo.metrics import (
     RFPO_ACTION_GROUP_NAMES,
     denoise_step_metrics,
 )
-from rlinf.models.embodiment.openpi_rfpo.rfpo_sampler import compute_raw_mean_l2
+from rlinf.models.embodiment.openpi_rfpo.rfpo_sampler import (
+    RFPOSampler,
+    compute_raw_mean_l2,
+    parse_raw_mean_l2_coefficients,
+)
 from rlinf.scheduler import Worker
 from rlinf.utils.metric_utils import append_to_dict
 from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chunk
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
-
-
-def _parse_raw_mean_l2_coefficients(
-    config: Mapping | None,
-) -> tuple[float, float, float]:
-    """Parse non-negative L2 weights; missing action groups default to zero."""
-    if config is None:
-        return (0.0, 0.0, 0.0)
-    if not isinstance(config, Mapping):
-        raise ValueError("raw_mean_l2_coefficients must be a mapping.")
-
-    unknown_groups = set(config) - set(RFPO_ACTION_GROUP_NAMES)
-    if unknown_groups:
-        raise ValueError(
-            f"Unsupported raw_mean_l2_coefficients groups: {sorted(unknown_groups)}."
-        )
-
-    coefficients = []
-    for group_name in RFPO_ACTION_GROUP_NAMES:
-        value = config.get(group_name, 0.0)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, Real)
-            or not math.isfinite(float(value))
-            or value < 0
-        ):
-            raise ValueError(
-                "RFPO raw_mean_l2_coefficients entry "
-                f"'{group_name}' must be finite and non-negative."
-            )
-        coefficients.append(float(value))
-    return tuple(coefficients)
 
 
 class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
@@ -84,8 +53,12 @@ class EmbodiedRFPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.rfpo_adapter = RFPOBackboneAdapter(self.rfpo_backbone_model)
         super().init_worker()
         self.raw_mean_l2_coefficients = torch.tensor(
-            _parse_raw_mean_l2_coefficients(
-                self.cfg.algorithm.get("raw_mean_l2_coefficients", None)
+            parse_raw_mean_l2_coefficients(
+                self.cfg.algorithm.get("raw_mean_l2_coefficients", None),
+                active_step_indices=RFPOSampler(
+                    **self.cfg.actor.model.get("sampler", {})
+                ).active_step_indices,
+                num_steps=self.rfpo_adapter.num_steps,
             ),
             device=self.device,
             dtype=torch.float32,

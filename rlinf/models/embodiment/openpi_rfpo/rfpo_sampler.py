@@ -14,13 +14,17 @@
 
 """Euler denoising with learned residual velocities."""
 
+import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Real
 from typing import TYPE_CHECKING
 
 import torch
 from torch.nn import functional as F
 
 from .metrics import (
+    RFPO_ACTION_GROUP_NAMES,
     RFPO_ACTION_GROUPS,
     RFPOStepStats,
     group_mean_square,
@@ -33,21 +37,82 @@ if TYPE_CHECKING:
     from .rfpo_actor import RFPOActor
 
 
+def parse_raw_mean_l2_coefficients(
+    config: Mapping | None,
+    *,
+    active_step_indices: Sequence[int],
+    num_steps: int,
+) -> tuple[tuple[float, ...], ...]:
+    """Return group weights in the sampler's ascending active-step order.
+
+    Missing steps/groups are zero. Legacy group-only mappings apply to every
+    active step. Configured inactive steps never contribute to the loss.
+    """
+    if config is None:
+        config = {}
+    if not isinstance(config, Mapping):
+        raise ValueError("raw_mean_l2_coefficients must be a mapping.")
+
+    def parse_groups(groups: Mapping) -> tuple[float, ...]:
+        if not isinstance(groups, Mapping):
+            raise ValueError("raw_mean_l2_coefficients step must be a mapping.")
+        unknown = set(groups) - set(RFPO_ACTION_GROUP_NAMES)
+        if unknown:
+            raise ValueError(f"Unsupported raw_mean_l2_coefficients groups: {unknown}.")
+        values = []
+        for name in RFPO_ACTION_GROUP_NAMES:
+            value = groups.get(name, 0.0)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                raise ValueError(
+                    f"raw_mean_l2_coefficients '{name}' must be finite and non-negative."
+                )
+            values.append(float(value))
+        return tuple(values)
+
+    active_steps = sorted(set(active_step_indices))
+    if (
+        num_steps <= 0
+        or not active_steps
+        or any(step < 0 or step >= num_steps for step in active_steps)
+    ):
+        raise ValueError("Residual step indices must fit the positive pi step count.")
+    if set(config).issubset(RFPO_ACTION_GROUP_NAMES):
+        return tuple(parse_groups(config) for _ in active_steps)
+
+    step_keys = {f"denoise_step_{step}" for step in range(num_steps)}
+    unknown = set(config) - step_keys
+    if unknown:
+        raise ValueError(f"Unsupported raw_mean_l2_coefficients steps: {unknown}.")
+    parsed = {key: parse_groups(groups) for key, groups in config.items()}
+    zeros = (0.0,) * len(RFPO_ACTION_GROUP_NAMES)
+    return tuple(parsed.get(f"denoise_step_{step}", zeros) for step in active_steps)
+
+
 def compute_raw_mean_l2(
     raw_mean_group_mse: torch.Tensor, coefficients: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return weighted L2 loss, group MSE, and weighted group terms.
 
-    Average [guided_steps, batch, 3] over steps and batch before weighting.
+    Weight [guided_steps, batch, 3] per step before averaging steps and batch.
+    A legacy [3] coefficient tensor applies the same weights to every step.
     """
     group_count = len(RFPO_ACTION_GROUPS)
     if raw_mean_group_mse.ndim != 3 or raw_mean_group_mse.shape[-1] != group_count:
         raise ValueError(
             f"RFPO raw-mean group MSE must have shape [steps, batch, {group_count}]."
         )
-    if coefficients.shape != (group_count,):
+    if coefficients.shape not in (
+        (group_count,),
+        (raw_mean_group_mse.shape[0], group_count),
+    ):
         raise ValueError(
-            f"RFPO raw_mean_l2 coefficients must have shape [{group_count}]."
+            f"RFPO raw_mean_l2 coefficients must have shape [{group_count}] "
+            f"or [guided_steps, {group_count}]."
         )
     if raw_mean_group_mse.shape[0] == 0:
         return (
@@ -55,10 +120,11 @@ def compute_raw_mean_l2(
             raw_mean_group_mse.new_zeros((group_count,)),
             raw_mean_group_mse.new_zeros((group_count,)),
         )
-    group_mse = raw_mean_group_mse.float().mean(dim=(0, 1))
-    weighted_group_terms = group_mse * coefficients.to(
-        device=group_mse.device, dtype=group_mse.dtype
-    )
+    step_group_mse = raw_mean_group_mse.float().mean(dim=1)
+    group_mse = step_group_mse.mean(dim=0)
+    weighted_group_terms = (
+        step_group_mse * coefficients.to(device=group_mse.device, dtype=group_mse.dtype)
+    ).mean(dim=0)
     return weighted_group_terms.sum(), group_mse, weighted_group_terms
 
 
