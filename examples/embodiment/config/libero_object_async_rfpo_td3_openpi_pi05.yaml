@@ -26,7 +26,7 @@ runner:
     project_name: rlinf
     experiment_name: "libero_object_async_rfpo_td3_openpi_pi05"
     logger_backends: ["tensorboard"]
-  max_epochs: 2000
+  max_epochs: 1000
   max_steps: -1
   only_eval: False
   val_check_interval: -1
@@ -50,14 +50,14 @@ algorithm:
 
   # L2 weights for residual means, averaged over guided steps and action positions.
   raw_mean_l2_coefficients:
-    translation: 2.0e-4
-    rotation: 2.0e-4
-    gripper: 2.0e-4
+    translation: 1.0e-4
+    rotation: 1.0e-4
+    gripper: 1.0e-4
 
   target_update_freq: 2
-  target_actor_update_freq: 2
-  target_noise_std: 0.2
-  target_noise_clip: 0.5
+  target_actor_update_freq: 4
+  target_noise_std: 0.05
+  target_noise_clip: 0.1
   replay_buffer:
     enable_cache: True
     cache_size: 100
@@ -120,7 +120,7 @@ actor:
     actor:
       deterministic: True
     sampler:
-      exploration_noise_std: 0.2
+      exploration_noise_std: 0.05
 
   rfpo_backbone_model:
     model_type: openpi
@@ -148,13 +148,15 @@ actor:
 
   optim:
     clip_grad: 1.0
-    lr: 5.0e-05
-    lr_scheduler: constant
+    lr: 3.0e-05
+    lr_scheduler: openpi_cosine
     lr_warmup_steps: 50
+    total_training_steps: 2000
+    min_lr: 3.0e-06
 
   critic_optim:
     clip_grad: 1.0
-    lr: 5.0e-05
+    lr: 3.0e-05
     lr_scheduler: torch_constant
 
   fsdp_config:
