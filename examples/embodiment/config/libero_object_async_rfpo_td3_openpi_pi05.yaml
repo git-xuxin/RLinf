@@ -50,9 +50,9 @@ algorithm:
 
   # L2 weights for residual means, averaged over guided steps and action positions.
   raw_mean_l2_coefficients:
-    translation: 1.0e-4
-    rotation: 1.0e-4
-    gripper: 1.0e-4
+    translation: 5.0e-2
+    rotation: 5.0e-2
+    gripper: 5.0e-2
 
   target_update_freq: 2
   target_actor_update_freq: 4
@@ -124,15 +124,16 @@ actor:
 
   rfpo_backbone_model:
     model_type: openpi
-    model_path: /mnt/public2/luoxi/models/RLinf-Pi05-LIBERO-SFT
+    # model_path: /mnt/public2/luoxi/models/RLinf-Pi05-LIBERO-SFT
+    model_path: /mnt/public2/luoxi/RLinf-PR1512/logs/20261016-01:47:04-libero_sft_openpi_rlinf/libero_pi05_openpi_rlinf_sft/checkpoints/global_step_600/actor/model_state_dict/full_weights.pt
     precision: bf16
     pi05: True
-    num_action_chunks: 20
+    num_action_chunks: 10
     action_dim: 7
     num_steps: 4
     openpi:
       task: eval
-      config_name: pi05_libero
+      config_name: pi05_libero_state
       action_horizon: ${..num_action_chunks}
       action_chunk: ${..num_action_chunks}
       action_env_dim: ${..action_dim}
@@ -141,18 +142,16 @@ actor:
       paligemma_variant: gemma_2b
       action_expert_variant: gemma_300m
       max_token_len: 200
-      discrete_state_input: False
+      discrete_state_input: True
       torch_compile: False
     openpi_data:
-      norm_stats_path: ${..model_path}/physical-intelligence/libero/norm_stats.json
+      # norm_stats_path: ${..model_path}/physical-intelligence/libero/norm_stats.json
+      norm_stats_path: /mnt/public2/luoxi/models/libero_assets/physical-intelligence/libero/norm_stats.json
 
   optim:
     clip_grad: 1.0
     lr: 3.0e-05
-    lr_scheduler: openpi_cosine
-    lr_warmup_steps: 50
-    total_training_steps: 2000
-    min_lr: 3.0e-06
+    lr_scheduler: torch_constant
 
   critic_optim:
     clip_grad: 1.0
