@@ -16,7 +16,7 @@
 import copy
 import math
 from collections.abc import Mapping
-from numbers import Real
+from numbers import Integral, Real
 
 import numpy as np
 import torch
@@ -39,24 +39,57 @@ from rlinf.utils.nested_dict_process import put_tensor_device, split_dict_to_chu
 from rlinf.workers.actor.fsdp_td3_policy_worker import EmbodiedTD3FSDPPolicy
 
 
-def _parse_raw_mean_l2_coefficients(
-    config: Mapping | None,
-) -> tuple[float, float, float]:
-    """Parse non-negative L2 weights; missing action groups default to zero."""
-    if config is None:
-        return (0.0, 0.0, 0.0)
-    if not isinstance(config, Mapping):
-        raise ValueError("raw_mean_l2_coefficients must be a mapping.")
+class RawMeanL2Schedule:
+    """Evaluate fixed or cosine L2 weights at a TD3 update step.
 
-    unknown_groups = set(config) - set(RFPO_ACTION_GROUP_NAMES)
-    if unknown_groups:
-        raise ValueError(
-            f"Unsupported raw_mean_l2_coefficients groups: {sorted(unknown_groups)}."
+    Initial and final weights are ordered translation, rotation, gripper.
+    Cosine interpolation runs from initial at step zero to final at T.
+    The endpoints determine whether each weight increases or decreases.
+    Values stay at final after T. No mutable state is needed on resume.
+    """
+
+    group_names = ("translation", "rotation", "gripper")
+
+    def __init__(self, config: Mapping | None):
+        if config is None:
+            config = {}
+        if not isinstance(config, Mapping):
+            raise ValueError("raw_mean_l2_coefficients must be a mapping.")
+        dynamic_keys = {"scheduler", "total_training_steps"} | {
+            f"final_{group}" for group in self.group_names
+        }
+        unknown = set(config) - set(self.group_names) - dynamic_keys
+        if unknown:
+            raise ValueError(
+                f"Unsupported raw_mean_l2_coefficients keys: {sorted(unknown)}."
+            )
+        self.initial = tuple(self._weight(config, group) for group in self.group_names)
+        self.scheduler = None
+        self.total_training_steps = None
+        self.final = self.initial
+        if not dynamic_keys.intersection(config):
+            return
+        missing = dynamic_keys - set(config)
+        if missing:
+            raise ValueError(
+                f"Dynamic raw_mean_l2_coefficients missing keys: {sorted(missing)}."
+            )
+        self.scheduler = config["scheduler"]
+        if self.scheduler != "cosine":
+            raise ValueError("raw_mean_l2_coefficients.scheduler must be cosine.")
+        steps = config["total_training_steps"]
+        if isinstance(steps, bool) or not isinstance(steps, Integral) or steps <= 0:
+            raise ValueError(
+                "raw_mean_l2_coefficients.total_training_steps must be a positive integer."
+            )
+        self.total_training_steps = int(steps)
+        self.final = tuple(
+            self._weight(config, f"final_{group}") for group in self.group_names
         )
 
-    coefficients = []
-    for group_name in RFPO_ACTION_GROUP_NAMES:
-        value = config.get(group_name, 0.0)
+    @staticmethod
+    def _weight(config: Mapping, key: str) -> float:
+        value = config.get(key, 0.0)
         if (
             isinstance(value, bool)
             or not isinstance(value, Real)
@@ -64,17 +97,33 @@ def _parse_raw_mean_l2_coefficients(
             or value < 0
         ):
             raise ValueError(
-                "RFPO raw_mean_l2_coefficients entry "
-                f"'{group_name}' must be finite and non-negative."
+                f"raw_mean_l2_coefficients.{key} must be finite and non-negative."
             )
-        coefficients.append(float(value))
-    return tuple(coefficients)
+        return float(value)
+
+    def at_step(self, step: int) -> tuple[float, float, float]:
+        """Return weights at zero-based update ``step``, holding final after T."""
+        if isinstance(step, bool) or not isinstance(step, Integral) or step < 0:
+            raise ValueError("L2 schedule step must be a non-negative integer.")
+        if self.scheduler is None:
+            return self.initial
+        if step >= self.total_training_steps:
+            return self.final
+        phase = step / self.total_training_steps
+        progress = (1.0 - math.cos(math.pi * phase)) / 2.0
+        return tuple(
+            (1.0 - progress) * initial + progress * final
+            for initial, final in zip(self.initial, self.final, strict=True)
+        )
 
 
 class EmbodiedRFPOTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
     """Train the residual actor and critic while keeping pi frozen."""
 
     def init_worker(self):
+        self.raw_mean_l2_schedule = RawMeanL2Schedule(
+            self.cfg.algorithm.get("raw_mean_l2_coefficients", None)
+        )
         # Load pi before model construction; it stays outside the FSDP policy.
         self.rfpo_backbone_model = load_backbone_model(
             self.cfg.actor.rfpo_backbone_model, self.device
@@ -82,9 +131,7 @@ class EmbodiedRFPOTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
         self.rfpo_adapter = RFPOBackboneAdapter(self.rfpo_backbone_model)
         super().init_worker()
         self.raw_mean_l2_coefficients = torch.tensor(
-            _parse_raw_mean_l2_coefficients(
-                self.cfg.algorithm.get("raw_mean_l2_coefficients", None)
-            ),
+            self.raw_mean_l2_schedule.at_step(self.update_step),
             device=self.device,
             dtype=torch.float32,
         )
@@ -295,6 +342,10 @@ class EmbodiedRFPOTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
 
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self, train_actor: bool = True):
+        coefficients = self.raw_mean_l2_schedule.at_step(self.update_step)
+        self.raw_mean_l2_coefficients.copy_(
+            self.raw_mean_l2_coefficients.new_tensor(coefficients)
+        )
         global_batch_size_per_rank = (
             self.cfg.actor.global_batch_size // self._world_size
         )
@@ -343,6 +394,12 @@ class EmbodiedRFPOTD3FSDPPolicy(EmbodiedTD3FSDPPolicy):
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": qf_grad_norm,
             **all_critic_metrics,
+            **{
+                f"rfpo/raw_mean_l2_coefficients/{group}": value
+                for group, value in zip(
+                    RFPO_ACTION_GROUP_NAMES, coefficients, strict=True
+                )
+            },
         }
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
