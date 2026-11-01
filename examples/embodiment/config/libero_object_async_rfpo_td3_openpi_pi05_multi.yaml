@@ -74,6 +74,7 @@ env:
     ignore_terminations: False
     use_only_first_success: True
     use_rel_reward: False
+    reward_coef: 1.0
     max_episode_steps: 240
     max_steps_per_rollout_epoch: 240
     specific_reset_id: null
@@ -82,11 +83,14 @@ env:
     video_cfg:
       save_video: False
   eval:
-    rollout_epoch: 1
+    rollout_epoch: 12
     total_num_envs: 40
     auto_reset: True
-    ignore_terminations: False
+    ignore_terminations: True
     is_eval: True
+    reward_coef: 1.0
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
     specific_reset_id: null
     task_id_filter: null
     use_ordered_reset_state_ids: True
@@ -112,7 +116,7 @@ actor:
   group_name: ActorGroup
   training_backend: fsdp
   micro_batch_size: 32
-  global_batch_size: 256
+  global_batch_size: 512
   seed: 42
   enable_offload: False
 
