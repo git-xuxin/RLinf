@@ -1,0 +1,99 @@
+defaults:
+  - env/libero_spatial@env.eval
+  - model/rfpo@rollout.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_spatial_rfpo_openpi_pi05_multi_eval"
+    logger_backends: ["tensorboard"]
+  max_epochs: 1
+  max_steps: -1
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: EnvGroup
+  eval:
+    # Standard LIBERO: 10 tasks x 50 initial states, each evaluated once.
+    # If changing parallelism, keep enough epochs to cover all 500 states.
+    rollout_epoch: 25
+    total_num_envs: 20
+    group_size: 1
+    seed: 0
+    auto_reset: True
+    ignore_terminations: True
+    is_eval: True
+    reward_coef: 1.0
+    max_episode_steps: 220
+    max_steps_per_rollout_epoch: 220
+    specific_reset_id: null
+    task_id_filter: null
+    use_ordered_reset_state_ids: True
+    use_fixed_reset_state_ids: True
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  rollout_backend: huggingface
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: False
+  collect_prev_infos: False
+  collect_final_values: False
+  enable_torch_compile: False
+  enable_cuda_graph: False
+
+  model:
+    num_action_chunks: ${rollout.rfpo_backbone_model.num_action_chunks}
+    actor:
+      deterministic: True
+    sampler:
+      active_step_indices: [0, 1, 2]
+      exploration_noise_std: 0.0
+
+  rfpo_backbone_model:
+    model_type: openpi
+    model_path: /mnt/public2/luoxi/RLinf-PR1512/logs/20261016-01:47:04-libero_sft_openpi_rlinf/libero_pi05_openpi_rlinf_sft/checkpoints/global_step_600/actor/model_state_dict/full_weights.pt
+    precision: bf16
+    pi05: True
+    num_action_chunks: 10
+    action_dim: 7
+    num_steps: 4
+    openpi:
+      task: eval
+      config_name: pi05_libero_state
+      action_horizon: ${..num_action_chunks}
+      action_chunk: ${..num_action_chunks}
+      action_env_dim: ${..action_dim}
+      num_steps: ${..num_steps}
+      model_action_dim: 32
+      paligemma_variant: gemma_2b
+      action_expert_variant: gemma_300m
+      max_token_len: 200
+      discrete_state_input: True
+      torch_compile: False
+    openpi_data:
+      norm_stats_path: /mnt/public2/luoxi/models/libero_assets/physical-intelligence/libero/norm_stats.json
