@@ -49,6 +49,7 @@ def get_model(
 ) -> RFPOPolicy:
     """Build the RFPO policy from a config prepared by ``build_model_config``."""
     dims = cfg.input_dims
+    sampler = RFPOSampler(**cfg.get("sampler", {}))
     model = RFPOPolicy(
         RFPOActor(
             cfg.actor,
@@ -56,6 +57,7 @@ def get_model(
             suffix_dim=dims.suffix_dim,
             suffix_has_state=dims.suffix_has_state,
             condition_dim=dims.condition_dim,
+            action_chunk=sampler.rfpo_action_chunk,
         ),
         RFPOCritic(
             cfg.critic,
@@ -63,7 +65,7 @@ def get_model(
             condition_dim=dims.condition_dim,
             state_dim=dims.state_dim,
         ),
-        RFPOSampler(**cfg.get("sampler", {})),
+        sampler,
     )
     dtype = (
         torch_dtype

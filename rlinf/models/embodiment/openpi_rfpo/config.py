@@ -51,13 +51,25 @@ class _RFPOTransformerConfig:
 
 @dataclass(frozen=True)
 class RFPOActorConfig(_RFPOTransformerConfig):
-    """DiT actor architecture."""
+    """Shared condition decoder and selectable residual velocity network."""
 
     hidden_size: int = 256
     num_dit_blocks: int = 3
     num_decoder_layers: int = 1
     init_log_std: float = -6.0
     deterministic: bool = False
+    architecture: str = "dit"
+    mlp_hidden_dim: int = 256
+    mlp_num_hidden_layers: int = 3
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.architecture not in ("dit", "mlp"):
+            raise ValueError("RFPO actor architecture must be 'dit' or 'mlp'.")
+        if self.architecture == "mlp" and (
+            self.mlp_hidden_dim <= 0 or self.mlp_num_hidden_layers <= 0
+        ):
+            raise ValueError("RFPO MLP width and hidden layer count must be positive.")
 
 
 @dataclass(frozen=True)

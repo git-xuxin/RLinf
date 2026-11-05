@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DiT residual velocity actor conditioned on frozen OpenPI features."""
+"""DiT or MLP residual velocity actor conditioned on frozen OpenPI features."""
 
 import math
 
@@ -99,12 +99,20 @@ class RFPOActor(nn.Module):
         suffix_dim: int,
         condition_dim: int,
         suffix_has_state: bool = True,
+        action_chunk: int | None = None,
     ) -> None:
         super().__init__()
         self.cfg = RFPOActorConfig(**cfg)
         self.suffix_has_state = suffix_has_state
+        self.action_chunk = action_chunk
+        self.action_dim = action_dim
+        if self.cfg.architecture == "mlp" and (
+            action_chunk is None or action_chunk <= 0
+        ):
+            raise ValueError("RFPO MLP actor requires a positive action_chunk.")
         width = self.cfg.hidden_size
-        self.velocity_input = nn.Linear(action_dim, width)
+        if self.cfg.architecture == "dit":
+            self.velocity_input = nn.Linear(action_dim, width)
         self.suffix_input = nn.Linear(suffix_dim, width)
         self.condition_input = nn.Linear(condition_dim, width)
         self.cls_token = nn.Parameter(torch.empty(1, 1, width))
@@ -122,12 +130,27 @@ class RFPOActor(nn.Module):
             num_layers=self.cfg.num_decoder_layers,
             norm=nn.LayerNorm(width, eps=1e-6),
         )
-        self.blocks = nn.ModuleList(
-            RFPODiTBlock(self.cfg) for _ in range(self.cfg.num_dit_blocks)
-        )
-        self.final_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
-        self.final_modulation = nn.Sequential(nn.SiLU(), nn.Linear(width, 2 * width))
-        self.mean_head = nn.Linear(width, action_dim)
+        self.blocks = nn.ModuleList()
+        if self.cfg.architecture == "dit":
+            self.blocks.extend(
+                RFPODiTBlock(self.cfg) for _ in range(self.cfg.num_dit_blocks)
+            )
+            self.final_norm = nn.LayerNorm(width, elementwise_affine=False, eps=1e-6)
+            self.final_modulation = nn.Sequential(
+                nn.SiLU(), nn.Linear(width, 2 * width)
+            )
+            self.mean_head = nn.Linear(width, action_dim)
+        else:
+            chunk_dim = action_chunk * action_dim
+            input_dim = width + chunk_dim
+            layers = []
+            for _ in range(self.cfg.mlp_num_hidden_layers):
+                layers.extend(
+                    [nn.Linear(input_dim, self.cfg.mlp_hidden_dim), nn.ReLU()]
+                )
+                input_dim = self.cfg.mlp_hidden_dim
+            layers.append(nn.Linear(input_dim, chunk_dim))
+            self.residual_mlp = nn.Sequential(*layers)
         # One log std per action dimension, shared across observations and steps.
         if not self.cfg.deterministic:
             self.log_std = nn.Parameter(
@@ -149,10 +172,14 @@ class RFPOActor(nn.Module):
         for block in self.blocks:
             nn.init.zeros_(block.modulation[-1].weight)
             nn.init.zeros_(block.modulation[-1].bias)
-        nn.init.zeros_(self.final_modulation[-1].weight)
-        nn.init.zeros_(self.final_modulation[-1].bias)
-        # Small, nonzero outputs let adaLN start learning on the first update.
-        nn.init.normal_(self.mean_head.weight, std=1e-4)
+        if self.cfg.architecture == "dit":
+            nn.init.zeros_(self.final_modulation[-1].weight)
+            nn.init.zeros_(self.final_modulation[-1].bias)
+            output_head = self.mean_head
+        else:
+            output_head = self.residual_mlp[-1]
+        # Start near the frozen policy with a small, nonzero residual head.
+        nn.init.normal_(output_head.weight, std=1e-4)
 
     def _predict_mean(
         self,
@@ -163,6 +190,15 @@ class RFPOActor(nn.Module):
         condition_tokens: torch.Tensor,
         condition_mask: torch.Tensor,
     ) -> torch.Tensor:
+        if self.cfg.architecture == "mlp" and (
+            base_velocity.ndim != 3
+            or base_velocity.shape[1:] != (self.action_chunk, self.action_dim)
+        ):
+            raise ValueError(
+                "RFPO MLP base velocity must have shape "
+                f"[B, {self.action_chunk}, {self.action_dim}], got "
+                f"{tuple(base_velocity.shape)}."
+            )
         batch_size, action_chunk = base_velocity.shape[:2]
         suffix_length = action_chunk + int(self.suffix_has_state)
         if suffix_embedding.shape != (
@@ -175,14 +211,15 @@ class RFPOActor(nn.Module):
                 f"[B, {suffix_length}, {self.suffix_input.in_features}], got "
                 f"{tuple(suffix_embedding.shape)}."
             )
-        dtype = self.velocity_input.weight.dtype
-        velocity_tokens = self.velocity_input(base_velocity.to(dtype=dtype))
-        velocity_tokens = (
-            velocity_tokens
-            + _position_embedding(
-                action_chunk, self.cfg.hidden_size, base_velocity.device
-            ).to(dtype=dtype)[None]
-        )
+        dtype = self.suffix_input.weight.dtype
+        if self.cfg.architecture == "dit":
+            velocity_tokens = self.velocity_input(base_velocity.to(dtype=dtype))
+            velocity_tokens = (
+                velocity_tokens
+                + _position_embedding(
+                    action_chunk, self.cfg.hidden_size, base_velocity.device
+                ).to(dtype=dtype)[None]
+            )
 
         suffix_tokens = self.suffix_input(suffix_embedding.to(dtype=dtype))
         suffix_tokens = (
@@ -202,8 +239,17 @@ class RFPOActor(nn.Module):
                 device=memory.device, dtype=torch.bool
             ),
         )
-        # The CLS token summarizes suffix and prefix features for DiT conditioning.
+        # The CLS token summarizes suffix and prefix features for both architectures.
         condition = decoded[:, -1] + self.timestep_embedder(timestep)
+        if self.cfg.architecture == "mlp":
+            mlp_input = torch.cat(
+                [condition, base_velocity.to(dtype=dtype).flatten(start_dim=1)], dim=-1
+            )
+            return (
+                self.residual_mlp(mlp_input)
+                .reshape(batch_size, action_chunk, self.action_dim)
+                .float()
+            )
         for block in self.blocks:
             velocity_tokens = block(velocity_tokens, condition)
         shift, scale = self.final_modulation(condition).chunk(2, dim=-1)
