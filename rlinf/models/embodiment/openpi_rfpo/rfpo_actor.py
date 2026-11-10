@@ -240,7 +240,9 @@ class RFPOActor(nn.Module):
             ),
         )
         # The CLS token summarizes suffix and prefix features for both architectures.
-        condition = decoded[:, -1] + self.timestep_embedder(timestep)
+        condition = decoded[:, -1]
+        if self.cfg.use_timestep_embedding:
+            condition = condition + self.timestep_embedder(timestep)
         if self.cfg.architecture == "mlp":
             mlp_input = torch.cat(
                 [condition, base_velocity.to(dtype=dtype).flatten(start_dim=1)], dim=-1

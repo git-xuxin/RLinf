@@ -59,6 +59,7 @@ class RFPOActorConfig(_RFPOTransformerConfig):
     init_log_std: float = -6.0
     deterministic: bool = False
     architecture: str = "dit"
+    use_timestep_embedding: bool = True
     mlp_hidden_dim: int = 256
     mlp_num_hidden_layers: int = 3
 

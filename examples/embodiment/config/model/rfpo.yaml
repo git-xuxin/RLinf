@@ -13,6 +13,7 @@ sampler:
 # Trainable networks; each worker loads frozen pi from rfpo_backbone_model.
 actor:
   architecture: dit  # dit or mlp; both retain the condition decoder.
+  use_timestep_embedding: True
   mlp_hidden_dim: 256
   mlp_num_hidden_layers: 3
   hidden_size: 256
